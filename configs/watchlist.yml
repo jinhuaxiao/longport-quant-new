@@ -1,0 +1,129 @@
+# Curated watchlist for automated trading
+markets:
+  hk:
+    - 09988.HK  # 阿里巴巴
+    - 03690.HK  # 美团
+    - 00700.HK  # 腾讯
+    - 01810.HK  # 小米
+    - 09992.HK  # 泡泡玛特
+    - 01929.HK  # 周大福
+    - 00558.HK  # 力劲科技
+    - 00005.HK  # 汇丰控股
+    - 00001.HK  # 长和
+    - 00388.HK  # 港交所
+    - 00939.HK  # 建设银行
+    - 01398.HK  # 工商银行
+    - 03988.HK  # 中国银行
+    - 02318.HK  # 中国平安
+    - 00883.HK  # 中海油
+    - 00386.HK  # 中国石化
+    - 00857.HK  # 中国石油
+    - 09618.HK  # 京东
+    - 01024.HK  # 快手
+    - 00981.HK  # 中芯国际
+    - 09660.HK  # 地平线机器人
+    - 02382.HK  # 舜宇光学科技
+    - 00669.HK  # 创科实业
+    - 01211.HK  # 比亚迪
+    - 00175.HK  # 吉利汽车
+    - 02319.HK  # 蒙牛乳业
+    - 02020.HK  # 安踏体育
+    - 01928.HK  # 金沙中国
+    - 00027.HK  # 银河娱乐
+    - 01109.HK  # 华润置地
+    - 00688.HK  # 中国海外发展
+    - 00836.HK  # 华润电力
+    - 02688.HK  # 新奥能源
+    - 03968.HK  # 招商银行
+    # ETFs
+    - 02800.HK  # 盈富基金
+    - 02822.HK  # 南方A50
+    - 02828.HK  # 恒生H股ETF
+    - 03188.HK  # 华夏沪深300
+    - 09919.HK  # 南方恒指
+    - 03110.HK  # 东汇科技ETF
+    - 02801.HK  # iShares核心MSCI
+    - 02827.HK  # iShares MSCI中国
+    - 09067.HK  # 恒生科技30ETF
+    - 02819.HK  # 安硕A50
+  sz:
+    - 300750.SZ  # 宁德时代
+  us:
+    # Mega-cap tech and key NDX/S&P components
+    - AAPL
+    - MSFT
+    - GOOGL
+    - GOOG
+    - AMZN
+    - NVDA
+    - META
+    - TSLA
+    - AVGO
+    - COST
+    - PEP
+    - NFLX
+    - AMD
+    - INTC
+    - QCOM
+    - ADI
+    - AMAT
+    - MU
+    - CRM
+    - ORCL
+    - NOW
+    - PANW
+    - LRCX
+    - INTU
+    - TXN
+    - HON
+    - MDB
+    - SNOW
+    - SHOP
+    - ABNB
+    - BKNG
+    - ASML
+    - ARM
+    - PLTR
+    - UBER
+    - MRVL
+    - CRWD
+    - TEAM
+    - NET
+    - ZS
+    - DDOG
+    - DOCU
+    - SNPS
+    - CDNS
+    - ADSK
+    - TSM
+    - BRK.B
+    - JPM
+    - V
+    - MA
+    - UNH
+    - XOM
+    - CVX
+    - WMT
+    - HD
+    - PG
+    - JNJ
+    - LLY
+    - MRK
+    - ABBV
+    # ETFs
+    - SPY
+    - IVV
+    - VOO
+    - QQQ
+    - QQQM
+    - DIA
+    - IWM
+    - XLK
+    - XLF
+    - XLE
+    - SMH
+    - SOXX
+
+# Optional explicit list for cross-market or custom entries
+symbols: []
+

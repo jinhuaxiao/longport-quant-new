@@ -1,0 +1,249 @@
+"""Convenience wrappers around Longport QuoteContext for data retrieval."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import date, datetime
+from typing import Iterable, List, Optional
+
+from loguru import logger
+from longport import OpenApiException, openapi
+
+from longport_quant.config.sdk import build_sdk_config
+from longport_quant.config.settings import Settings
+
+
+class QuoteDataClient:
+    """Thread-safe asynchronous facade for quote-related SDK methods."""
+
+    def __init__(self, settings: Settings, config: openapi.Config | None = None) -> None:
+        self._settings = settings
+        self._config = config
+        self._ctx: openapi.QuoteContext | None = None
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self) -> "QuoteDataClient":
+        await self._ensure_context()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._ctx = None
+
+    async def get_static_info(self, symbols: List[str]) -> List[openapi.SecurityStaticInfo]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.static_info, symbols)
+
+    async def get_realtime_quote(self, symbols: List[str]) -> List[openapi.SecurityQuote]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.realtime_quote, symbols)
+
+    async def get_option_quote(self, symbols: List[str]) -> List[openapi.OptionQuote]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.option_quote, symbols)
+
+    async def get_warrant_quote(self, symbols: List[str]) -> List[openapi.WarrantQuote]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.warrant_quote, symbols)
+
+    async def get_depth(self, symbol: str) -> openapi.SecurityDepth:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.realtime_depth, symbol)
+
+    async def get_brokers(self, symbol: str) -> openapi.SecurityBrokers:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.realtime_brokers, symbol)
+
+    async def get_participants(self) -> openapi.ParticipantInfo:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.participants)
+
+    async def get_trades(self, symbol: str, count: int = 100) -> List[openapi.Trade]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.realtime_trades, symbol, count)
+
+    async def get_intraday(self, symbol: str) -> openapi.IntradayLine:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.intraday, symbol)
+
+    async def get_candlesticks(
+        self,
+        symbol: str,
+        period: openapi.Period,
+        count: int,
+        adjust_type: openapi.AdjustType,
+    ) -> List[openapi.Candlestick]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(
+            ctx.candlesticks,
+            symbol,
+            period,
+            count,
+            adjust_type,
+        )
+
+    async def get_history_candles(
+        self,
+        symbol: str,
+        period: openapi.Period,
+        adjust_type: openapi.AdjustType,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> List[openapi.Candlestick]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(
+            ctx.history_candlesticks_by_date,
+            symbol,
+            period,
+            adjust_type,
+            start,
+            end,
+        )
+
+    async def get_option_expirations(self, symbol: str) -> List[date]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.option_chain_expiry_date_list, symbol)
+
+    async def get_option_chain(self, symbol: str, expiry_date: date) -> List[openapi.OptionQuote]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.option_chain_info_by_date, symbol, expiry_date)
+
+    async def get_warrant_issuers(self) -> openapi.IssuerInfo:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.warrant_issuers)
+
+    async def filter_warrants(
+        self,
+        symbol: str,
+        sort_by: openapi.WarrantSortBy,
+        sort_order: openapi.SortOrderType,
+        **filters,
+    ) -> openapi.WarrantInfo:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.warrant_list, symbol, sort_by, sort_order, **filters)
+
+    async def get_trading_session(self) -> openapi.TradingSessionInfo:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.trading_session)
+
+    async def get_trading_days(
+        self,
+        market: openapi.Market,
+        begin: date,
+        end: date,
+    ) -> openapi.MarketTradingDays:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.trading_days, market, begin, end)
+
+    async def get_capital_flow(self, symbol: str) -> openapi.CapitalFlowLine:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.capital_flow, symbol)
+
+    async def get_capital_distribution(self, symbol: str) -> openapi.CapitalDistributionResponse:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.capital_distribution, symbol)
+
+    async def get_calc_index(self, symbols: List[str], indexes: List[openapi.CalcIndex]) -> List[openapi.SecurityCalcIndex]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.calc_indexes, symbols, indexes)
+
+    async def get_market_temperature(self, market: openapi.Market) -> openapi.MarketTemperature:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.market_temperature, market)
+
+    async def get_history_market_temperature(
+        self,
+        market: openapi.Market,
+        start_date: date,
+        end_date: date,
+    ) -> openapi.HistoryMarketTemperatureResponse:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.history_market_temperature, market, start_date, end_date)
+
+    async def list_securities(
+        self,
+        market: openapi.Market,
+        category: openapi.SecurityListCategory | None = None,
+    ) -> List[openapi.Security]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.security_list, market, category)
+
+    async def create_watchlist_group(
+        self,
+        name: str,
+        securities: Iterable[openapi.WatchlistSecurity] | None = None,
+    ) -> openapi.WatchlistGroup:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.create_watchlist_group, name, securities)
+
+    async def delete_watchlist_group(self, group_id: int, purge: bool = False) -> None:
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.delete_watchlist_group, group_id, purge)
+
+    async def list_watchlist_groups(self) -> List[openapi.WatchlistGroup]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.watchlist)
+
+    async def update_watchlist_group(
+        self,
+        group_id: int,
+        name: Optional[str] = None,
+        securities: Iterable[openapi.WatchlistSecurity] | None = None,
+        mode: openapi.SecuritiesUpdateMode | None = None,
+    ) -> openapi.WatchlistGroup:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(
+            ctx.update_watchlist_group,
+            group_id,
+            name,
+            securities,
+            mode,
+        )
+
+    async def subscribe(
+        self,
+        symbols: List[str],
+        sub_types: List[openapi.SubType],
+        is_first_push: bool = False,
+    ) -> None:
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.subscribe, symbols, sub_types, is_first_push)
+
+    async def unsubscribe(self, symbols: List[str], sub_types: List[openapi.SubType]) -> None:
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.unsubscribe, symbols, sub_types)
+
+    async def subscriptions(self) -> List[openapi.Subscription]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(ctx.subscriptions)
+
+    async def set_on_quote(self, callback):
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.set_on_quote, callback)
+
+    async def set_on_depth(self, callback):
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.set_on_depth, callback)
+
+    async def set_on_brokers(self, callback):
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.set_on_brokers, callback)
+
+    async def set_on_trades(self, callback):
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.set_on_trades, callback)
+
+    async def set_on_candlestick(self, callback):
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.set_on_candlestick, callback)
+
+    async def _ensure_context(self) -> openapi.QuoteContext:
+        async with self._lock:
+            if self._ctx is None:
+                config = self._config or build_sdk_config(self._settings)
+                self._config = config
+                logger.debug("Initialising QuoteContext for data client")
+                self._ctx = await asyncio.to_thread(openapi.QuoteContext, config)
+        return self._ctx
+
+
+__all__ = ["QuoteDataClient"]

@@ -1,0 +1,13 @@
+# Watchlist of Hong Kong and US tickers to monitor
+markets:
+  hk:
+    - 00700.HK
+    - 09988.HK
+  us:
+    - AAPL
+    - TSLA
+
+# Optional explicit symbol list allowing custom metadata
+symbols:
+  - symbol: SPY
+    market: us
