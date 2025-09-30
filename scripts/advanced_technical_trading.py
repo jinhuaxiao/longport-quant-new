@@ -92,6 +92,7 @@ class AdvancedTechnicalTrader:
 
         # 美股监控列表
         self.us_watchlist = {
+            # 科技大盘股
             "AAPL.US": {"name": "苹果", "sector": "科技"},
             "MSFT.US": {"name": "微软", "sector": "科技"},
             "GOOGL.US": {"name": "谷歌", "sector": "科技"},
@@ -100,6 +101,12 @@ class AdvancedTechnicalTrader:
             "TSLA.US": {"name": "特斯拉", "sector": "汽车"},
             "META.US": {"name": "Meta", "sector": "科技"},
             "AMD.US": {"name": "AMD", "sector": "科技"},
+
+            # 杠杆ETF和新增标的
+            "TQQQ.US": {"name": "纳指三倍做多ETF", "sector": "ETF"},
+            "NVDU.US": {"name": "英伟达二倍做多ETF", "sector": "ETF"},
+            "RKLB.US": {"name": "火箭实验室", "sector": "航天"},
+            "HOOD.US": {"name": "Robinhood", "sector": "金融科技"},
         }
 
         # A股监控列表（如果券商支持）
@@ -109,7 +116,7 @@ class AdvancedTechnicalTrader:
 
         # 交易参数
         self.budget_per_stock = 5000  # 每只股票预算
-        self.max_positions = 5  # 最大持仓数
+        self.max_positions = 10  # 最大持仓数（从5增加到10以捕获更多交易机会）
         self.executed_today = set()  # 今日已交易标的
 
         # 策略参数
