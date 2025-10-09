@@ -34,8 +34,29 @@ class QuoteDataClient:
         return await asyncio.to_thread(ctx.static_info, symbols)
 
     async def get_realtime_quote(self, symbols: List[str]) -> List[openapi.SecurityQuote]:
+        """
+        获取实时行情
+
+        注意: realtime_quote方法在某些情况下返回空列表
+        因此改用quote方法作为备选
+        """
         ctx = await self._ensure_context()
-        return await asyncio.to_thread(ctx.realtime_quote, symbols)
+
+        # 尝试使用realtime_quote
+        try:
+            quotes = await asyncio.to_thread(ctx.realtime_quote, symbols)
+            if quotes:
+                return quotes
+        except Exception as e:
+            logger.debug(f"realtime_quote失败，尝试使用quote: {e}")
+
+        # 备选方案：使用quote方法
+        try:
+            quotes = await asyncio.to_thread(ctx.quote, symbols)
+            return quotes if quotes else []
+        except Exception as e:
+            logger.error(f"quote方法也失败: {e}")
+            return []
 
     async def get_option_quote(self, symbols: List[str]) -> List[openapi.OptionQuote]:
         ctx = await self._ensure_context()
@@ -97,6 +118,24 @@ class QuoteDataClient:
             adjust_type,
             start,
             end,
+        )
+
+    async def get_history_candles_by_offset(
+        self,
+        symbol: str,
+        period: openapi.Period,
+        adjust_type: openapi.AdjustType,
+        offset: int,
+        count: int,
+    ) -> List[openapi.Candlestick]:
+        ctx = await self._ensure_context()
+        return await asyncio.to_thread(
+            ctx.history_candlesticks_by_offset,
+            symbol,
+            period,
+            adjust_type,
+            offset,
+            count,
         )
 
     async def get_option_expirations(self, symbol: str) -> List[date]:
@@ -161,11 +200,47 @@ class QuoteDataClient:
 
     async def list_securities(
         self,
-        market: openapi.Market,
-        category: openapi.SecurityListCategory | None = None,
+        market: openapi.Market | str,
+        category: openapi.SecurityListCategory | str | None = None,
     ) -> List[openapi.Security]:
         ctx = await self._ensure_context()
-        return await asyncio.to_thread(ctx.security_list, market, category)
+
+        market_param = self._normalise_market(market)
+        category_param = self._normalise_security_list_category(category)
+
+        return await asyncio.to_thread(ctx.security_list, market_param, category_param)
+
+    @staticmethod
+    def _normalise_market(market: openapi.Market | str) -> openapi.Market:
+        if isinstance(market, openapi.Market):
+            return market
+        upper = market.upper()
+        mapping = {
+            "HK": openapi.Market.HK,
+            "US": openapi.Market.US,
+            "CN": openapi.Market.CN,
+            "SG": openapi.Market.SG,
+            "CRYPTO": openapi.Market.Crypto,
+        }
+        if upper not in mapping:
+            raise ValueError(f"Unsupported market code: {market}")
+        return mapping[upper]
+
+    @staticmethod
+    def _normalise_security_list_category(
+        category: openapi.SecurityListCategory | str | None,
+    ) -> openapi.SecurityListCategory | None:
+        if category is None:
+            return None
+        if isinstance(category, openapi.SecurityListCategory):
+            return category
+        upper = category.upper()
+        mapping = {
+            "OVERNIGHT": openapi.SecurityListCategory.Overnight,
+        }
+        if upper not in mapping:
+            raise ValueError(f"Unsupported security list category: {category}")
+        return mapping[upper]
 
     async def create_watchlist_group(
         self,
@@ -235,6 +310,33 @@ class QuoteDataClient:
     async def set_on_candlestick(self, callback):
         ctx = await self._ensure_context()
         await asyncio.to_thread(ctx.set_on_candlestick, callback)
+
+    async def subscribe_candlesticks(
+        self,
+        symbol: str,
+        period: openapi.Period,
+    ) -> None:
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.subscribe_candlesticks, symbol, period)
+
+    async def unsubscribe_candlesticks(
+        self,
+        symbol: str,
+        period: openapi.Period,
+    ) -> None:
+        ctx = await self._ensure_context()
+        await asyncio.to_thread(ctx.unsubscribe_candlesticks, symbol, period)
+
+    async def get_quote_level(self) -> str:
+        ctx = await self._ensure_context()
+        level = await asyncio.to_thread(lambda: ctx.quote_level)
+        return str(level)
+
+    async def get_quote_package_details(self) -> List[dict]:
+        ctx = await self._ensure_context()
+        details = await asyncio.to_thread(ctx.quote_package_details)
+        # Convert to dict list for easier handling
+        return [{"name": d.name, "description": d.description} for d in details] if details else []
 
     async def _ensure_context(self) -> openapi.QuoteContext:
         async with self._lock:
