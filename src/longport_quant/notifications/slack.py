@@ -13,7 +13,8 @@ class SlackNotifier:
     """Thin async wrapper for posting messages to Slack via webhook."""
 
     def __init__(self, webhook_url: str | None) -> None:
-        self._webhook_url = webhook_url
+        # Convert HttpUrl to string if needed
+        self._webhook_url = str(webhook_url) if webhook_url else None
         self._client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()
 
@@ -35,6 +36,12 @@ class SlackNotifier:
                 "Slack webhook not configured; skipping message: {}", message
             )
             return
+
+        # 清理Unicode字符以防止编码错误
+        try:
+            message = message.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
+        except Exception:
+            message = message.encode('ascii', errors='ignore').decode('ascii')
 
         payload: Dict[str, Any] = {"text": message}
         if kwargs:

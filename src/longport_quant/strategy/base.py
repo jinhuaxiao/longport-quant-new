@@ -8,29 +8,22 @@ from typing import AsyncIterator
 
 from typing import TYPE_CHECKING
 
-from longport_quant.execution.order_router import OrderRouter
-from longport_quant.portfolio.state import PortfolioService
-from longport_quant.risk.checks import RiskEngine
+from longport_quant.common.types import Signal
 
 if TYPE_CHECKING:
+    from longport_quant.execution.order_router import OrderRouter
+    from longport_quant.portfolio.state import PortfolioService
+    from longport_quant.risk.checks import RiskEngine
     from longport_quant.strategy.dispatcher import SignalDispatcher
-
-
-@dataclass
-class Signal:
-    symbol: str
-    side: str
-    quantity: float
-    price: float
 
 
 class StrategyBase(ABC):
     def __init__(
         self,
-        order_router: OrderRouter,
-        portfolio: PortfolioService,
-        risk_engine: RiskEngine | None = None,
-        signal_dispatcher: "SignalDispatcher" | None = None,
+        order_router: 'OrderRouter',
+        portfolio: 'PortfolioService',
+        risk_engine: 'RiskEngine' | None = None,
+        signal_dispatcher: 'SignalDispatcher' | None = None,
     ) -> None:
         self._order_router = order_router
         self._portfolio = portfolio

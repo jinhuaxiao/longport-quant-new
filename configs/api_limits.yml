@@ -1,0 +1,47 @@
+# API限制配置
+# 用于避免超出LongPort API限制 (每秒最多10次调用)
+
+sync_limits:
+  # 分钟K线同步
+  minute_klines:
+    max_symbols_per_batch: 2    # 每批最多2个股票（降低频率）
+    delay_between_symbols: 0.5  # 单个股票间延迟（秒）
+    delay_between_batches: 3    # 批次间延迟（秒）
+    max_concurrent_requests: 1  # 最大并发请求数（串行执行）
+
+  # 日线同步
+  daily_klines:
+    max_symbols_per_batch: 3    # 每批最多3个股票
+    delay_between_symbols: 0.3  # 单个股票间延迟（秒）
+    delay_between_batches: 2    # 批次间延迟（秒）
+    max_concurrent_requests: 1  # 最大并发请求数
+
+# 实时数据限制
+realtime_limits:
+  max_symbols_per_request: 10   # 每次请求最多10个股票
+  min_interval_seconds: 1        # 最小请求间隔（秒）
+
+# 重试配置
+retry_config:
+  max_retries: 3                # 最大重试次数
+  retry_delay: 2                 # 初始重试延迟（秒）
+  backoff_factor: 2              # 退避因子（指数增长）
+  max_retry_delay: 30            # 最大重试延迟（秒）
+
+# 特定股票的排除列表（这些股票经常出错）
+exclude_symbols:
+  - "00001.HK"  # 长和，经常超限
+  - "00700.HK"  # 腾讯，数据量大
+
+# 优先股票列表（优先同步）
+priority_symbols:
+  - "09988.HK"  # 阿里巴巴
+  - "03690.HK"  # 美团
+  - "AAPL.US"   # 苹果
+  - "NVDA.US"   # 英伟达
+
+# API限流保护
+rate_limit:
+  enabled: true
+  max_calls_per_second: 8       # 每秒最大调用次数（留余量）
+  window_seconds: 1             # 统计窗口（秒）

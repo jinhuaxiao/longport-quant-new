@@ -10,7 +10,7 @@ from loguru import logger
 from longport_quant.config import get_settings
 from longport_quant.config.sdk import build_sdk_config
 from longport_quant.core.logging import configure_logging
-from longport_quant.data.market_data_service import MarketDataService
+from longport_quant.data.enhanced_market_data import EnhancedMarketDataService
 from longport_quant.notifications import SlackNotifier
 from longport_quant.execution.order_router import OrderRouter
 from longport_quant.persistence.db import DatabaseSessionManager
@@ -32,15 +32,16 @@ async def application_lifespan() -> AsyncIterator[None]:
         sdk_config = build_sdk_config(settings)
         slack = SlackNotifier(settings.slack_webhook_url)
 
-        market_data = MarketDataService(settings, sdk_config)
-        await stack.enter_async_context(market_data)
-
         order_router = OrderRouter(settings, sdk_config)
         await stack.enter_async_context(order_router)
 
+        market_data = EnhancedMarketDataService(settings, db_manager)
+        await stack.enter_async_context(market_data)
+
         await stack.enter_async_context(slack)
 
-        portfolio = PortfolioService(db_manager)
+        trade_context = await order_router.get_trade_context()
+        portfolio = PortfolioService(db_manager, trade_context)
         risk_engine = RiskEngine(settings, portfolio)
         order_router.bind_risk_engine(risk_engine)
         strategies = StrategyManager(

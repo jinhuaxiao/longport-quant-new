@@ -11,7 +11,7 @@ from typing import Dict, Optional
 from loguru import logger
 
 from longport_quant.notifications import SlackNotifier
-from longport_quant.strategy.base import Signal
+from longport_quant.common.types import Signal
 
 
 @dataclass

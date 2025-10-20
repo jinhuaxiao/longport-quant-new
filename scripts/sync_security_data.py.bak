@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""简明脚本：拉取市场标的与静态信息并写入数据库。"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from typing import Iterable, List, Optional
+
+from loguru import logger
+from longport import OpenApiException, openapi
+from sqlalchemy.dialects.postgresql import insert
+
+from longport_quant.config import get_settings
+from longport_quant.config.sdk import build_sdk_config
+from longport_quant.persistence.db import DatabaseSessionManager
+from longport_quant.persistence.models import SecurityStatic, SecurityUniverse
+
+
+@dataclass(frozen=True)
+class SecurityEntry:
+    symbol: str
+    name_cn: Optional[str]
+    name_en: Optional[str]
+    name_hk: Optional[str]
+
+
+@dataclass(frozen=True)
+class StaticEntry:
+    symbol: str
+    exchange: Optional[str]
+    currency: Optional[str]
+    lot_size: Optional[int]
+    total_shares: Optional[int]
+    circulating_shares: Optional[int]
+    eps: Optional[Decimal]
+    eps_ttm: Optional[Decimal]
+    bps: Optional[Decimal]
+    dividend_yield: Optional[Decimal]
+    board: Optional[str]
+    name_cn: Optional[str]
+    name_en: Optional[str]
+
+
+def chunked(items: List[str], size: int) -> Iterable[List[str]]:
+    for idx in range(0, len(items), size):
+        yield items[idx : idx + size]
+
+
+def fetch_security_list(
+    market: openapi.Market,
+    category: openapi.SecurityListCategory | None,
+) -> List[SecurityEntry]:
+    settings = get_settings()
+    config = build_sdk_config(settings)
+    ctx = openapi.QuoteContext(config)
+    try:
+        logger.info("调用 security_list 获取 {} 标的...", market)
+        securities = ctx.security_list(market, category)
+        entries = _convert_security_entries(securities)
+        logger.info("共拉取 {} 个标的", len(entries))
+        return entries
+    except OpenApiException as exc:
+        code = getattr(exc, "code", None)
+        logger.error("security_list 调用失败: code={}, message={}", code, exc)
+        if code == 310010:
+            logger.warning("尝试去除 category 参数重试")
+            try:
+                securities = ctx.security_list(market)
+                entries = _convert_security_entries(securities)
+                logger.info("去除 category 后共拉取 {} 个标的", len(entries))
+                return entries
+            except OpenApiException as second_exc:
+                second_code = getattr(second_exc, "code", None)
+                logger.warning(
+                    "重试仍失败 (code={})，改用 HTTP API 获取", second_code
+                )
+                return _fetch_security_list_http(market, category)
+        raise
+    finally:
+        del ctx
+
+
+def fetch_static_info(symbols: List[str], batch_size: int) -> List[StaticEntry]:
+    if not symbols:
+        return []
+
+    settings = get_settings()
+    config = build_sdk_config(settings)
+    ctx = openapi.QuoteContext(config)
+    collected: List[StaticEntry] = []
+    try:
+        for batch in chunked(symbols, batch_size):
+            logger.info("调用 static_info 获取 {} 条静态信息", len(batch))
+            try:
+                infos = ctx.static_info(batch)
+            except OpenApiException as exc:
+                logger.error("static_info 批次失败 (symbols[0]={}): code={}, message={}", batch[0], getattr(exc, "code", None), exc)
+                raise
+
+            for info in infos or []:
+                symbol = getattr(info, "symbol", None)
+                if not symbol:
+                    continue
+                collected.append(
+                    StaticEntry(
+                        symbol=symbol,
+                        exchange=(getattr(info, "exchange", None) or None),
+                        currency=(getattr(info, "currency", None) or None),
+                        lot_size=_safe_int(getattr(info, "lot_size", None)),
+                        total_shares=_safe_int(getattr(info, "total_shares", None)),
+                        circulating_shares=_safe_int(getattr(info, "circulating_shares", None)),
+                        eps=_safe_decimal(getattr(info, "eps", None)),
+                        eps_ttm=_safe_decimal(getattr(info, "eps_ttm", None)),
+                        bps=_safe_decimal(getattr(info, "bps", None)),
+                        dividend_yield=_safe_decimal(getattr(info, "dividend_yield", None)),
+                        board=(getattr(info, "board", None) or None),
+                        name_cn=(getattr(info, "name_cn", None) or None),
+                        name_en=(getattr(info, "name_en", None) or None),
+                    )
+                )
+    finally:
+        del ctx
+
+    logger.info("静态信息获取完成，共 {} 条", len(collected))
+    return collected
+
+
+def _convert_security_entries(securities: Iterable[object] | None) -> List[SecurityEntry]:
+    results: List[SecurityEntry] = []
+    for item in securities or []:
+        symbol = getattr(item, "symbol", None)
+        if not symbol:
+            continue
+        results.append(
+            SecurityEntry(
+                symbol=symbol,
+                name_cn=(getattr(item, "name_cn", None) or None),
+                name_en=(getattr(item, "name_en", None) or None),
+                name_hk=(getattr(item, "name_hk", None) or None),
+            )
+        )
+    return results
+
+
+def _fetch_security_list_http(
+    market: openapi.Market,
+    category: openapi.SecurityListCategory | None,
+) -> List[SecurityEntry]:
+    try:
+        http_client = openapi.HttpClient.from_env()
+    except Exception as exc:  # pragma: no cover - env 缺失
+        logger.error("初始化 HttpClient 失败: {}", exc)
+        raise
+
+    payload = {"market": str(market).split(".")[-1]}
+    if category is not None:
+        payload["category"] = getattr(category, "__name__", None) or str(category).split(".")[-1]
+
+    try:
+        response = http_client.request("post", "/v1/quote/get_security_list", body=payload)
+    except OpenApiException as exc:  # pragma: no cover - 远端异常
+        logger.error(
+            "HTTP security_list 调用失败: code={}, message={}", getattr(exc, "code", None), exc
+        )
+        raise
+
+    data = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(data, list):
+        logger.error("HTTP security_list 返回数据格式异常: {}", response)
+        raise RuntimeError("security_list http response invalid")
+
+    entries: List[SecurityEntry] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
+        entries.append(
+            SecurityEntry(
+                symbol=symbol,
+                name_cn=item.get("name_cn"),
+                name_en=item.get("name_en"),
+                name_hk=item.get("name_hk"),
+            )
+        )
+
+    logger.info("HTTP fallback 获取 {} 个标的", len(entries))
+    return entries
+
+
+async def persist_to_database(
+    universe: List[SecurityEntry],
+    static_infos: List[StaticEntry],
+) -> None:
+    settings = get_settings()
+    async with DatabaseSessionManager(settings.database_dsn) as db:
+        await _upsert_universe(db, universe)
+        await _upsert_static(db, static_infos)
+
+
+async def _upsert_universe(db: DatabaseSessionManager, universe: List[SecurityEntry]) -> None:
+    if not universe:
+        return
+    timestamp = datetime.utcnow()
+    async with db.session() as session:
+        for entry in universe:
+            stmt = (
+                insert(SecurityUniverse)
+                .values(
+                    symbol=entry.symbol,
+                    market=_infer_market(entry.symbol),
+                    name_cn=entry.name_cn,
+                    name_en=entry.name_en,
+                    name_hk=entry.name_hk,
+                    updated_at=timestamp,
+                )
+                .on_conflict_do_update(
+                    index_elements=[SecurityUniverse.symbol],
+                    set_={
+                        "market": _infer_market(entry.symbol),
+                        "name_cn": entry.name_cn,
+                        "name_en": entry.name_en,
+                        "name_hk": entry.name_hk,
+                        "updated_at": timestamp,
+                    },
+                )
+            )
+            await session.execute(stmt)
+        await session.commit()
+    logger.info("已写入 security_universe {} 条记录", len(universe))
+
+
+async def _upsert_static(db: DatabaseSessionManager, static_infos: List[StaticEntry]) -> None:
+    if not static_infos:
+        return
+    timestamp = datetime.utcnow()
+    async with db.session() as session:
+        for entry in static_infos:
+            stmt = (
+                insert(SecurityStatic)
+                .values(
+                    symbol=entry.symbol,
+                    name_cn=entry.name_cn,
+                    name_en=entry.name_en,
+                    exchange=entry.exchange,
+                    currency=entry.currency,
+                    lot_size=entry.lot_size,
+                    total_shares=entry.total_shares,
+                    circulating_shares=entry.circulating_shares,
+                    eps=entry.eps,
+                    eps_ttm=entry.eps_ttm,
+                    bps=entry.bps,
+                    dividend_yield=entry.dividend_yield,
+                    board=entry.board,
+                    updated_at=timestamp,
+                )
+                .on_conflict_do_update(
+                    index_elements=[SecurityStatic.symbol],
+                    set_={
+                        "name_cn": entry.name_cn,
+                        "name_en": entry.name_en,
+                        "exchange": entry.exchange,
+                        "currency": entry.currency,
+                        "lot_size": entry.lot_size,
+                        "total_shares": entry.total_shares,
+                        "circulating_shares": entry.circulating_shares,
+                        "eps": entry.eps,
+                        "eps_ttm": entry.eps_ttm,
+                        "bps": entry.bps,
+                        "dividend_yield": entry.dividend_yield,
+                        "board": entry.board,
+                        "updated_at": timestamp,
+                    },
+                )
+            )
+            await session.execute(stmt)
+        await session.commit()
+    logger.info("已写入 security_static {} 条记录", len(static_infos))
+
+
+def _safe_decimal(value: object) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _safe_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _infer_market(symbol: str) -> str:
+    if "." in symbol:
+        suffix = symbol.split(".")[-1]
+        if suffix:
+            return suffix.upper()
+    return "UNKNOWN"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="同步市场标的及静态信息")
+    parser.add_argument("market", choices=["hk", "us", "cn", "sg"], help="市场别名")
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="可选的 security_list 分类，例如 overnight",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=400,
+        help="static_info 单次请求的标的数量（<=500）",
+    )
+    parser.add_argument(
+        "--skip-static",
+        action="store_true",
+        help="仅同步标的列表，不拉取静态信息",
+    )
+    return parser.parse_args()
+
+
+def resolve_market(alias: str) -> openapi.Market:
+    mapping = {
+        "hk": openapi.Market.HK,
+        "us": openapi.Market.US,
+        "cn": openapi.Market.CN,
+        "sg": openapi.Market.SG,
+    }
+    return mapping[alias.lower()]
+
+
+def resolve_category(raw: Optional[str]) -> openapi.SecurityListCategory | None:
+    if not raw:
+        return None
+    lookup = {
+        "overnight": openapi.SecurityListCategory.Overnight,
+    }
+    key = raw.lower()
+    if key not in lookup:
+        raise ValueError(f"不支持的 category 参数: {raw}")
+    return lookup[key]
+
+
+def main() -> None:
+    args = parse_args()
+    market = resolve_market(args.market)
+    category = resolve_category(args.category)
+
+    universe = fetch_security_list(market, category)
+    symbols = [entry.symbol for entry in universe]
+    static_infos: List[StaticEntry] = []
+    if not args.skip_static:
+        static_infos = fetch_static_info(symbols, args.batch_size)
+
+    asyncio.run(persist_to_database(universe, static_infos))
+    logger.info("同步任务完成")
+
+
+if __name__ == "__main__":
+    main()

@@ -9,20 +9,34 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 
 class DatabaseSessionManager:
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, auto_init: bool = False) -> None:
         self._dsn = dsn
         self._engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        self._auto_init = auto_init
+
+        # If auto_init is True, initialize immediately (for non-context manager usage)
+        if auto_init:
+            self._initialize()
+
+    def _initialize(self) -> None:
+        """Initialize engine and session factory."""
+        if not self._engine:
+            self._engine = create_async_engine(self._dsn, echo=False, pool_pre_ping=True)
+            self._session_factory = async_sessionmaker(self._engine, expire_on_commit=False)
 
     async def __aenter__(self) -> "DatabaseSessionManager":
-        self._engine = create_async_engine(self._dsn, echo=False, pool_pre_ping=True)
-        self._session_factory = async_sessionmaker(self._engine, expire_on_commit=False)
-        from longport_quant.persistence import models
-
-        await self._engine.run_sync(models.Base.metadata.create_all)
+        self._initialize()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._engine:
+            await self._engine.dispose()
+        self._engine = None
+        self._session_factory = None
+
+    async def close(self) -> None:
+        """Explicitly close the database connection."""
         if self._engine:
             await self._engine.dispose()
         self._engine = None

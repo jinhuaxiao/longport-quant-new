@@ -24,7 +24,10 @@ dependencies = [
   "apscheduler>=3.10",
   "python-dotenv>=1.0",
   "PyYAML>=6.0",
-  "longport>=3.0.14"
+  "longport>=3.0.14",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "ta>=0.10"
 ]
 
 [project.optional-dependencies]

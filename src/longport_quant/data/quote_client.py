@@ -27,7 +27,39 @@ class QuoteDataClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        self._ctx = None
+        """清理资源，关闭连接"""
+        if self._ctx is not None:
+            try:
+                # 尝试取消所有订阅（如果有的话）
+                try:
+                    subs = await asyncio.to_thread(self._ctx.subscriptions)
+                    if subs:
+                        logger.debug(f"Unsubscribing {len(subs)} subscriptions before closing QuoteContext")
+                        for sub in subs:
+                            try:
+                                await asyncio.to_thread(
+                                    self._ctx.unsubscribe,
+                                    [sub.symbol],
+                                    [sub.sub_types[0]] if sub.sub_types else []
+                                )
+                            except Exception as e:
+                                logger.debug(f"Failed to unsubscribe {sub.symbol}: {e}")
+                except Exception as e:
+                    logger.debug(f"Failed to get subscriptions: {e}")
+
+                # 强制删除对象，触发底层资源清理
+                ctx_to_delete = self._ctx
+                self._ctx = None
+                del ctx_to_delete
+
+                # 建议垃圾回收器立即回收
+                import gc
+                gc.collect()
+
+                logger.debug("QuoteContext cleaned up and resources released")
+            except Exception as e:
+                logger.warning(f"Error during QuoteContext cleanup: {e}")
+                self._ctx = None
 
     async def get_static_info(self, symbols: List[str]) -> List[openapi.SecurityStaticInfo]:
         ctx = await self._ensure_context()

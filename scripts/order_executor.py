@@ -39,6 +39,11 @@ from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.stop_manager import StopLossManager
 
 
+class InsufficientFundsError(Exception):
+    """资金不足异常"""
+    pass
+
+
 class OrderExecutor:
     """订单执行器（从队列消费信号并执行）"""
 
@@ -101,6 +106,17 @@ class OrderExecutor:
 
                 logger.info("✅ 订单执行器初始化完成")
 
+                # 启动时恢复所有僵尸信号
+                logger.info("🔧 检查并恢复僵尸信号...")
+                try:
+                    recovered_count = await self.signal_queue.recover_zombie_signals(timeout_seconds=0)
+                    if recovered_count > 0:
+                        logger.warning(f"⚠️ 发现并恢复了 {recovered_count} 个卡住的信号")
+                    else:
+                        logger.info("✅ 没有需要恢复的信号")
+                except Exception as e:
+                    logger.warning(f"⚠️ 恢复僵尸信号时出错: {e}")
+
                 logger.info(f"📥 开始监听信号队列: {self.settings.signal_queue_key}")
                 logger.info(f"🔄 最大重试次数: {self.settings.signal_max_retries}")
                 logger.info("")
@@ -123,11 +139,32 @@ class OrderExecutor:
                         logger.info(f"📥 收到信号: {symbol}, 类型={signal_type}, 评分={score}")
                         logger.info(f"{'='*70}")
 
-                        # 执行订单
+                        # 执行订单（带超时保护）
                         try:
-                            await self.execute_order(signal)
+                            # 60秒超时保护
+                            await asyncio.wait_for(
+                                self.execute_order(signal),
+                                timeout=60.0
+                            )
 
                             # 标记信号处理完成
+                            await self.signal_queue.mark_signal_completed(signal)
+
+                        except asyncio.TimeoutError:
+                            error_msg = "订单执行超时（60秒）"
+                            logger.error(f"❌ {error_msg}: {symbol}")
+
+                            # 标记信号失败（会自动重试）
+                            await self.signal_queue.mark_signal_failed(
+                                signal,
+                                error_message=error_msg,
+                                retry=True
+                            )
+
+                        except InsufficientFundsError as e:
+                            # 资金不足：直接标记为完成，不重试
+                            # （避免资金不足的信号反复重试浪费资源）
+                            logger.info(f"  ℹ️ {symbol}: 资金不足，跳过此信号")
                             await self.signal_queue.mark_signal_completed(signal)
 
                         except Exception as e:
@@ -196,8 +233,8 @@ class OrderExecutor:
 
         # 2. 弱买入信号过滤
         if signal_type == "WEAK_BUY" and score < 35:
-            logger.debug(f"  ⏭️ 跳过弱买入信号 (评分: {score})")
-            return
+            logger.info(f"  ⏭️ 跳过弱买入信号 (评分: {score})")
+            return  # 直接返回，信号会被标记为完成
 
         # 3. 资金检查
         currency = "HKD" if ".HK" in symbol else "USD"
@@ -211,8 +248,8 @@ class OrderExecutor:
             if account.get('buy_power', {}).get(currency, 0) > 1000:
                 logger.info(f"  💳 使用购买力进行交易")
             else:
-                logger.warning(f"  ⏭️ 跳过交易，等待资金正常")
-                return
+                logger.warning(f"  ⏭️ 账户资金异常，跳过交易")
+                raise InsufficientFundsError(f"账户资金异常（显示为负数: ${available_cash:.2f}）")
 
         # 4. 计算动态预算
         dynamic_budget = self._calculate_dynamic_budget(account, signal)
@@ -231,18 +268,52 @@ class OrderExecutor:
                 f"(手数: {lot_size}, 需要: ${lot_size * current_price:.2f}, "
                 f"动态预算: ${dynamic_budget:.2f})"
             )
-            return
+            raise InsufficientFundsError(f"动态预算不足（需要${lot_size * current_price:.2f}，预算${dynamic_budget:.2f}）")
 
         num_lots = quantity // lot_size
         required_cash = current_price * quantity
 
-        # 7. 资金充足性检查
+        # 7. 资金充足性检查（带智能轮换）
         if required_cash > available_cash:
             logger.warning(
                 f"  ⚠️ {symbol}: 资金不足 "
                 f"(需要 ${required_cash:.2f}, 可用 ${available_cash:.2f})"
             )
-            return
+
+            # 尝试智能持仓轮换释放资金
+            needed_amount = required_cash - available_cash
+            logger.info(f"  🔄 尝试智能持仓轮换释放 ${needed_amount:,.2f}...")
+
+            rotation_success, freed_amount = await self._try_smart_rotation(
+                signal, needed_amount
+            )
+
+            if rotation_success:
+                logger.success(f"  ✅ 智能轮换成功，已释放 ${freed_amount:,.2f}")
+
+                # 重新获取账户信息
+                try:
+                    account = await self.trade_client.get_account()
+                    available_cash = account["cash"].get(currency, 0)
+
+                    if available_cash >= required_cash:
+                        logger.success(f"  💰 轮换后可用资金: ${available_cash:,.2f}，继续执行订单")
+                    else:
+                        logger.warning(
+                            f"  ⚠️ 轮换后资金仍不足 "
+                            f"(需要 ${required_cash:.2f}, 可用 ${available_cash:.2f})"
+                        )
+                        raise InsufficientFundsError(
+                            f"轮换后资金仍不足（需要${required_cash:.2f}，可用${available_cash:.2f}）"
+                        )
+                except Exception as e:
+                    logger.error(f"  ❌ 重新获取账户信息失败: {e}")
+                    raise
+            else:
+                logger.warning(f"  ⚠️ 智能轮换未能释放足够资金")
+                raise InsufficientFundsError(
+                    f"资金不足且无法通过轮换释放（需要${required_cash:.2f}，可用${available_cash:.2f}）"
+                )
 
         # 8. 获取买卖盘价格
         bid_price, ask_price = await self._get_bid_ask(symbol)
@@ -581,6 +652,52 @@ class OrderExecutor:
 
         except Exception as e:
             logger.warning(f"⚠️ 发送Slack通知失败: {e}")
+
+    async def _try_smart_rotation(
+        self,
+        signal: Dict,
+        needed_amount: float
+    ) -> tuple[bool, float]:
+        """
+        尝试通过智能持仓轮换释放资金
+
+        Args:
+            signal: 新信号数据（包含symbol, score等）
+            needed_amount: 需要释放的资金量
+
+        Returns:
+            (成功与否, 实际释放的资金量)
+        """
+        try:
+            # 动态导入SmartPositionRotator
+            import sys
+            from pathlib import Path
+            sys.path.append(str(Path(__file__).parent))
+
+            from smart_position_rotation import SmartPositionRotator
+
+            rotator = SmartPositionRotator()
+
+            # 调用智能轮换释放资金
+            success, freed = await rotator.try_free_up_funds(
+                needed_amount=needed_amount,
+                new_signal=signal,
+                trade_client=self.trade_client,
+                quote_client=self.quote_client,
+                score_threshold=10  # 新信号需高出10分才替换
+            )
+
+            return success, freed
+
+        except ImportError as e:
+            logger.error(f"❌ 导入SmartPositionRotator失败: {e}")
+            logger.warning("⚠️ 智能轮换功能不可用，跳过轮换尝试")
+            return False, 0.0
+        except Exception as e:
+            logger.error(f"❌ 智能轮换执行失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False, 0.0
 
 
 async def main():

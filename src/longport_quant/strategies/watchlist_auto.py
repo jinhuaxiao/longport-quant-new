@@ -11,7 +11,7 @@ from longport_quant.config import get_settings
 from longport_quant.data.watchlist import WatchlistLoader
 from longport_quant.execution.order_router import OrderRouter
 from longport_quant.portfolio.state import PortfolioService
-from longport_quant.strategy.base import Signal, StrategyBase
+from longport_quant.common.types import Signal, StrategyBase
 
 
 class AutoTradeStrategy(StrategyBase):

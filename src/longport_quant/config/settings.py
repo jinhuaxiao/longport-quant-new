@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     )
     redis_url: str = Field("redis://localhost:6379/0", alias="REDIS_URL")
 
+    # 信号队列配置（用于解耦信号生成和订单执行）
+    signal_queue_key: str = Field("trading:signals", alias="SIGNAL_QUEUE_KEY")
+    signal_processing_key: str = Field("trading:signals:processing", alias="SIGNAL_PROCESSING_KEY")
+    signal_failed_key: str = Field("trading:signals:failed", alias="SIGNAL_FAILED_KEY")
+    signal_max_retries: int = Field(3, alias="SIGNAL_MAX_RETRIES")
+    signal_queue_max_size: int = Field(1000, alias="SIGNAL_QUEUE_MAX_SIZE")
+    order_executor_workers: int = Field(1, alias="ORDER_EXECUTOR_WORKERS")
+
     watchlist_path: Path = Field(Path("configs/watchlist.yml"), alias="WATCHLIST_PATH")
     strategy_modules: List[str] = Field(default_factory=list, alias="STRATEGY_MODULES")
     active_markets: List[str] = Field(default_factory=list, alias="ACTIVE_MARKETS")

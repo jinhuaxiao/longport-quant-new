@@ -35,6 +35,13 @@ class OrderRouter(AbstractAsyncContextManager):
     def bind_risk_engine(self, risk_engine: RiskEngine) -> None:
         self._risk_engine = risk_engine
 
+    @property
+    def trading_client(self) -> LongportTradingClient:
+        return self._client
+
+    async def get_trade_context(self) -> openapi.TradeContext:
+        return await self._client.get_trade_context()
+
     async def submit(self, order: dict) -> dict:
         if self._risk_engine and not self._risk_engine.validate_order(order):
             logger.warning("Order blocked by risk engine: {}", order)

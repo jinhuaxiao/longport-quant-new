@@ -1,0 +1,466 @@
+"""Create materialized views for multi-timeframe K-lines.
+
+This migration creates materialized views for:
+- 5-minute K-lines
+- 15-minute K-lines
+- 30-minute K-lines
+- 60-minute K-lines
+
+These views aggregate minute-level data for faster querying of higher timeframes.
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+def upgrade():
+    """Create materialized views and refresh functions."""
+
+    # Create function to aggregate K-line data
+    op.execute("""
+        CREATE OR REPLACE FUNCTION aggregate_kline(
+            p_open DECIMAL(12,4),
+            p_high DECIMAL(12,4),
+            p_low DECIMAL(12,4),
+            p_close DECIMAL(12,4),
+            p_volume BIGINT,
+            p_turnover DECIMAL(18,2)
+        ) RETURNS TABLE(
+            open DECIMAL(12,4),
+            high DECIMAL(12,4),
+            low DECIMAL(12,4),
+            close DECIMAL(12,4),
+            volume BIGINT,
+            turnover DECIMAL(18,2)
+        ) AS $$
+        BEGIN
+            RETURN QUERY
+            SELECT
+                FIRST_VALUE(p_open) OVER (ORDER BY timestamp),
+                MAX(p_high),
+                MIN(p_low),
+                LAST_VALUE(p_close) OVER (ORDER BY timestamp),
+                SUM(p_volume),
+                SUM(p_turnover);
+        END;
+        $$ LANGUAGE plpgsql;
+    """)
+
+    # Create 5-minute K-line materialized view
+    op.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kline_5min AS
+        WITH aggregated AS (
+            SELECT
+                symbol,
+                DATE_TRUNC('hour', timestamp) +
+                    INTERVAL '5 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 5) AS timestamp_5min,
+                FIRST_VALUE(open) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '5 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 5)
+                    ORDER BY timestamp
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS open,
+                MAX(high) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '5 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 5)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS high,
+                MIN(low) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '5 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 5)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS low,
+                LAST_VALUE(close) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '5 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 5)
+                    ORDER BY timestamp
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS close,
+                SUM(volume) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '5 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 5)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS volume,
+                SUM(turnover) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '5 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 5)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS turnover,
+                ROW_NUMBER() OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '5 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 5)
+                    ORDER BY timestamp DESC
+                ) AS rn
+            FROM kline_minute
+            WHERE timestamp >= NOW() - INTERVAL '30 days'
+        )
+        SELECT
+            symbol,
+            timestamp_5min AS timestamp,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            turnover
+        FROM aggregated
+        WHERE rn = 1
+        ORDER BY symbol, timestamp_5min DESC
+    """)
+
+    # Create index on 5-minute view
+    op.execute("""
+        CREATE UNIQUE INDEX idx_kline_5min_symbol_timestamp
+        ON kline_5min (symbol, timestamp DESC)
+    """)
+
+    # Create 15-minute K-line materialized view
+    op.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kline_15min AS
+        WITH aggregated AS (
+            SELECT
+                symbol,
+                DATE_TRUNC('hour', timestamp) +
+                    INTERVAL '15 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 15) AS timestamp_15min,
+                FIRST_VALUE(open) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '15 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 15)
+                    ORDER BY timestamp
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS open,
+                MAX(high) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '15 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 15)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS high,
+                MIN(low) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '15 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 15)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS low,
+                LAST_VALUE(close) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '15 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 15)
+                    ORDER BY timestamp
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS close,
+                SUM(volume) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '15 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 15)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS volume,
+                SUM(turnover) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '15 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 15)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS turnover,
+                ROW_NUMBER() OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '15 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 15)
+                    ORDER BY timestamp DESC
+                ) AS rn
+            FROM kline_minute
+            WHERE timestamp >= NOW() - INTERVAL '30 days'
+        )
+        SELECT
+            symbol,
+            timestamp_15min AS timestamp,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            turnover
+        FROM aggregated
+        WHERE rn = 1
+        ORDER BY symbol, timestamp_15min DESC
+    """)
+
+    # Create index on 15-minute view
+    op.execute("""
+        CREATE UNIQUE INDEX idx_kline_15min_symbol_timestamp
+        ON kline_15min (symbol, timestamp DESC)
+    """)
+
+    # Create 30-minute K-line materialized view
+    op.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kline_30min AS
+        WITH aggregated AS (
+            SELECT
+                symbol,
+                DATE_TRUNC('hour', timestamp) +
+                    INTERVAL '30 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 30) AS timestamp_30min,
+                FIRST_VALUE(open) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '30 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 30)
+                    ORDER BY timestamp
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS open,
+                MAX(high) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '30 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 30)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS high,
+                MIN(low) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '30 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 30)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS low,
+                LAST_VALUE(close) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '30 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 30)
+                    ORDER BY timestamp
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS close,
+                SUM(volume) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '30 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 30)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS volume,
+                SUM(turnover) OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '30 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 30)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS turnover,
+                ROW_NUMBER() OVER (
+                    PARTITION BY symbol,
+                    DATE_TRUNC('hour', timestamp) +
+                        INTERVAL '30 minutes' * FLOOR(EXTRACT(minute FROM timestamp) / 30)
+                    ORDER BY timestamp DESC
+                ) AS rn
+            FROM kline_minute
+            WHERE timestamp >= NOW() - INTERVAL '30 days'
+        )
+        SELECT
+            symbol,
+            timestamp_30min AS timestamp,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            turnover
+        FROM aggregated
+        WHERE rn = 1
+        ORDER BY symbol, timestamp_30min DESC
+    """)
+
+    # Create index on 30-minute view
+    op.execute("""
+        CREATE UNIQUE INDEX idx_kline_30min_symbol_timestamp
+        ON kline_30min (symbol, timestamp DESC)
+    """)
+
+    # Create 60-minute K-line materialized view
+    op.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kline_60min AS
+        WITH aggregated AS (
+            SELECT
+                symbol,
+                DATE_TRUNC('hour', timestamp) AS timestamp_60min,
+                FIRST_VALUE(open) OVER (
+                    PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                    ORDER BY timestamp
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS open,
+                MAX(high) OVER (
+                    PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS high,
+                MIN(low) OVER (
+                    PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS low,
+                LAST_VALUE(close) OVER (
+                    PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                    ORDER BY timestamp
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS close,
+                SUM(volume) OVER (
+                    PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS volume,
+                SUM(turnover) OVER (
+                    PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) AS turnover,
+                ROW_NUMBER() OVER (
+                    PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                    ORDER BY timestamp DESC
+                ) AS rn
+            FROM kline_minute
+            WHERE timestamp >= NOW() - INTERVAL '30 days'
+        )
+        SELECT
+            symbol,
+            timestamp_60min AS timestamp,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            turnover
+        FROM aggregated
+        WHERE rn = 1
+        ORDER BY symbol, timestamp_60min DESC
+    """)
+
+    # Create index on 60-minute view
+    op.execute("""
+        CREATE UNIQUE INDEX idx_kline_60min_symbol_timestamp
+        ON kline_60min (symbol, timestamp DESC)
+    """)
+
+    # Create refresh function for all materialized views
+    op.execute("""
+        CREATE OR REPLACE FUNCTION refresh_kline_views()
+        RETURNS void AS $$
+        BEGIN
+            -- Refresh all K-line materialized views
+            REFRESH MATERIALIZED VIEW CONCURRENTLY kline_5min;
+            REFRESH MATERIALIZED VIEW CONCURRENTLY kline_15min;
+            REFRESH MATERIALIZED VIEW CONCURRENTLY kline_30min;
+            REFRESH MATERIALIZED VIEW CONCURRENTLY kline_60min;
+
+            RAISE NOTICE 'K-line materialized views refreshed at %', NOW();
+        END;
+        $$ LANGUAGE plpgsql;
+    """)
+
+    # Create automatic refresh trigger (called after minute K-line insert)
+    op.execute("""
+        CREATE OR REPLACE FUNCTION trigger_refresh_kline_views()
+        RETURNS trigger AS $$
+        BEGIN
+            -- Only refresh if more than 5 minutes have passed since last refresh
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_stat_all_tables
+                WHERE schemaname = 'public'
+                AND tablename = 'kline_5min'
+                AND last_vacuum > NOW() - INTERVAL '5 minutes'
+            ) THEN
+                PERFORM refresh_kline_views();
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+    """)
+
+    # Create statistics tracking table for views
+    op.execute("""
+        CREATE TABLE IF NOT EXISTS materialized_view_stats (
+            view_name VARCHAR(50) PRIMARY KEY,
+            last_refresh TIMESTAMP,
+            refresh_duration INTERVAL,
+            row_count BIGINT,
+            size_bytes BIGINT
+        )
+    """)
+
+    # Function to update statistics
+    op.execute("""
+        CREATE OR REPLACE FUNCTION update_view_stats()
+        RETURNS void AS $$
+        DECLARE
+            v_record RECORD;
+            v_start TIMESTAMP;
+            v_end TIMESTAMP;
+        BEGIN
+            FOR v_record IN
+                SELECT 'kline_5min' AS name UNION ALL
+                SELECT 'kline_15min' UNION ALL
+                SELECT 'kline_30min' UNION ALL
+                SELECT 'kline_60min'
+            LOOP
+                v_start := clock_timestamp();
+
+                INSERT INTO materialized_view_stats (view_name, last_refresh, row_count, size_bytes)
+                VALUES (
+                    v_record.name,
+                    NOW(),
+                    (SELECT COUNT(*) FROM kline_5min WHERE v_record.name = 'kline_5min'
+                     UNION ALL
+                     SELECT COUNT(*) FROM kline_15min WHERE v_record.name = 'kline_15min'
+                     UNION ALL
+                     SELECT COUNT(*) FROM kline_30min WHERE v_record.name = 'kline_30min'
+                     UNION ALL
+                     SELECT COUNT(*) FROM kline_60min WHERE v_record.name = 'kline_60min'
+                     LIMIT 1),
+                    pg_total_relation_size(v_record.name::regclass)
+                )
+                ON CONFLICT (view_name)
+                DO UPDATE SET
+                    last_refresh = NOW(),
+                    refresh_duration = NOW() - v_start,
+                    row_count = EXCLUDED.row_count,
+                    size_bytes = EXCLUDED.size_bytes;
+
+                v_end := clock_timestamp();
+            END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;
+    """)
+
+    # Create scheduled job to refresh views every 5 minutes
+    op.execute("""
+        CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+        -- Schedule refresh every 5 minutes during trading hours
+        SELECT cron.schedule(
+            'refresh-kline-views',
+            '*/5 9-16 * * 1-5',
+            'SELECT refresh_kline_views();'
+        );
+
+        -- Schedule stats update every hour
+        SELECT cron.schedule(
+            'update-view-stats',
+            '0 * * * *',
+            'SELECT update_view_stats();'
+        );
+    """)
+
+
+def downgrade():
+    """Drop materialized views and related objects."""
+
+    # Drop scheduled jobs
+    op.execute("""
+        SELECT cron.unschedule('refresh-kline-views');
+        SELECT cron.unschedule('update-view-stats');
+    """)
+
+    # Drop materialized views
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS kline_60min CASCADE")
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS kline_30min CASCADE")
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS kline_15min CASCADE")
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS kline_5min CASCADE")
+
+    # Drop functions
+    op.execute("DROP FUNCTION IF EXISTS refresh_kline_views() CASCADE")
+    op.execute("DROP FUNCTION IF EXISTS trigger_refresh_kline_views() CASCADE")
+    op.execute("DROP FUNCTION IF EXISTS update_view_stats() CASCADE")
+    op.execute("DROP FUNCTION IF EXISTS aggregate_kline() CASCADE")
+
+    # Drop statistics table
+    op.execute("DROP TABLE IF EXISTS materialized_view_stats")

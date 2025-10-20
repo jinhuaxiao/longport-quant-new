@@ -18,21 +18,45 @@ from longport_quant.features.technical_indicators import TechnicalIndicators
 from longport_quant.notifications.slack import SlackNotifier
 from longport_quant.utils import LotSizeHelper
 from longport_quant.persistence.order_manager import OrderManager
+from longport_quant.persistence.stop_manager import StopLossManager
+
+
+def sanitize_unicode(text: str) -> str:
+    """清理无效的Unicode字符,防止surrogate pair错误
+
+    Args:
+        text: 需要清理的字符串
+
+    Returns:
+        清理后的字符串
+    """
+    if not text:
+        return text
+
+    try:
+        # 使用'surrogateescape'错误处理器编码再解码,去除无效字符
+        # 或者使用'ignore'直接忽略无效字符
+        return text.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
+    except Exception:
+        # 如果还是失败,返回ASCII安全的版本
+        return text.encode('ascii', errors='ignore').decode('ascii')
 
 
 class AdvancedTechnicalTrader:
     """高级技术指标交易系统"""
 
-    def __init__(self, use_builtin_watchlist=False):
+    def __init__(self, use_builtin_watchlist=False, max_iterations=None):
         """初始化交易系统
 
         Args:
             use_builtin_watchlist: 是否使用内置的监控列表（而不是从watchlist.yml加载）
+            max_iterations: 最大迭代次数，None表示无限循环
         """
         self.settings = get_settings()
         self.beijing_tz = ZoneInfo('Asia/Shanghai')
         self.slack = None  # Will be initialized in run()
         self.use_builtin_watchlist = use_builtin_watchlist
+        self.max_iterations = max_iterations
 
         # 港股监控列表（用户自定义15只股票）
         self.hk_watchlist = {
@@ -60,6 +84,14 @@ class AdvancedTechnicalTrader:
 
             # 工业股
             "0558.HK": {"name": "力劲科技", "sector": "工业"},
+
+            # 银行股
+            "0005.HK": {"name": "汇丰控股", "sector": "银行"},
+            "1398.HK": {"name": "工商银行", "sector": "银行"},
+
+            # 能源股
+            "0857.HK": {"name": "中国石油", "sector": "能源"},
+            "0883.HK": {"name": "中国海洋石油", "sector": "能源"},
         }
 
         # 美股监控列表
@@ -87,7 +119,16 @@ class AdvancedTechnicalTrader:
         }
 
         # 交易参数（动态调整）
-        self.max_positions = 10  # 最大持仓数
+        self.max_positions = 999  # 不限制持仓数量（实际受资金限制）
+
+        # 分市场持仓限制（避免单一市场过度集中）
+        self.max_positions_by_market = {
+            'HK': 8,   # 港股最多8个
+            'US': 5,   # 美股最多5个
+            'SH': 2,   # A股上交所最多2个
+            'SZ': 2,   # A股深交所最多2个
+        }
+
         self.min_position_size_pct = 0.05  # 最小仓位比例（账户总值的5%）
         self.max_position_size_pct = 0.30  # 最大仓位比例（账户总值的30%）
         self.max_daily_trades_per_symbol = 2  # 每个标的每天最多交易次数（可根据VIP级别调整）
@@ -132,25 +173,65 @@ class AdvancedTechnicalTrader:
         # 持仓管理
         self.positions_with_stops = {}  # {symbol: {entry_price, stop_loss, take_profit}}
 
+        # 止损止盈持久化管理器
+        self.stop_manager = StopLossManager()
+
+        # 账户信息缓存
+        self._cached_account = None
+        self._last_account_update = None
+
         # 手数辅助工具
         self.lot_size_helper = LotSizeHelper()
 
         logger.info("初始化高级技术指标交易系统")
         logger.info(f"策略: RSI + 布林带 + MACD + 成交量确认 + ATR动态止损")
 
+    def _normalize_hk_symbol(self, symbol):
+        """标准化港股代码格式 - 确保是4位数字"""
+        if symbol.endswith('.HK'):
+            code = symbol[:-3]  # 移除.HK后缀
+            # 如果代码少于4位，在前面补0
+            if len(code) < 4 and code.isdigit():
+                code = code.zfill(4)  # 补齐到4位
+                return f"{code}.HK"
+        return symbol
+
+    def _get_market(self, symbol):
+        """获取标的所属市场
+
+        Returns:
+            str: 市场代码 ('HK', 'US', 'SH', 'SZ', 'UNKNOWN')
+        """
+        if '.HK' in symbol:
+            return 'HK'
+        elif '.US' in symbol:
+            return 'US'
+        elif '.SH' in symbol:
+            return 'SH'
+        elif '.SZ' in symbol:
+            return 'SZ'
+        return 'UNKNOWN'
+
     def _get_symbol_name(self, symbol):
         """获取标的的中文名称"""
-        # 检查港股
-        if symbol in self.hk_watchlist:
-            return self.hk_watchlist[symbol]["name"]
+        # 先尝试标准化港股代码
+        normalized_symbol = self._normalize_hk_symbol(symbol)
+
+        name = ""
+        # 检查港股（使用标准化后的代码）
+        if normalized_symbol in self.hk_watchlist:
+            name = self.hk_watchlist[normalized_symbol]["name"]
+        elif symbol in self.hk_watchlist:  # 也尝试原始代码
+            name = self.hk_watchlist[symbol]["name"]
         # 检查美股
         elif symbol in self.us_watchlist:
-            return self.us_watchlist[symbol]["name"]
+            name = self.us_watchlist[symbol]["name"]
         # 检查A股
         elif hasattr(self, 'a_watchlist') and symbol in self.a_watchlist:
-            return self.a_watchlist[symbol]["name"]
-        # 返回空字符串或原始代码
-        return ""
+            name = self.a_watchlist[symbol]["name"]
+
+        # 清理Unicode字符以防止编码错误
+        return sanitize_unicode(name) if name else ""
 
     async def run(self):
         """主运行循环"""
@@ -200,6 +281,53 @@ class AdvancedTechnicalTrader:
             # 初始化时检查今日已有的订单
             await self._init_today_orders()
 
+            # 从数据库加载已保存的止损止盈设置
+            logger.info("📂 加载持久化的止损止盈设置...")
+            all_stops = await self.stop_manager.load_active_stops()
+
+            # 过滤：只保留实际持仓中存在的止损记录（排除测试数据）
+            current_positions = set(account.get("positions", {}).keys())
+            self.positions_with_stops = {
+                symbol: stops
+                for symbol, stops in all_stops.items()
+                if symbol in current_positions
+            }
+
+            # 如果有被过滤掉的记录，显示警告
+            filtered_out = set(all_stops.keys()) - current_positions
+            if filtered_out:
+                logger.warning(
+                    f"⚠️  过滤掉 {len(filtered_out)} 个不在持仓中的止损记录: "
+                    f"{list(filtered_out)}"
+                )
+
+            if self.positions_with_stops:
+                logger.info(f"✅ 已加载 {len(self.positions_with_stops)} 个有效止损止盈设置:")
+                for symbol, stops in self.positions_with_stops.items():
+                    logger.info(f"  {symbol}: 止损=${stops['stop_loss']:.2f}, 止盈=${stops['take_profit']:.2f}")
+            else:
+                logger.info("📭 没有找到有效的止损止盈设置")
+
+            # 启动信号处理器（不论是否使用WebSocket都需要处理信号队列）
+            logger.info("🚀 准备启动信号处理器...")
+            processor_task = asyncio.create_task(self.signal_processor())
+            logger.success(f"✅ 信号处理器任务已创建: {processor_task}")
+
+            # 等待一小段时间，确保处理器已启动
+            await asyncio.sleep(0.5)
+
+            # 检查处理器是否正常运行
+            if processor_task.done():
+                try:
+                    processor_task.result()
+                except Exception as e:
+                    logger.error(f"❌ 信号处理器启动失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+            else:
+                logger.success("✅ 信号处理器正在运行")
+
             # 主循环
             iteration = 0
             while True:
@@ -207,6 +335,69 @@ class AdvancedTechnicalTrader:
                 logger.info(f"\n{'='*70}")
                 logger.info(f"第 {iteration} 轮扫描 - {datetime.now(self.beijing_tz).strftime('%H:%M:%S')}")
                 logger.info(f"{'='*70}")
+
+                # 检查是否达到最大迭代次数
+                if self.max_iterations and iteration > self.max_iterations:
+                    logger.info(f"✅ 达到最大迭代次数 {self.max_iterations}，停止运行")
+                    break
+
+                # 定期重置数据库连接池（防止连接泄漏）
+                if iteration % 5 == 0:  # 每5轮（5分钟）重置一次
+                    try:
+                        await self.stop_manager.reset_pool()
+
+                        # 检查文件描述符数量并执行自动降级
+                        import os
+                        pid = os.getpid()
+                        try:
+                            fd_count = len(os.listdir(f'/proc/{pid}/fd'))
+                            logger.info(f"📊 当前文件描述符数量: {fd_count}")
+
+                            # 🔴 危险级别：超过 900，自动退出重启
+                            if fd_count > 900:
+                                logger.critical(f"🔴 文件描述符危险 ({fd_count}/1024)！强制退出以防止系统崩溃")
+                                logger.critical("   建议使用 bash scripts/safe_restart_trading.sh 重启")
+                                break  # 退出主循环
+
+                            # 🟠 严重级别：超过 800，暂停交易
+                            elif fd_count > 800:
+                                logger.error(f"🟠 文件描述符过多 ({fd_count})！暂停交易，仅保留监控")
+                                # 禁用WebSocket（如果启用）
+                                if hasattr(self, 'websocket_enabled') and self.websocket_enabled:
+                                    logger.warning("   🔌 禁用 WebSocket 订阅以减少连接")
+                                    try:
+                                        await self.quote_client.unsubscribe(
+                                            list(self.subscribed_symbols),
+                                            [openapi.SubType.Quote]
+                                        )
+                                        self.websocket_enabled = False
+                                    except Exception as e:
+                                        logger.debug(f"取消订阅失败: {e}")
+
+                            # 🟡 警告级别：超过 600，禁用 WebSocket
+                            elif fd_count > 600:
+                                logger.warning(f"🟡 文件描述符较多 ({fd_count})，禁用 WebSocket")
+                                if hasattr(self, 'websocket_enabled') and self.websocket_enabled:
+                                    try:
+                                        await self.quote_client.unsubscribe(
+                                            list(self.subscribed_symbols),
+                                            [openapi.SubType.Quote]
+                                        )
+                                        self.websocket_enabled = False
+                                        logger.info("   ✅ 已切换到轮询模式")
+                                    except Exception as e:
+                                        logger.debug(f"取消订阅失败: {e}")
+
+                            # 🟢 正常级别：超过 300，触发紧急重置
+                            elif fd_count > 300:
+                                logger.info(f"🟢 文件描述符正常 ({fd_count})，执行紧急连接池重置")
+                                await self.stop_manager.reset_pool()
+
+                        except Exception as fd_check_error:
+                            logger.debug(f"文件描述符检查失败: {fd_check_error}")
+
+                    except Exception as e:
+                        logger.warning(f"重置连接池失败: {e}")
 
                 try:
                     # 1. 检查当前活跃市场
@@ -219,7 +410,15 @@ class AdvancedTechnicalTrader:
                     # 1a. 动态合并监控列表（确保包含所有持仓）
                     # 获取当前账户持仓
                     temp_account = await self.check_account_status()
-                    position_symbols = list(temp_account.get("positions", {}).keys())
+                    raw_position_symbols = list(temp_account.get("positions", {}).keys())
+
+                    # 标准化持仓中的港股代码
+                    position_symbols = []
+                    for sym in raw_position_symbols:
+                        normalized = self._normalize_hk_symbol(sym)
+                        position_symbols.append(normalized)
+                        if normalized != sym:
+                            logger.debug(f"  标准化股票代码: {sym} → {normalized}")
 
                     # 合并原始监控列表和持仓列表（去重）
                     all_monitored_symbols = list(set(symbols + position_symbols))
@@ -335,6 +534,27 @@ class AdvancedTechnicalTrader:
                             # 显示信号
                             await self._display_signal(symbol, signal, current_price)
 
+                            # 如果是WebSocket模式且信号处理器正在运行，将信号加入队列
+                            if self.websocket_enabled and hasattr(self, 'signal_queue'):
+                                # 计算优先级（负数，因为PriorityQueue是最小堆）
+                                priority = -signal.get('strength', 0)
+
+                                # 加入优先级队列
+                                await self.signal_queue.put((
+                                    priority,
+                                    {
+                                        'symbol': symbol,
+                                        'signal': signal,
+                                        'price': current_price,
+                                        'quote': quote,
+                                        'timestamp': datetime.now()
+                                    }
+                                ))
+
+                                logger.info(f"🔔 {symbol}: 轮询信号入队（WebSocket模式），评分={signal.get('strength', 0)}")
+                                continue  # 交给信号处理器处理，避免重复
+
+                            # 非WebSocket模式，直接处理
                             # 检查是否可以开仓
                             can_open = await self._can_open_position(symbol, account)
 
@@ -624,8 +844,7 @@ class AdvancedTechnicalTrader:
             logger.success(f"✅ 成功订阅 {len(symbols)} 个标的的实时行情推送")
             logger.info("   WebSocket连接已建立，将实时接收行情更新")
 
-            # 启动异步信号处理器
-            asyncio.create_task(self.signal_processor())
+            # 信号处理器已在主循环开始时启动，无需重复启动
 
         except Exception as e:
             logger.warning(f"⚠️ WebSocket订阅失败，将使用轮询模式: {e}")
@@ -690,35 +909,60 @@ class AdvancedTechnicalTrader:
     async def _handle_realtime_update(self, symbol, quote):
         """
         处理实时行情更新
+
+        优先级：
+        1. 检查持仓的止损止盈（最高优先级）
+        2. 分析新的买入信号
         """
         try:
             current_price = float(quote.last_done)
             if current_price <= 0:
                 return
 
-            # 快速分析是否有信号
-            signal = await self.analyze_symbol_advanced(symbol, current_price, quote)
+            # 步骤1：检查是否为持仓标的（优先处理止损止盈）
+            if hasattr(self, '_cached_account') and self._cached_account:
+                positions = self._cached_account.get("positions", {})
 
-            if signal:
-                # 计算优先级（负数，因为PriorityQueue是最小堆）
-                priority = -signal.get('strength', 0)
+                if symbol in positions:
+                    position = positions[symbol]
 
-                # 加入优先级队列
-                await self.signal_queue.put((
-                    priority,
-                    {
-                        'symbol': symbol,
-                        'signal': signal,
-                        'price': current_price,
-                        'quote': quote,
-                        'timestamp': datetime.now()
-                    }
-                ))
+                    # 实时检查止损止盈
+                    triggered, trigger_type = await self.check_realtime_stop_loss(
+                        symbol, current_price, position
+                    )
 
-                logger.info(f"🔔 {symbol}: 实时信号入队，评分={signal.get('strength', 0)}")
+                    if triggered:
+                        logger.info(f"⚡ {symbol}: 实时{trigger_type}已执行")
+                        # 更新缓存的账户信息，移除已平仓的持仓
+                        if symbol in self._cached_account["positions"]:
+                            del self._cached_account["positions"][symbol]
+                            self._cached_account["position_count"] -= 1
+                        return  # 止损止盈后不再分析买入信号
+
+                # 步骤2：如果不是持仓或未触发止损止盈，分析买入信号
+                else:
+                    signal = await self.analyze_symbol_advanced(symbol, current_price, quote)
+
+                    if signal:
+                        # 计算优先级（负数，因为PriorityQueue是最小堆）
+                        priority = -signal.get('strength', 0)
+
+                        # 加入优先级队列
+                        await self.signal_queue.put((
+                            priority,
+                            {
+                                'symbol': symbol,
+                                'signal': signal,
+                                'price': current_price,
+                                'quote': quote,
+                                'timestamp': datetime.now()
+                            }
+                        ))
+
+                        logger.info(f"🔔 {symbol}: 实时买入信号入队，评分={signal.get('strength', 0)}")
 
         except Exception as e:
-            logger.debug(f"实时分析失败 {symbol}: {e}")
+            logger.debug(f"实时处理失败 {symbol}: {e}")
 
     async def signal_processor(self):
         """
@@ -729,7 +973,9 @@ class AdvancedTechnicalTrader:
         while True:
             try:
                 # 从优先级队列获取信号
+                logger.debug("⏳ 等待信号队列...")
                 priority, signal_data = await self.signal_queue.get()
+                logger.info(f"📥 收到信号: {signal_data.get('symbol')}, 优先级={-priority}")
 
                 symbol = signal_data['symbol']
                 signal_type = signal_data.get('type', '')
@@ -759,21 +1005,59 @@ class AdvancedTechnicalTrader:
 
                     # 检查是否可以开仓
                     can_open = await self._can_open_position(symbol, account)
+                    made_room = False  # 标记是否尝试清理过仓位
 
+                    # 如果不能开仓，检查是否因为满仓
+                    if not can_open and account["position_count"] >= self.max_positions:
+                        logger.info(f"  💼 {symbol}: 检测到满仓（{account['position_count']}/{self.max_positions}），尝试智能仓位管理")
+                        logger.debug(f"     新信号: {signal['type']}, 评分: {signal['strength']}/100")
+
+                        # 尝试清理弱势持仓
+                        made_room = await self._try_make_room(signal, account)
+                        if made_room:
+                            logger.success(f"  ✅ {symbol}: 已成功执行仓位清理，等待下一轮检查后执行买入")
+                            # 重新将信号加入队列，等待下一轮处理（确保资金已到账）
+                            priority = signal.get('strength', 50)
+                            await self.signal_queue.put((
+                                -priority,  # 负数表示高优先级
+                                {
+                                    'symbol': symbol,
+                                    'signal': signal,
+                                    'price': current_price,
+                                    'timestamp': datetime.now()
+                                }
+                            ))
+                        else:
+                            logger.info(f"  ⏭️  {symbol}: 评估后决定保持当前持仓，跳过新信号")
+
+                    # 执行交易
                     if can_open:
                         await self.execute_signal(symbol, signal, current_price, account)
-                    else:
+                    elif not made_room:
                         logger.info(f"  ⏳ {symbol}: 无法开仓，跳过")
 
             except asyncio.QueueEmpty:
                 await asyncio.sleep(0.1)
             except Exception as e:
-                logger.error(f"信号处理器错误: {e}")
+                logger.error(f"❌ 信号处理器错误: {type(e).__name__}: {e}")
+                import traceback
+                logger.error(f"   错误详情:\n{traceback.format_exc()}")
                 await asyncio.sleep(1)
+                # 继续运行，不要让处理器崩溃
 
-    async def check_account_status(self):
-        """检查账户状态（支持融资账户）"""
+    async def check_account_status(self, use_cache=False):
+        """检查账户状态（支持融资账户和缓存）
+
+        Args:
+            use_cache: 是否使用缓存（实时行情处理时使用）
+        """
         try:
+            # 如果要求使用缓存且缓存有效（5秒内），返回缓存
+            if use_cache and self._cached_account and self._last_account_update:
+                cache_age = (datetime.now() - self._last_account_update).total_seconds()
+                if cache_age < 5:  # 缓存5秒内有效
+                    return self._cached_account
+
             balances = await self.trade_client.account_balance()
             positions_resp = await self.trade_client.stock_positions()
 
@@ -814,7 +1098,9 @@ class AdvancedTechnicalTrader:
             positions = {}
             for channel in positions_resp.channels:
                 for pos in channel.positions:
-                    positions[pos.symbol] = {
+                    # 标准化港股代码
+                    symbol = self._normalize_hk_symbol(pos.symbol)
+                    positions[symbol] = {
                         "quantity": pos.quantity,
                         "available_quantity": pos.available_quantity,
                         "cost": float(pos.cost_price) if pos.cost_price else 0,
@@ -822,13 +1108,19 @@ class AdvancedTechnicalTrader:
                         "market": pos.market
                     }
 
-            return {
+            account_data = {
                 "cash": cash,
                 "buy_power": buy_power,
                 "net_assets": net_assets,
                 "positions": positions,
                 "position_count": len(positions)
             }
+
+            # 更新缓存
+            self._cached_account = account_data
+            self._last_account_update = datetime.now()
+
+            return account_data
 
         except Exception as e:
             logger.error(f"查询账户状态失败: {e}")
@@ -863,6 +1155,24 @@ class AdvancedTechnicalTrader:
         # 显示风控参数
         logger.info(f"\n  📊 风控状态:")
         logger.info(f"    • 持仓数: {account['position_count']}/{self.max_positions}")
+
+        # 显示各市场持仓数
+        if account["positions"]:
+            market_counts = {}
+            for symbol in account["positions"]:
+                market = self._get_market(symbol)
+                market_counts[market] = market_counts.get(market, 0) + 1
+
+            market_info = []
+            for market in ['HK', 'US', 'SH', 'SZ']:
+                count = market_counts.get(market, 0)
+                limit = self.max_positions_by_market.get(market, 5)
+                if count > 0 or market in ['HK', 'US']:  # 显示有持仓的或主要市场
+                    market_info.append(f"{market}:{count}/{limit}")
+
+            if market_info:
+                logger.info(f"    • 分市场: {', '.join(market_info)}")
+
         logger.info(f"    • 每标的日交易上限: {self.max_daily_trades_per_symbol}次")
 
         # 显示今日交易统计
@@ -887,7 +1197,7 @@ class AdvancedTechnicalTrader:
 
         # 如果已达到每日最大交易次数
         if trade_count >= self.max_daily_trades_per_symbol:
-            logger.info(f"  ⏭️  {symbol}: 今日已交易{trade_count}次，达到上限({self.max_daily_trades_per_symbol}次)")
+            logger.warning(f"  ❌ {symbol}: 今日已交易{trade_count}次，达到上限({self.max_daily_trades_per_symbol}次)")
             return False
 
         # 从数据库检查是否有未完成的买单
@@ -896,28 +1206,44 @@ class AdvancedTechnicalTrader:
             pending_buy_count = sum(1 for o in today_orders
                                    if o.side == "BUY" and o.status in ["New", "WaitToNew", "PartialFilled"])
             if pending_buy_count > 0:
-                logger.info(f"  ⏭️  {symbol}: 有{pending_buy_count}个待成交买单，跳过")
+                logger.warning(f"  ❌ {symbol}: 有{pending_buy_count}个待成交买单，跳过")
                 return False
         except Exception as e:
             logger.debug(f"  数据库查询失败，检查缓存: {e}")
 
         # 检查是否已持有
         if symbol in account["positions"]:
-            logger.info(f"  ⏭️  {symbol}: 已持有，跳过")
+            logger.warning(f"  ❌ {symbol}: 已持有，跳过买入信号")
             return False
 
         # 检查缓存中是否有未完成的买单
         if self._has_pending_buy_order(symbol):
-            logger.info(f"  ⏭️  {symbol}: 有未完成的买单，跳过")
+            logger.warning(f"  ❌ {symbol}: 缓存中有未完成的买单，跳过")
             return False
 
-        # 如果未达到最大持仓数，直接允许
+        # 检查市场持仓限制（避免单一市场过度集中）
+        market = self._get_market(symbol)
+        market_positions = [s for s in account["positions"] if self._get_market(s) == market]
+        market_limit = self.max_positions_by_market.get(market, 5)  # 默认5个
+
+        if len(market_positions) >= market_limit:
+            logger.warning(
+                f"  ❌ {symbol}: {market}市场已达持仓上限 "
+                f"({len(market_positions)}/{market_limit})"
+            )
+            return False
+
+        # 检查总持仓数
         if account["position_count"] < self.max_positions:
-            logger.debug(f"  ✅ {symbol}: 可以开仓 (持仓数: {account['position_count']}/{self.max_positions})")
+            logger.info(
+                f"  ✅ {symbol}: 可以开仓 "
+                f"({market}: {len(market_positions)}/{market_limit}, "
+                f"总: {account['position_count']}/{self.max_positions})"
+            )
             return True
 
         # 如果已满仓，返回False（需要通过 _try_make_room 来清理）
-        logger.debug(f"  ⏭️  {symbol}: 已达最大持仓数({self.max_positions})")
+        logger.warning(f"  ⚠️ {symbol}: 已达最大持仓数({self.max_positions})，需要清理仓位")
         return False
 
     async def _init_today_orders(self):
@@ -1068,7 +1394,7 @@ class AdvancedTechnicalTrader:
                 logger.debug(f"  ✅ {symbol}: 订单已成交（数据库已更新）")
 
             elif order_detail.status in [
-                openapi.OrderStatus.Cancelled,
+                openapi.OrderStatus.Canceled,  # 注意是 Canceled 不是 Cancelled
                 openapi.OrderStatus.Expired,
                 openapi.OrderStatus.Rejected
             ]:
@@ -1100,10 +1426,38 @@ class AdvancedTechnicalTrader:
             logger.debug(f"  ❌ 新信号类型 {new_signal['type']} 不足以触发仓位清理")
             return False
 
+        # 使用智能持仓轮换系统进行更精确的评估
+        try:
+            # 尝试导入智能持仓轮换模块（如果可用）
+            from smart_position_rotation import SmartPositionRotator
+            rotator = SmartPositionRotator()
+
+            # 使用智能轮换系统评估
+            rotation_success = await rotator.execute_position_rotation(
+                new_signal, self.trade_client, self.quote_client
+            )
+
+            if rotation_success:
+                logger.success("  ✅ 智能持仓轮换成功，已腾出空间")
+                return True
+            else:
+                logger.info("  ℹ️ 智能轮换评估后决定保留当前持仓")
+                # 继续使用传统方法作为备选
+
+        except ImportError:
+            logger.debug("  使用内置仓位清理逻辑")
+        except Exception as e:
+            logger.error(f"  智能轮换失败: {e}, 使用备选方案")
+
         # 评估所有持仓的质量
         positions_to_evaluate = []
 
         for symbol, position in account["positions"].items():
+            # 跳过已有待处理卖单的持仓（避免重复提交）
+            if symbol in self.pending_orders and self.pending_orders[symbol].get('side') == 'SELL':
+                logger.debug(f"  ⏭️  {symbol}: 已有待处理卖单，跳过评估")
+                continue
+
             cost_price = position["cost"]
             quantity = position["quantity"]
 
@@ -1123,19 +1477,25 @@ class AdvancedTechnicalTrader:
             # 计算持仓评分（越低越应该清理）
             score = 50  # 基础分
 
-            # 1. 盈亏评分（-10分到+30分）
+            # 1. 盈亏评分（-20分到+30分）- 优化评分体系
             if pnl_pct < -5:
                 score -= 20  # 大幅亏损
             elif pnl_pct < -3:
-                score -= 10  # 亏损接近止损
+                score -= 15  # 中等亏损
+            elif pnl_pct < -1:
+                score -= 10  # 小幅亏损
             elif pnl_pct < 0:
-                score -= 5   # 小幅亏损
+                score -= 5   # 微亏
             elif pnl_pct > 15:
                 score += 30  # 大幅盈利
             elif pnl_pct > 10:
-                score += 20  # 盈利良好
+                score += 25  # 盈利良好
             elif pnl_pct > 5:
+                score += 15  # 中等盈利
+            elif pnl_pct > 2:
                 score += 10  # 小幅盈利
+            else:
+                score += 5   # 微盈
 
             # 2. 止损止盈状态评分
             if symbol in self.positions_with_stops:
@@ -1178,7 +1538,7 @@ class AdvancedTechnicalTrader:
         # 对比新信号和最弱持仓
         new_signal_score = new_signal['strength']
 
-        # 决策逻辑（更积极的清理策略）
+        # 决策逻辑（优化后的清理策略）
         should_clear = False
         clear_reason = ""
 
@@ -1187,21 +1547,29 @@ class AdvancedTechnicalTrader:
             should_clear = True
             clear_reason = "已触发止损"
         elif weakest['score'] < 30 and new_signal_score > 60:
-            # 弱势持仓 + 较强新信号（降低门槛从70到60）
+            # 弱势持仓 + 较强新信号
             should_clear = True
             clear_reason = f"弱势持仓(评分:{weakest['score']}) vs 强信号(评分:{new_signal_score})"
         elif weakest['pnl_pct'] < -2 and new_signal_score > 50:
-            # 亏损持仓 + 中等新信号（降低门槛）
+            # 亏损持仓 + 中等新信号
             should_clear = True
             clear_reason = f"亏损持仓({weakest['pnl_pct']:.1f}%) vs 新信号(评分:{new_signal_score})"
-        elif weakest['score'] < 40 and new_signal_score - weakest['score'] > 20:
-            # 评分差距显著（新增条件）
+        elif weakest['score'] < 50 and new_signal_score - weakest['score'] > 15:
+            # 评分差距显著（优化：从20分降低到15分，从40分提高到50分）
             should_clear = True
             clear_reason = f"评分差距显著: 持仓({weakest['score']}) vs 新信号({new_signal_score})"
         elif weakest['pnl_pct'] < 2 and new_signal['type'] == 'STRONG_BUY':
-            # 低收益持仓遇到强买入信号（新增条件）
+            # 低收益持仓遇到强买入信号
             should_clear = True
             clear_reason = f"低收益持仓({weakest['pnl_pct']:.1f}%) vs 强买入信号"
+        elif weakest['pnl_pct'] < 5 and new_signal_score >= 60:
+            # 新增：中等收益持仓遇到高分信号（60+分）应该换仓
+            should_clear = True
+            clear_reason = f"中等收益持仓({weakest['pnl_pct']:.1f}%) vs 高分信号({new_signal_score})"
+        elif new_signal_score >= 60 and weakest['score'] < 55:
+            # 新增：强信号(≥60分) vs 一般持仓(<55分)，果断换仓
+            should_clear = True
+            clear_reason = f"强信号({new_signal_score}) vs 一般持仓(评分:{weakest['score']})"
 
         if should_clear:
             # 获取中文名称用于显示
@@ -1286,17 +1654,28 @@ class AdvancedTechnicalTrader:
 
             start_date = end_date - timedelta(days=days_to_fetch)
 
-            candles = await self.quote_client.get_history_candles(
-                symbol=symbol,
-                period=openapi.Period.Day,
-                adjust_type=openapi.AdjustType.NoAdjust,
-                start=start_date,
-                end=end_date
-            )
+            logger.debug(f"  📥 获取历史K线数据: {days_to_fetch}天 (从{start_date.date()}到{end_date.date()})")
+
+            try:
+                candles = await self.quote_client.get_history_candles(
+                    symbol=symbol,
+                    period=openapi.Period.Day,
+                    adjust_type=openapi.AdjustType.NoAdjust,
+                    start=start_date,
+                    end=end_date
+                )
+                logger.debug(f"  ✅ 获取到 {len(candles) if candles else 0} 天K线数据")
+            except Exception as e:
+                logger.warning(f"  ❌ 获取K线数据失败: {e}")
+                logger.debug(f"     详细错误: {type(e).__name__}: {str(e)}")
+                raise  # 重新抛出异常，让外层统一处理
 
             if not candles or len(candles) < 30:  # 降低最小要求
-                logger.info(f"  ❌ 历史数据不足: 只有{len(candles) if candles else 0}天数据 (需要至少30天)")
-                logger.info(f"  决策: 跳过分析")
+                logger.warning(
+                    f"  ❌ 历史数据不足，跳过分析\n"
+                    f"     实际: {len(candles) if candles else 0}天\n"
+                    f"     需要: 至少30天"
+                )
                 return None
 
             # 提取数据
@@ -1313,7 +1692,9 @@ class AdvancedTechnicalTrader:
             volumes = volumes[-min_len:]
 
             # 计算所有技术指标
+            logger.debug(f"  🔬 开始计算技术指标 (数据长度: {len(closes)}天)...")
             indicators = self._calculate_all_indicators(closes, highs, lows, volumes)
+            logger.debug(f"  ✅ 技术指标计算完成")
 
             # 显示技术指标值
             logger.info("  技术指标:")
@@ -1396,15 +1777,29 @@ class AdvancedTechnicalTrader:
             return signal
 
         except Exception as e:
-            # 只在非API限制错误时记录详细日志
-            if "301607" in str(e):
-                logger.info(f"  ⚠️ API限制: 跳过分析")
-            elif "301600" in str(e):
-                logger.info(f"  ⚠️ 无权限访问此标的")
-            elif "404001" in str(e):
-                logger.info(f"  ⚠️ 标的不存在或代码错误")
+            # 分类处理不同的错误，提供详细信息
+            error_msg = str(e)
+            error_type = type(e).__name__
+
+            if "301607" in error_msg:
+                logger.warning(f"  ⚠️ API限制: 请求过于频繁，跳过 {symbol}")
+            elif "301600" in error_msg:
+                logger.warning(f"  ⚠️ 无权限访问: {symbol}")
+            elif "404001" in error_msg:
+                logger.warning(f"  ⚠️ 标的不存在或代码错误: {symbol}")
+            elif "timeout" in error_msg.lower():
+                logger.warning(f"  ⚠️ 获取数据超时: {symbol}")
             else:
-                logger.info(f"  ❌ 分析失败: {e}")
+                # 显示完整的错误信息供调试
+                logger.error(
+                    f"  ❌ 分析失败: {symbol}\n"
+                    f"     错误类型: {error_type}\n"
+                    f"     错误信息: {error_msg}"
+                )
+                # 在DEBUG级别显示堆栈跟踪
+                import traceback
+                logger.debug(f"     堆栈跟踪:\n{traceback.format_exc()}")
+
             return None
 
     def _calculate_all_indicators(self, closes, highs, lows, volumes):
@@ -1451,7 +1846,17 @@ class AdvancedTechnicalTrader:
                 'prev_macd_histogram': macd['histogram'][-2] if len(macd['histogram']) > 1 else 0,
             }
         except Exception as e:
-            logger.debug(f"计算技术指标失败: {e}")
+            logger.error(
+                f"计算技术指标失败:\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  错误信息: {e}\n"
+                f"  数据长度: closes={len(closes)}, highs={len(highs)}, "
+                f"lows={len(lows)}, volumes={len(volumes)}"
+            )
+            # 在DEBUG级别显示堆栈跟踪
+            import traceback
+            logger.debug(f"  堆栈跟踪:\n{traceback.format_exc()}")
+
             return {
                 'rsi': np.nan,
                 'bb_upper': np.nan,
@@ -1516,11 +1921,11 @@ class AdvancedTechnicalTrader:
         # === 1. RSI分析 (0-30分) ===
         rsi_score = 0
         rsi_reason = ""
-        if ind['rsi'] < 20:  # 极度超卖
+        if ind['rsi'] < 20:  # 极度超卖（逆向策略）
             rsi_score = 30
             rsi_reason = f"极度超卖({ind['rsi']:.1f})"
             reasons.append(f"RSI{rsi_reason}")
-        elif ind['rsi'] < self.rsi_oversold:  # 超卖
+        elif ind['rsi'] < self.rsi_oversold:  # 超卖（逆向策略）
             rsi_score = 25
             rsi_reason = f"超卖({ind['rsi']:.1f})"
             reasons.append(f"RSI{rsi_reason}")
@@ -1532,8 +1937,12 @@ class AdvancedTechnicalTrader:
             rsi_score = 5
             rsi_reason = f"中性({ind['rsi']:.1f})"
             reasons.append(f"RSI{rsi_reason}")
-        else:
-            rsi_reason = f"偏高({ind['rsi']:.1f})"
+        elif 50 < ind['rsi'] <= 70:  # 强势区间（趋势跟随策略）
+            rsi_score = 15
+            rsi_reason = f"强势({ind['rsi']:.1f})"
+            reasons.append(f"RSI强势区间({ind['rsi']:.1f})")
+        else:  # > 70，超买
+            rsi_reason = f"超买({ind['rsi']:.1f})"
 
         logger.info(f"    RSI得分: {rsi_score}/30 ({rsi_reason})")
         score += rsi_score
@@ -1541,11 +1950,11 @@ class AdvancedTechnicalTrader:
         # === 2. 布林带分析 (0-25分) ===
         bb_score = 0
         bb_reason = ""
-        if current_price <= ind['bb_lower']:  # 触及或突破下轨
+        if current_price <= ind['bb_lower']:  # 触及或突破下轨（逆向策略）
             bb_score = 25
             bb_reason = f"触及下轨(${ind['bb_lower']:.2f})"
             reasons.append(f"触及布林带下轨(${ind['bb_lower']:.2f})")
-        elif current_price <= ind['bb_lower'] * 1.02:  # 接近下轨
+        elif current_price <= ind['bb_lower'] * 1.02:  # 接近下轨（逆向策略）
             bb_score = 20
             bb_reason = "接近下轨"
             reasons.append(f"接近布林带下轨")
@@ -1553,6 +1962,14 @@ class AdvancedTechnicalTrader:
             bb_score = 10
             bb_reason = f"下半部({bb_position_pct:.0f}%)"
             reasons.append(f"布林带下半部({bb_position_pct:.0f}%)")
+        elif current_price >= ind['bb_upper']:  # 突破上轨（趋势跟随策略）
+            bb_score = 20
+            bb_reason = f"突破上轨(${ind['bb_upper']:.2f})"
+            reasons.append(f"突破布林带上轨(${ind['bb_upper']:.2f})")
+        elif current_price >= ind['bb_upper'] * 0.98:  # 接近上轨（趋势跟随策略）
+            bb_score = 15
+            bb_reason = "接近上轨"
+            reasons.append(f"接近布林带上轨")
         else:
             bb_reason = f"位置{bb_position_pct:.0f}%"
 
@@ -1606,8 +2023,12 @@ class AdvancedTechnicalTrader:
             volume_score = 5
             vol_reason = f"温和放量({volume_ratio:.1f}x)"
             reasons.append(f"成交量温和({volume_ratio:.1f}x)")
+        elif volume_ratio >= 0.8:  # 正常成交量（支持趋势跟随）
+            volume_score = 3
+            vol_reason = f"正常({volume_ratio:.1f}x)"
+            reasons.append(f"成交量正常({volume_ratio:.1f}x)")
         else:
-            vol_reason = f"正常或缩量({volume_ratio:.1f}x)"
+            vol_reason = f"缩量({volume_ratio:.1f}x)"
 
         logger.info(f"    成交量得分: {volume_score}/15 ({vol_reason})")
         score += volume_score
@@ -1713,6 +2134,12 @@ class AdvancedTechnicalTrader:
         """
         exit_signals = []  # 收集所有止损止盈信号
 
+        # 添加日志显示开始检查（改为info级别以确保显示）
+        if account["positions"]:
+            logger.info(f"\n📍 开始检查 {len(account['positions'])} 个持仓的止损止盈状态...")
+            logger.info(f"   持仓列表: {list(account['positions'].keys())}")
+            logger.info(f"   已设置止损止盈的持仓: {list(self.positions_with_stops.keys())}")
+
         for quote in quotes:
             symbol = quote.symbol
             current_price = float(quote.last_done)
@@ -1730,15 +2157,27 @@ class AdvancedTechnicalTrader:
             # 检查是否有设置止损止盈
             if symbol not in self.positions_with_stops:
                 # 如果没有，尝试根据当前ATR设置
+                logger.info(f"  {symbol}: 未找到止损止盈记录，尝试设置...")
                 try:
                     await self._set_stops_for_position(symbol, entry_price)
+                    # 如果成功设置，保存到数据库
+                    if symbol in self.positions_with_stops:
+                        stops = self.positions_with_stops[symbol]
+                        await self.stop_manager.save_stop(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            stop_loss=stops['stop_loss'],
+                            take_profit=stops['take_profit'],
+                            atr=stops.get('atr'),
+                            quantity=position.get('quantity')
+                        )
                 except Exception as e:
-                    logger.debug(f"  {symbol}: 无法设置止损止盈 - {e}")
+                    logger.warning(f"  {symbol}: 无法设置止损止盈 - {e}")
                     continue
 
             # 再次检查是否成功设置
             if symbol not in self.positions_with_stops:
-                logger.debug(f"  {symbol}: 跳过止损止盈检查（未设置）")
+                logger.warning(f"  ⚠️ {symbol}: 跳过止损止盈检查（未设置）")
                 continue
 
             stops = self.positions_with_stops[symbol]
@@ -1747,6 +2186,12 @@ class AdvancedTechnicalTrader:
 
             # 计算盈亏
             pnl_pct = (current_price / entry_price - 1) * 100
+
+            # 显示当前状态（改为info级别）
+            logger.info(
+                f"  📊 {symbol}: 当前价=${current_price:.2f}, 成本=${entry_price:.2f}, "
+                f"止损=${stop_loss:.2f}, 止盈=${take_profit:.2f}, 盈亏={pnl_pct:+.1f}%"
+            )
 
             # 检查止损
             if current_price <= stop_loss:
@@ -1774,21 +2219,15 @@ class AdvancedTechnicalTrader:
                     )
                     await self.slack.send(message)
 
-                # 如果启用了WebSocket，加入优先级队列
-                if self.websocket_enabled and hasattr(self, 'signal_queue'):
-                    exit_signal = {
-                        'symbol': symbol,
-                        'type': 'STOP_LOSS',
-                        'price': current_price,
-                        'position': position,
-                        'reason': '止损',
-                        'timestamp': datetime.now()
-                    }
-                    # 止损信号最高优先级 (-1000)
-                    await self.signal_queue.put((-1000, exit_signal))
-                    logger.info(f"🚨 {symbol}: 止损信号已加入最高优先级队列")
-                else:
-                    await self._execute_sell(symbol, current_price, position, "止损")
+                # 直接执行止损卖出（无论WebSocket是否启用）
+                logger.info(f"🚨 {symbol}: 立即执行止损卖出")
+                await self._execute_sell(symbol, current_price, position, "止损")
+
+                # 更新数据库中的止损止盈状态
+                pnl = position['quantity'] * (current_price - entry_price)
+                await self.stop_manager.update_stop_status(
+                    symbol, 'stopped_out', current_price, pnl
+                )
                 continue
 
             # 检查止盈
@@ -1878,20 +2317,15 @@ class AdvancedTechnicalTrader:
                         await self.slack.send(message)
 
                     # 如果启用了WebSocket，加入优先级队列
-                    if self.websocket_enabled and hasattr(self, 'signal_queue'):
-                        exit_signal = {
-                            'symbol': symbol,
-                            'type': 'TAKE_PROFIT',
-                            'price': current_price,
-                            'position': position,
-                            'reason': '止盈',
-                            'timestamp': datetime.now()
-                        }
-                        # 止盈信号高优先级 (-900)
-                        await self.signal_queue.put((-900, exit_signal))
-                        logger.info(f"💰 {symbol}: 止盈信号已加入高优先级队列")
-                    else:
-                        await self._execute_sell(symbol, current_price, position, "止盈")
+                    # 直接执行止盈卖出（无论WebSocket是否启用）
+                    logger.info(f"💰 {symbol}: 立即执行止盈卖出")
+                    await self._execute_sell(symbol, current_price, position, "止盈")
+
+                    # 更新数据库中的止损止盈状态
+                    pnl = position['quantity'] * (current_price - entry_price)
+                    await self.stop_manager.update_stop_status(
+                        symbol, 'took_profit', current_price, pnl
+                    )
                     continue
                 else:
                     # 继续持有，跳过本次卖出
@@ -1992,6 +2426,82 @@ class AdvancedTechnicalTrader:
         except:
             return None
 
+    async def check_realtime_stop_loss(self, symbol, current_price, position):
+        """
+        实时检查单个标的的止损止盈
+
+        用于WebSocket实时行情推送时立即检查
+        返回: (是否触发, 触发类型)
+        """
+        try:
+            # 检查是否有设置止损止盈（仅使用内存缓存，避免频繁数据库查询）
+            if symbol not in self.positions_with_stops:
+                # ⚠️ 不再在实时检查中查询数据库，避免高频DB访问导致连接泄漏
+                # 止损设置应该在买入时就设置好，并加载到内存中
+                return False, None
+
+            stops = self.positions_with_stops[symbol]
+            stop_loss = stops["stop_loss"]
+            take_profit = stops["take_profit"]
+            entry_price = position["cost"]
+
+            # 计算盈亏
+            pnl_pct = (current_price / entry_price - 1) * 100
+
+            # 实时日志（只在接近止损止盈时显示）
+            if abs(current_price - stop_loss) / stop_loss < 0.02 or \
+               abs(current_price - take_profit) / take_profit < 0.02:
+                logger.info(
+                    f"⚡ 实时监控 {symbol}: 价格=${current_price:.2f}, "
+                    f"止损=${stop_loss:.2f}, 止盈=${take_profit:.2f}, 盈亏={pnl_pct:+.1f}%"
+                )
+
+            # 检查止损
+            if current_price <= stop_loss:
+                logger.warning(
+                    f"\n🛑 {symbol} 实时触发止损!\n"
+                    f"   当前价: ${current_price:.2f}\n"
+                    f"   止损位: ${stop_loss:.2f}\n"
+                    f"   盈亏: {pnl_pct:.2f}%"
+                )
+
+                # 立即执行止损
+                await self._execute_sell(symbol, current_price, position, "实时止损")
+
+                # 更新数据库状态
+                pnl = position['quantity'] * (current_price - entry_price)
+                await self.stop_manager.update_stop_status(
+                    symbol, 'stopped_out', current_price, pnl
+                )
+
+                return True, "STOP_LOSS"
+
+            # 检查止盈
+            elif current_price >= take_profit:
+                logger.success(
+                    f"\n🎉 {symbol} 实时触发止盈!\n"
+                    f"   当前价: ${current_price:.2f}\n"
+                    f"   止盈位: ${take_profit:.2f}\n"
+                    f"   盈亏: {pnl_pct:.2f}%"
+                )
+
+                # 立即执行止盈
+                await self._execute_sell(symbol, current_price, position, "实时止盈")
+
+                # 更新数据库状态
+                pnl = position['quantity'] * (current_price - entry_price)
+                await self.stop_manager.update_stop_status(
+                    symbol, 'took_profit', current_price, pnl
+                )
+
+                return True, "TAKE_PROFIT"
+
+            return False, None
+
+        except Exception as e:
+            logger.error(f"实时止损止盈检查失败 {symbol}: {e}")
+            return False, None
+
     async def _execute_sell(self, symbol, current_price, position, reason):
         """执行卖出"""
         try:
@@ -2049,6 +2559,15 @@ class AdvancedTechnicalTrader:
                 status="New"
             )
 
+            # 记录到pending_orders缓存（避免重复提交卖单）
+            self.pending_orders[symbol] = {
+                'order_id': order['order_id'],
+                'timestamp': datetime.now(),
+                'side': 'SELL',
+                'quantity': quantity,
+                'status': 'submitted'
+            }
+
             logger.success(
                 f"\n✅ 平仓订单已提交: {order['order_id']}\n"
                 f"   标的: {symbol}\n"
@@ -2081,6 +2600,9 @@ class AdvancedTechnicalTrader:
             # 移除止损记录
             if symbol in self.positions_with_stops:
                 del self.positions_with_stops[symbol]
+
+            # 从数据库移除止损止盈记录（标记为已取消）
+            await self.stop_manager.remove_stop(symbol)
 
         except Exception as e:
             logger.error(f"  ❌ {symbol} 平仓失败: {e}")
@@ -2500,6 +3022,17 @@ class AdvancedTechnicalTrader:
                 "atr": signal['atr']
             }
 
+            # 保存止损止盈到数据库
+            await self.stop_manager.save_stop(
+                symbol=symbol,
+                entry_price=current_price,
+                stop_loss=signal['stop_loss'],
+                take_profit=signal['take_profit'],
+                atr=signal.get('atr'),
+                quantity=quantity,
+                strategy='advanced_technical'
+            )
+
             # 保存订单到数据库
             await self.order_manager.save_order(
                 order_id=order['order_id'],
@@ -2536,17 +3069,43 @@ async def main():
     # 检查命令行参数
     use_builtin = "--builtin" in sys.argv or "-b" in sys.argv
 
+    # 解析最大迭代次数
+    max_iterations = None
+    for i, arg in enumerate(sys.argv):
+        if arg in ["--iterations", "-n"]:
+            if i + 1 < len(sys.argv):
+                try:
+                    max_iterations = int(sys.argv[i + 1])
+                    logger.info(f"⏱️  设置最大迭代次数: {max_iterations}")
+                except ValueError:
+                    logger.warning(f"无效的迭代次数参数: {sys.argv[i + 1]}")
+
     if use_builtin:
         logger.info("\n使用内置监控列表 - 高级技术指标组合策略")
     else:
         logger.info("\n使用配置文件监控列表 - 高级技术指标组合策略")
 
-    trader = AdvancedTechnicalTrader(use_builtin_watchlist=use_builtin)
+    trader = AdvancedTechnicalTrader(use_builtin_watchlist=use_builtin, max_iterations=max_iterations)
 
     try:
         await trader.run()
     except KeyboardInterrupt:
         logger.info("\n收到中断信号，停止交易系统")
+    finally:
+        # 清理资源
+        logger.info("正在清理资源...")
+        if hasattr(trader, 'stop_manager') and trader.stop_manager:
+            try:
+                await trader.stop_manager.disconnect()
+                logger.success("✅ 止损管理器已关闭")
+            except Exception as e:
+                logger.warning(f"关闭止损管理器失败: {e}")
+
+        if hasattr(trader, 'order_manager') and trader.order_manager:
+            # OrderManager 使用 SQLAlchemy，连接池会自动管理
+            logger.debug("订单管理器使用 SQLAlchemy，自动管理连接池")
+
+        logger.success("✅ 所有资源已清理")
 
 
 if __name__ == "__main__":
@@ -2606,6 +3165,11 @@ if __name__ == "__main__":
 ║  🚀 启动命令:                                                          ║
 ║     python3 scripts/advanced_technical_trading.py                    ║
 ║     python3 scripts/advanced_technical_trading.py --builtin          ║
+║     python3 scripts/advanced_technical_trading.py -n 3               ║
+║                                                                       ║
+║  命令行参数:                                                           ║
+║     --builtin, -b    : 使用内置监控列表                                ║
+║     --iterations N, -n N : 限制最大迭代次数 (默认无限循环)              ║
 ║                                                                       ║
 ║  按 Ctrl+C 停止                                                       ║
 ║                                                                       ║
