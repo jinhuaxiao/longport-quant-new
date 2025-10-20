@@ -39,6 +39,7 @@ from longport_quant.messaging import SignalQueue
 from longport_quant.utils import LotSizeHelper
 from longport_quant.persistence.stop_manager import StopLossManager
 from longport_quant.persistence.order_manager import OrderManager
+from longport_quant.persistence.position_manager import RedisPositionManager
 
 
 def sanitize_unicode(text: str) -> str:
@@ -156,14 +157,27 @@ class SignalGenerator:
         # 订单管理器（用于检查今日订单，包括pending订单）
         self.order_manager = OrderManager()
 
+        # 【新增】Redis持仓管理器 - 跨进程共享持仓状态
+        self.position_manager = RedisPositionManager(
+            redis_url=self.settings.redis_url,
+            key_prefix="trading"
+        )
+
         # 今日已交易标的集合（避免重复下单）
         self.traded_today = set()  # 今日买单标的（包括pending）
         self.sold_today = set()     # 今日卖单标的（包括pending）- 新增
-        self.current_positions = set()  # 当前持仓标的
+        self.current_positions = set()  # 当前持仓标的（内存缓存，从Redis同步）
 
         # 信号生成历史（防止重复信号）
         self.signal_history = {}  # {symbol: last_signal_time}
-        self.signal_cooldown = 300  # 信号冷却期（秒），5分钟内不重复生成同一标的的信号
+        self.signal_cooldown = 900  # 信号冷却期（秒），15分钟内不重复生成同一标的的信号（修复：从5分钟延长到15分钟）
+
+        # 🔥 WebSocket实时订阅相关（事件驱动模式）
+        self.websocket_enabled = False  # WebSocket订阅标志
+        self.subscribed_symbols = set()  # 已订阅的股票列表
+        self.realtime_quotes = {}  # 存储最新实时行情 {symbol: quote}
+        self.last_calc_time = {}  # 上次计算时间（防抖）{symbol: timestamp}
+        self.indicator_cache = {}  # 技术指标缓存 {symbol: {'price': float, 'indicators': dict}}
 
     def _is_market_open(self, symbol: str) -> bool:
         """
@@ -248,15 +262,23 @@ class SignalGenerator:
         """
         try:
             # 使用OrderManager获取今日所有买单标的
-            self.traded_today = await self.order_manager.get_today_buy_symbols()
+            new_traded_today = await self.order_manager.get_today_buy_symbols()
+
+            # 更新成功才赋值
+            self.traded_today = new_traded_today
 
             if self.traded_today:
                 logger.info(f"📋 今日已下买单标的: {len(self.traded_today)}个（包括pending订单）")
                 logger.debug(f"   详细: {', '.join(sorted(self.traded_today))}")
+            else:
+                logger.info(f"📋 今日尚无买单记录")
 
         except Exception as e:
-            logger.warning(f"⚠️ 更新今日买单失败: {e}")
-            self.traded_today = set()
+            # 修复：查询失败时保留上一次的值，不清空
+            logger.error(f"❌ 更新今日买单失败（保留上次数据）: {e}")
+            logger.warning(f"   当前使用的买单列表: {', '.join(sorted(self.traded_today)) if self.traded_today else '空'}")
+            import traceback
+            logger.debug(f"   错误详情:\n{traceback.format_exc()}")
 
     async def _update_sold_today(self):
         """
@@ -272,34 +294,57 @@ class SignalGenerator:
         """
         try:
             # 使用OrderManager获取今日所有卖单标的
-            self.sold_today = await self.order_manager.get_today_sell_symbols()
+            new_sold_today = await self.order_manager.get_today_sell_symbols()
+
+            # 更新成功才赋值
+            self.sold_today = new_sold_today
 
             if self.sold_today:
                 logger.info(f"📋 今日已下卖单标的: {len(self.sold_today)}个（包括pending订单）")
                 logger.debug(f"   详细: {', '.join(sorted(self.sold_today))}")
+            else:
+                logger.info(f"📋 今日尚无卖单记录")
 
         except Exception as e:
-            logger.warning(f"⚠️ 更新今日卖单失败: {e}")
-            self.sold_today = set()
+            # 修复：查询失败时保留上一次的值，不清空
+            logger.error(f"❌ 更新今日卖单失败（保留上次数据）: {e}")
+            logger.warning(f"   当前使用的卖单列表: {', '.join(sorted(self.sold_today)) if self.sold_today else '空'}")
+            import traceback
+            logger.debug(f"   错误详情:\n{traceback.format_exc()}")
 
     async def _update_current_positions(self, account: Dict):
         """
-        更新当前持仓标的集合
+        更新当前持仓标的集合（同步到Redis）
 
         Args:
             account: 账户信息字典
         """
         try:
             positions = account.get("positions", [])
-            self.current_positions = {pos["symbol"] for pos in positions if pos.get("quantity", 0) > 0}
+
+            # 1. 同步到Redis（这是真实的持仓状态）
+            await self.position_manager.sync_from_api(positions)
+
+            # 2. 从Redis读取到内存缓存
+            self.current_positions = await self.position_manager.get_all_positions()
 
             if self.current_positions:
-                logger.info(f"💼 当前持仓标的: {len(self.current_positions)}个")
+                logger.info(f"💼 当前持仓标的: {len(self.current_positions)}个（Redis同步）")
                 logger.debug(f"   详细: {', '.join(sorted(self.current_positions))}")
+            else:
+                logger.info(f"💼 当前无持仓（Redis同步）")
 
         except Exception as e:
-            logger.warning(f"⚠️ 更新当前持仓失败: {e}")
-            self.current_positions = set()
+            # 修复：更新失败时从Redis读取（而不是使用旧的内存数据）
+            logger.error(f"❌ API持仓更新失败，尝试从Redis读取: {e}")
+            try:
+                self.current_positions = await self.position_manager.get_all_positions()
+                logger.warning(f"   ✅ 已从Redis读取持仓: {len(self.current_positions)}个")
+            except Exception as e2:
+                logger.error(f"   ❌ Redis读取也失败，保留内存数据: {e2}")
+                logger.warning(f"   当前使用的持仓列表: {', '.join(sorted(self.current_positions)) if self.current_positions else '空'}")
+            import traceback
+            logger.debug(f"   错误详情:\n{traceback.format_exc()}")
 
     def _is_in_cooldown(self, symbol: str) -> tuple[bool, float]:
         """
@@ -360,18 +405,27 @@ class SignalGenerator:
 
         # === BUY信号的去重检查 ===
         if signal_type in ["BUY", "STRONG_BUY", "WEAK_BUY"]:
-            # 第2层：持仓去重
+            # 第2层：持仓去重（最关键的检查 - 从Redis实时检查）
+            # 🔥 关键修复：使用Redis检查，跨进程共享，实时更新
+            has_position = await self.position_manager.has_position(symbol)
+            if has_position:
+                return False, "已持有该标的（Redis检查）"
+
+            # 备用检查：内存缓存（如果Redis失败）
             if symbol in self.current_positions:
-                return False, "已持有该标的"
+                logger.debug(f"  ℹ️  {symbol}: Redis未检测到持仓，但内存缓存显示已持有")
+                return False, "已持有该标的（内存缓存）"
 
-            # 第3层：今日买单去重（包括pending订单）
-            if symbol in self.traded_today:
-                return False, "今日已对该标的下过买单（包括待成交订单）"
-
-            # 第4层：时间窗口去重
+            # 第3层：时间窗口去重（冷却期检查）
             in_cooldown, remaining = self._is_in_cooldown(symbol)
             if in_cooldown:
                 return False, f"信号冷却期内（还需等待{remaining:.0f}秒）"
+
+            # 调试日志：记录允许买入的情况
+            if symbol in self.traded_today:
+                logger.debug(f"  ℹ️  {symbol}: 今日已买过但已卖出（或订单未成交），允许再次买入")
+            else:
+                logger.debug(f"  ℹ️  {symbol}: 今日未买过，允许买入")
 
         # === SELL信号的去重检查 ===
         elif signal_type in ["SELL", "STOP_LOSS", "TAKE_PROFIT", "SMART_TAKE_PROFIT", "EARLY_TAKE_PROFIT"]:
@@ -390,6 +444,195 @@ class SignalGenerator:
 
         return True, ""
 
+    # ==================== WebSocket 实时订阅方法 ====================
+
+    async def setup_realtime_subscription(self, symbols):
+        """
+        设置WebSocket实时订阅，获取推送行情
+
+        优势:
+        1. 实时推送，延迟极低（<1秒）
+        2. 减少API轮询调用，节省配额
+        3. 捕捉最佳买卖点，不错过快速行情
+        """
+        try:
+            logger.info("\n📡 设置实时行情订阅...")
+
+            # 订阅实时行情
+            await self.quote_client.subscribe(
+                symbols=symbols,
+                sub_types=[openapi.SubType.Quote],  # 订阅报价数据
+                is_first_push=True  # 立即推送当前数据
+            )
+
+            # 设置行情回调
+            await self.quote_client.set_on_quote(self.on_realtime_quote)
+
+            self.websocket_enabled = True
+            self.subscribed_symbols = set(symbols)  # 记录已订阅的股票
+            logger.success(f"✅ 成功订阅 {len(symbols)} 个标的的实时行情推送")
+            logger.info("   WebSocket连接已建立，将实时接收行情更新")
+
+        except Exception as e:
+            logger.warning(f"⚠️ WebSocket订阅失败，将使用轮询模式: {e}")
+            self.websocket_enabled = False
+            self.subscribed_symbols = set()
+
+    def on_realtime_quote(self, symbol, quote):
+        """
+        实时行情推送回调（同步方法，由LongPort SDK调用）
+
+        当收到新行情时立即触发分析
+        """
+        try:
+            # 更新最新行情
+            self.realtime_quotes[symbol] = quote
+
+            # 由于回调在不同线程，需要安全地调度到主事件循环
+            if hasattr(self, '_main_loop'):
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_realtime_update(symbol, quote),
+                    self._main_loop
+                )
+
+        except Exception as e:
+            logger.debug(f"处理实时行情失败 {symbol}: {e}")
+
+    async def _handle_realtime_update(self, symbol, quote):
+        """
+        处理实时行情更新
+
+        优先级：
+        1. 检查持仓的止损止盈（最高优先级）
+        2. 分析新的买入信号（防抖：价格变化>0.5%才计算）
+        """
+        try:
+            current_price = float(quote.last_done)
+            if current_price <= 0:
+                return
+
+            # 防抖：判断是否需要重新计算
+            if not self._should_recalculate(symbol, current_price):
+                return
+
+            logger.debug(f"⚡ {symbol}: 价格变化触发实时计算 (${current_price:.2f})")
+
+            # 优先级1：检查持仓的止损止盈
+            if symbol in self.current_positions:
+                # 从Redis获取最新持仓状态
+                has_position = await self.position_manager.has_position(symbol)
+                if has_position:
+                    # TODO: 检查止损止盈逻辑（复用check_exit_signals）
+                    # 暂时跳过，因为现有的check_exit_signals需要account对象
+                    logger.debug(f"  ℹ️  {symbol}: 持仓标的，跳过买入信号分析")
+                    return
+
+            # 优先级2：分析买入信号
+            signal = await self.analyze_symbol_and_generate_signal(symbol, quote, current_price)
+
+            if signal:
+                # 去重检查
+                should_generate, skip_reason = await self._should_generate_signal(
+                    signal['symbol'],
+                    signal['type']
+                )
+
+                if not should_generate:
+                    logger.debug(f"  ⏭️  {symbol}: 跳过信号 - {skip_reason}")
+                    return
+
+                # 发送信号到Redis队列
+                success = await self.signal_queue.publish_signal(signal)
+                if success:
+                    # 记录信号生成时间（用于冷却期检查）
+                    self.signal_history[signal['symbol']] = datetime.now(self.beijing_tz)
+                    logger.success(
+                        f"🔔 {symbol}: 实时信号已生成! 类型={signal['type']}, "
+                        f"评分={signal['score']}, 价格=${current_price:.2f}"
+                    )
+
+        except Exception as e:
+            logger.debug(f"实时处理失败 {symbol}: {e}")
+
+    def _should_recalculate(self, symbol: str, current_price: float) -> bool:
+        """
+        判断是否需要重新计算技术指标（防抖）
+
+        触发条件（满足任一即可）:
+        1. 价格变化超过0.5%
+        2. 距离上次计算超过5分钟（兜底）
+        3. 首次计算
+
+        Returns:
+            bool: 是否需要重新计算
+        """
+        # 条件1：价格变化超过0.5%
+        if symbol in self.indicator_cache:
+            last_price = self.indicator_cache[symbol]['price']
+            price_change_pct = abs(current_price - last_price) / last_price * 100
+
+            if price_change_pct >= 0.5:
+                logger.debug(f"  ⚡ {symbol}: 价格变化{price_change_pct:.2f}% (触发阈值0.5%)")
+                # 更新缓存
+                self.indicator_cache[symbol]['price'] = current_price
+                self.last_calc_time[symbol] = datetime.now(self.beijing_tz)
+                return True
+
+        # 条件2：距离上次计算超过5分钟（兜底，防止价格变化小但时间久远）
+        if symbol in self.last_calc_time:
+            elapsed = (datetime.now(self.beijing_tz) - self.last_calc_time[symbol]).total_seconds()
+            if elapsed >= 300:  # 5分钟
+                logger.debug(f"  ⏰ {symbol}: 距上次计算{elapsed/60:.1f}分钟 (触发阈值5分钟)")
+                # 更新缓存
+                self.indicator_cache[symbol] = {'price': current_price}
+                self.last_calc_time[symbol] = datetime.now(self.beijing_tz)
+                return True
+
+        # 条件3：首次计算
+        if symbol not in self.indicator_cache:
+            logger.debug(f"  🆕 {symbol}: 首次计算")
+            self.indicator_cache[symbol] = {'price': current_price}
+            self.last_calc_time[symbol] = datetime.now(self.beijing_tz)
+            return True
+
+        # 不满足任何条件，跳过计算
+        return False
+
+    async def update_subscription_for_positions(self, position_symbols):
+        """
+        动态更新订阅，确保所有持仓都被监控
+
+        当发现新持仓时，自动加入WebSocket订阅
+        """
+        if not self.websocket_enabled:
+            return  # 如果WebSocket未启用，跳过
+
+        try:
+            # 检查未订阅的持仓
+            unsubscribed = []
+            for symbol in position_symbols:
+                if symbol not in self.subscribed_symbols:
+                    unsubscribed.append(symbol)
+
+            if unsubscribed:
+                logger.info(f"📡 动态订阅新持仓股票: {unsubscribed}")
+
+                # 订阅新的股票
+                await self.quote_client.subscribe(
+                    symbols=unsubscribed,
+                    sub_types=[openapi.SubType.Quote],
+                    is_first_push=True
+                )
+
+                # 更新已订阅列表
+                self.subscribed_symbols.update(unsubscribed)
+                logger.success(f"✅ 成功新增订阅 {len(unsubscribed)} 个持仓股票")
+
+        except Exception as e:
+            logger.warning(f"⚠️ 动态订阅失败: {e}")
+
+    # ==================== 主循环 ====================
+
     async def run(self):
         """主循环：扫描市场并生成信号"""
         logger.info("=" * 70)
@@ -397,6 +640,10 @@ class SignalGenerator:
         logger.info("=" * 70)
 
         try:
+            # 🔥 连接Redis持仓管理器
+            await self.position_manager.connect()
+            logger.info("✅ Redis持仓管理器已连接")
+
             # 使用async with正确初始化客户端
             async with QuoteDataClient(self.settings) as quote_client, \
                        LongportTradingClient(self.settings) as trade_client:
@@ -404,6 +651,9 @@ class SignalGenerator:
                 # 保存客户端引用
                 self.quote_client = quote_client
                 self.trade_client = trade_client
+
+                # 🔥 保存主事件循环引用（供WebSocket回调使用）
+                self._main_loop = asyncio.get_event_loop()
 
                 # 合并所有监控列表
                 all_symbols = {}
@@ -422,6 +672,20 @@ class SignalGenerator:
                 logger.info(f"📤 信号队列: {self.settings.signal_queue_key}")
                 logger.info("")
 
+                # 🔥 设置WebSocket实时订阅（事件驱动模式）
+                symbols_list = list(all_symbols.keys())
+                await self.setup_realtime_subscription(symbols_list)
+
+                # 根据WebSocket是否启用调整轮询间隔
+                if self.websocket_enabled:
+                    # WebSocket模式：降低轮询频率到10分钟（只用于状态同步）
+                    actual_poll_interval = 600
+                    logger.info("   🎯 模式: WebSocket实时推送 + 10分钟定期同步")
+                else:
+                    # 轮询模式：保持60秒间隔
+                    actual_poll_interval = self.poll_interval
+                    logger.info("   🎯 模式: 60秒轮询扫描")
+
                 iteration = 0
                 while True:
                     if self.max_iterations and iteration >= self.max_iterations:
@@ -435,14 +699,27 @@ class SignalGenerator:
 
                     try:
                         # 1. 更新今日已交易标的和当前持仓
+                        logger.debug(f"📊 开始更新去重数据...")
                         await self._update_traded_today()  # 更新买单
                         await self._update_sold_today()    # 更新卖单
                         try:
                             account = await self.trade_client.get_account()
                             await self._update_current_positions(account)
+
+                            # 🔥 动态更新WebSocket订阅（确保所有持仓都被监控）
+                            if account and account.get("positions"):
+                                # positions 是列表，每个元素是 {"symbol": "857.HK", ...}
+                                position_symbols = [pos["symbol"] for pos in account["positions"] if "symbol" in pos]
+                                if position_symbols:
+                                    await self.update_subscription_for_positions(position_symbols)
+
                         except Exception as e:
                             logger.warning(f"⚠️ 获取账户信息失败: {e}")
+                            logger.debug(f"   使用上一次的持仓数据: {', '.join(sorted(self.current_positions)) if self.current_positions else '空'}")
                             account = None
+
+                        # 汇总去重状态
+                        logger.info(f"📋 去重数据汇总: 持仓{len(self.current_positions)}个, 今日买过{len(self.traded_today)}个, 今日卖过{len(self.sold_today)}个")
 
                         # 2. 定期清理信号历史（每10轮一次，防止内存泄漏）
                         if iteration % 10 == 0:
@@ -454,55 +731,61 @@ class SignalGenerator:
 
                         if not quotes:
                             logger.warning("⚠️ 未获取到行情数据")
-                            await asyncio.sleep(self.poll_interval)
+                            await asyncio.sleep(actual_poll_interval)
                             continue
 
                         logger.info(f"📊 获取到 {len(quotes)} 个标的的实时行情")
 
                         # 4. 分析每个标的并生成信号
-                        signals_generated = 0
-                        for quote in quotes:
-                            try:
-                                symbol = quote.symbol
-                                current_price = float(quote.last_done)
+                        # 🔥 如果WebSocket已启用，跳过轮询扫描信号生成（信号由实时推送触发）
+                        if self.websocket_enabled:
+                            logger.debug("   ⏭️  WebSocket模式：跳过轮询扫描信号生成（实时推送中）")
+                            signals_generated = 0
+                        else:
+                            # 轮询模式：逐个分析标的并生成信号
+                            signals_generated = 0
+                            for quote in quotes:
+                                try:
+                                    symbol = quote.symbol
+                                    current_price = float(quote.last_done)
 
-                                logger.info(f"\n📊 分析 {symbol} ({all_symbols.get(symbol, {}).get('name', symbol)})")
-                                logger.info(f"  实时行情: 价格=${current_price:.2f}, 成交量={quote.volume:,}")
+                                    logger.info(f"\n📊 分析 {symbol} ({all_symbols.get(symbol, {}).get('name', symbol)})")
+                                    logger.info(f"  实时行情: 价格=${current_price:.2f}, 成交量={quote.volume:,}")
 
-                                # 检查市场是否开盘
-                                if self.check_market_hours and not self._is_market_open(symbol):
-                                    logger.debug(f"  ⏭️  跳过 {symbol} (市场未开盘)")
-                                    continue
-
-                                # 分析标的并生成信号
-                                signal = await self.analyze_symbol_and_generate_signal(symbol, quote, current_price)
-
-                                if signal:
-                                    # 检查是否应该生成信号（去重检查）
-                                    should_generate, skip_reason = await self._should_generate_signal(
-                                        signal['symbol'],
-                                        signal['type']
-                                    )
-
-                                    if not should_generate:
-                                        logger.info(f"  ⏭️  跳过信号: {skip_reason}")
+                                    # 检查市场是否开盘
+                                    if self.check_market_hours and not self._is_market_open(symbol):
+                                        logger.debug(f"  ⏭️  跳过 {symbol} (市场未开盘)")
                                         continue
-                                    # 发送信号到队列
-                                    success = await self.signal_queue.publish_signal(signal)
-                                    if success:
-                                        signals_generated += 1
-                                        # 记录信号生成时间（用于冷却期检查）
-                                        self.signal_history[signal['symbol']] = datetime.now(self.beijing_tz)
-                                        logger.success(
-                                            f"  ✅ 信号已发送到队列: {signal['type']}, "
-                                            f"评分={signal['score']}, 优先级={signal.get('priority', signal['score'])}"
-                                        )
-                                    else:
-                                        logger.error(f"  ❌ 信号发送失败: {symbol}")
 
-                            except Exception as e:
-                                logger.error(f"  ❌ 分析标的失败 {symbol}: {e}")
-                                continue
+                                    # 分析标的并生成信号
+                                    signal = await self.analyze_symbol_and_generate_signal(symbol, quote, current_price)
+
+                                    if signal:
+                                        # 检查是否应该生成信号（去重检查）
+                                        should_generate, skip_reason = await self._should_generate_signal(
+                                            signal['symbol'],
+                                            signal['type']
+                                        )
+
+                                        if not should_generate:
+                                            logger.info(f"  ⏭️  跳过信号: {skip_reason}")
+                                            continue
+                                        # 发送信号到队列
+                                        success = await self.signal_queue.publish_signal(signal)
+                                        if success:
+                                            signals_generated += 1
+                                            # 记录信号生成时间（用于冷却期检查）
+                                            self.signal_history[signal['symbol']] = datetime.now(self.beijing_tz)
+                                            logger.success(
+                                                f"  ✅ 信号已发送到队列: {signal['type']}, "
+                                                f"评分={signal['score']}, 优先级={signal.get('priority', signal['score'])}"
+                                            )
+                                        else:
+                                            logger.error(f"  ❌ 信号发送失败: {symbol}")
+
+                                except Exception as e:
+                                    logger.error(f"  ❌ 分析标的失败 {symbol}: {e}")
+                                    continue
 
                         # 5. 检查现有持仓的止损止盈（生成平仓信号）
                         try:
@@ -548,14 +831,19 @@ class SignalGenerator:
                         logger.debug(traceback.format_exc())
 
                     # 等待下一轮
-                    logger.info(f"\n💤 等待 {self.poll_interval} 秒后进行下一轮扫描...")
-                    await asyncio.sleep(self.poll_interval)
+                    if self.websocket_enabled:
+                        logger.info(f"\n💤 等待 {actual_poll_interval} 秒后进行状态同步...")
+                        logger.info("   （WebSocket实时接收行情，信号即时生成）")
+                    else:
+                        logger.info(f"\n💤 等待 {actual_poll_interval} 秒后进行下一轮扫描...")
+                    await asyncio.sleep(actual_poll_interval)
 
         except KeyboardInterrupt:
             logger.info("\n⚠️ 收到中断信号，正在退出...")
         finally:
             # 关闭Redis连接
             await self.signal_queue.close()
+            await self.position_manager.close()
             logger.info("✅ 资源清理完成")
 
     async def analyze_symbol_and_generate_signal(

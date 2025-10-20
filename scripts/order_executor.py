@@ -37,6 +37,7 @@ from longport_quant.notifications.slack import SlackNotifier
 from longport_quant.utils import LotSizeHelper
 from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.stop_manager import StopLossManager
+from longport_quant.persistence.position_manager import RedisPositionManager
 
 
 class InsufficientFundsError(Exception):
@@ -82,6 +83,12 @@ class OrderExecutor:
         self.order_manager = OrderManager()
         self.stop_manager = StopLossManager()
 
+        # 【新增】Redis持仓管理器 - 跨进程共享持仓状态
+        self.position_manager = RedisPositionManager(
+            redis_url=self.settings.redis_url,
+            key_prefix="trading"
+        )
+
         # 持仓追踪
         self.positions_with_stops = {}  # {symbol: {entry_price, stop_loss, take_profit}}
 
@@ -103,6 +110,10 @@ class OrderExecutor:
                 # 初始化Slack（可选）
                 if self.settings.slack_webhook_url:
                     self.slack = SlackNotifier(str(self.settings.slack_webhook_url))
+
+                # 🔥 连接Redis持仓管理器
+                await self.position_manager.connect()
+                logger.info("✅ Redis持仓管理器已连接")
 
                 logger.info("✅ 订单执行器初始化完成")
 
@@ -192,6 +203,7 @@ class OrderExecutor:
         finally:
             # 关闭Redis连接
             await self.signal_queue.close()
+            await self.position_manager.close()
             logger.info("✅ 资源清理完成")
 
     async def execute_order(self, signal: Dict):
@@ -349,6 +361,20 @@ class OrderExecutor:
                 f"   止盈位: ${signal.get('take_profit', 0):.2f}"
             )
 
+            # 🔥 【关键修复】立即更新Redis持仓（防止重复开仓）
+            try:
+                await self.position_manager.add_position(
+                    symbol=symbol,
+                    quantity=quantity,
+                    cost_price=order_price,
+                    order_id=order.get('order_id', ''),
+                    notify=True  # 发布Pub/Sub通知
+                )
+                logger.info(f"  ✅ Redis持仓已更新: {symbol}")
+            except Exception as e:
+                logger.error(f"  ❌ Redis持仓更新失败: {e}")
+                # 不影响订单执行，继续
+
             # 11. 记录止损止盈
             self.positions_with_stops[symbol] = {
                 "entry_price": current_price,
@@ -413,6 +439,17 @@ class OrderExecutor:
                 f"   价格: ${order_price:.2f}\n"
                 f"   总额: ${order_price * quantity:.2f}"
             )
+
+            # 🔥 【关键修复】立即从Redis移除持仓（允许再次买入）
+            try:
+                await self.position_manager.remove_position(
+                    symbol=symbol,
+                    notify=True  # 发布Pub/Sub通知
+                )
+                logger.info(f"  ✅ Redis持仓已移除: {symbol}")
+            except Exception as e:
+                logger.error(f"  ❌ Redis持仓移除失败: {e}")
+                # 不影响订单执行，继续
 
             # 清除止损止盈记录
             if symbol in self.positions_with_stops:
