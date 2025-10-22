@@ -1,0 +1,84 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Background */
+    --background-primary: #0B0E11;
+    --background-secondary: #131722;
+    --background-tertiary: #1C2128;
+    --background-elevated: #242931;
+
+    /* Borders */
+    --border-primary: #2A2E39;
+    --border-secondary: #363A45;
+    --border-hover: #434651;
+
+    /* Text */
+    --text-primary: #D1D4DC;
+    --text-secondary: #787B86;
+    --text-tertiary: #53565F;
+    --text-disabled: #363A45;
+
+    /* Data colors */
+    --color-long: #089981;
+    --color-short: #F23645;
+    --color-neutral: #787B86;
+
+    /* Functional */
+    --color-info: #2962FF;
+    --color-warning: #FF6D00;
+    --color-danger: #F23645;
+    --color-success: #089981;
+
+    /* Accent */
+    --accent-primary: #2962FF;
+    --accent-secondary: #5E81F4;
+  }
+
+  /* Light theme (optional) */
+  .light {
+    --background-primary: #FFFFFF;
+    --background-secondary: #F7F8FA;
+    --background-tertiary: #FAFBFC;
+    --background-elevated: #FFFFFF;
+
+    --border-primary: #E0E3EB;
+    --border-secondary: #D1D4DC;
+    --border-hover: #B8BCC4;
+
+    --text-primary: #131722;
+    --text-secondary: #434651;
+    --text-tertiary: #787B86;
+    --text-disabled: #B8BCC4;
+
+    --color-long: #00897B;
+    --color-short: #D32F2F;
+    --color-neutral: #787B86;
+
+    --color-info: #2962FF;
+    --color-warning: #F57C00;
+    --color-danger: #D32F2F;
+    --color-success: #00897B;
+
+    --accent-primary: #2962FF;
+    --accent-secondary: #5E81F4;
+  }
+
+  * {
+    @apply border-border-primary;
+  }
+
+  body {
+    @apply bg-bg-primary text-text-primary;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+  }
+}
+
+@layer utilities {
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
