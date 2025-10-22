@@ -38,6 +38,7 @@ from longport_quant.utils import LotSizeHelper
 from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.stop_manager import StopLossManager
 from longport_quant.persistence.position_manager import RedisPositionManager
+from longport_quant.models.signal_history import SignalRecorder
 
 
 class InsufficientFundsError(Exception):
@@ -88,6 +89,9 @@ class OrderExecutor:
             redis_url=self.settings.redis_url,
             key_prefix="trading"
         )
+
+        # 信号历史记录器 - 用于更新信号执行状态
+        self.signal_recorder = SignalRecorder()
 
         # 持仓追踪
         self.positions_with_stops = {}  # {symbol: {entry_price, stop_loss, take_profit}}
@@ -361,6 +365,20 @@ class OrderExecutor:
                 f"   止盈位: ${signal.get('take_profit', 0):.2f}"
             )
 
+            # 🔥 更新信号执行状态到数据库
+            try:
+                await self.signal_recorder.update_execution(
+                    symbol=symbol,
+                    action='BUY',
+                    executed_at=datetime.now(self.beijing_tz),
+                    execution_price=order_price,
+                    execution_quantity=quantity,
+                    order_id=order.get('order_id', ''),
+                    execution_status='SUBMITTED'  # 订单已提交，等待成交
+                )
+            except Exception as e:
+                logger.debug(f"  ⚠️ 更新信号执行状态失败: {e}")
+
             # 🔥 【关键修复】立即更新Redis持仓（防止重复开仓）
             try:
                 await self.position_manager.add_position(
@@ -439,6 +457,20 @@ class OrderExecutor:
                 f"   价格: ${order_price:.2f}\n"
                 f"   总额: ${order_price * quantity:.2f}"
             )
+
+            # 🔥 更新信号执行状态到数据库
+            try:
+                await self.signal_recorder.update_execution(
+                    symbol=symbol,
+                    action='SELL',
+                    executed_at=datetime.now(self.beijing_tz),
+                    execution_price=order_price,
+                    execution_quantity=quantity,
+                    order_id=order.get('order_id', ''),
+                    execution_status='SUBMITTED'  # 订单已提交，等待成交
+                )
+            except Exception as e:
+                logger.debug(f"  ⚠️ 更新信号执行状态失败: {e}")
 
             # 🔥 【关键修复】立即从Redis移除持仓（允许再次买入）
             try:

@@ -40,6 +40,7 @@ from longport_quant.utils import LotSizeHelper
 from longport_quant.persistence.stop_manager import StopLossManager
 from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.position_manager import RedisPositionManager
+from longport_quant.models.signal_history import SignalRecorder
 
 
 def sanitize_unicode(text: str) -> str:
@@ -162,6 +163,9 @@ class SignalGenerator:
             redis_url=self.settings.redis_url,
             key_prefix="trading"
         )
+
+        # 信号历史记录器 - 用于记录所有生成的信号
+        self.signal_recorder = SignalRecorder()
 
         # 今日已交易标的集合（避免重复下单）
         self.traded_today = set()  # 今日买单标的（包括pending）
@@ -546,6 +550,22 @@ class SignalGenerator:
                 if success:
                     # 记录信号生成时间（用于冷却期检查）
                     self.signal_history[signal['symbol']] = datetime.now(self.beijing_tz)
+
+                    # 🔥 记录信号到数据库（用于回溯分析）
+                    try:
+                        await self.signal_recorder.record_signal(
+                            symbol=signal['symbol'],
+                            action=signal.get('side', 'BUY'),
+                            price=signal['price'],
+                            signal_score=signal['score'],
+                            indicators=signal.get('indicators', {}),
+                            strategy_name='WebSocket实时推送',
+                            signal_type=signal['type'],
+                            reasons=signal.get('reasons', [])
+                        )
+                    except Exception as e:
+                        logger.debug(f"  ⚠️ 记录信号历史失败: {e}")
+
                     logger.success(
                         f"🔔 {symbol}: 实时信号已生成! 类型={signal['type']}, "
                         f"评分={signal['score']}, 价格=${current_price:.2f}"
@@ -776,6 +796,22 @@ class SignalGenerator:
                                             signals_generated += 1
                                             # 记录信号生成时间（用于冷却期检查）
                                             self.signal_history[signal['symbol']] = datetime.now(self.beijing_tz)
+
+                                            # 🔥 记录信号到数据库（用于回溯分析）
+                                            try:
+                                                await self.signal_recorder.record_signal(
+                                                    symbol=signal['symbol'],
+                                                    action=signal.get('side', 'BUY'),
+                                                    price=signal['price'],
+                                                    signal_score=signal['score'],
+                                                    indicators=signal.get('indicators', {}),
+                                                    strategy_name='定时轮询扫描',
+                                                    signal_type=signal['type'],
+                                                    reasons=signal.get('reasons', [])
+                                                )
+                                            except Exception as e:
+                                                logger.debug(f"  ⚠️ 记录信号历史失败: {e}")
+
                                             logger.success(
                                                 f"  ✅ 信号已发送到队列: {signal['type']}, "
                                                 f"评分={signal['score']}, 优先级={signal.get('priority', signal['score'])}"
@@ -810,6 +846,22 @@ class SignalGenerator:
                                     signals_generated += 1
                                     # 记录信号生成时间（用于冷却期检查）
                                     self.signal_history[exit_signal['symbol']] = datetime.now(self.beijing_tz)
+
+                                    # 🔥 记录平仓信号到数据库（用于回溯分析）
+                                    try:
+                                        await self.signal_recorder.record_signal(
+                                            symbol=exit_signal['symbol'],
+                                            action=exit_signal.get('side', 'SELL'),
+                                            price=exit_signal.get('price', 0),
+                                            signal_score=exit_signal.get('score', 90),
+                                            indicators={},  # 平仓信号不需要技术指标
+                                            strategy_name='止损止盈检查',
+                                            signal_type=exit_signal['type'],
+                                            reasons=[exit_signal.get('reason', '平仓')]
+                                        )
+                                    except Exception as e:
+                                        logger.debug(f"  ⚠️ 记录平仓信号历史失败: {e}")
+
                                     logger.success(
                                         f"  ✅ 平仓信号已发送: {exit_signal['symbol']}, "
                                         f"原因={exit_signal.get('reason', 'N/A')}"
