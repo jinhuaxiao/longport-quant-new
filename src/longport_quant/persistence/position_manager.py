@@ -112,8 +112,8 @@ class RedisPositionManager:
             # 2. 保存持仓详情
             position_data = {
                 "symbol": symbol,
-                "quantity": quantity,
-                "cost_price": cost_price,
+                "quantity": float(quantity) if quantity else 0,
+                "cost_price": float(cost_price) if cost_price else 0,
                 "order_id": order_id,
                 "added_at": datetime.now(self.beijing_tz).isoformat(),
             }
@@ -294,23 +294,26 @@ class RedisPositionManager:
                 if pos.get("quantity", 0) > 0
             }
 
-            # 找出需要添加和删除的
-            to_add = api_positions - redis_positions
+            # 找出需要删除的
             to_remove = redis_positions - api_positions
 
-            # 批量添加
-            for symbol in to_add:
-                pos = next(p for p in positions if p["symbol"] == symbol)
-                await self.add_position(
-                    symbol=symbol,
-                    quantity=pos.get("quantity", 0),
-                    cost_price=pos.get("cost_price", 0),
-                    notify=False  # 批量同步不发通知
-                )
-
-            # 批量删除
+            # 批量删除（API中没有的持仓）
             for symbol in to_remove:
                 await self.remove_position(symbol, notify=False)
+
+            # 🔥 关键修复：批量添加/更新所有API持仓（不仅新增，已有的也更新详情）
+            # 确保 Redis HASH 中有完整的持仓详情（quantity, cost_price等）
+            for pos in positions:
+                if pos.get("quantity", 0) > 0:
+                    await self.add_position(
+                        symbol=pos["symbol"],
+                        quantity=pos.get("quantity", 0),
+                        cost_price=pos.get("cost_price", 0),
+                        notify=False  # 批量同步不发通知
+                    )
+
+            # 统计新增数量
+            to_add = api_positions - redis_positions
 
             logger.info(
                 f"✅ Redis持仓同步完成: "

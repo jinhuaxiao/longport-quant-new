@@ -259,28 +259,40 @@ class LongportTradingClient:
             buy_power = {}
             net_assets = {}
 
+            # 先收集所有币种（从 cash_infos）
+            all_currencies = set()
             for balance in balances:
-                currency = balance.currency
-
-                # 使用buy_power（购买力）
-                buy_power[currency] = float(balance.buy_power) if hasattr(balance, 'buy_power') else 0
-
-                # 记录净资产
-                net_assets[currency] = float(balance.net_assets) if hasattr(balance, 'net_assets') else 0
-
-                # 获取实际可用现金
-                actual_cash = 0
                 if hasattr(balance, 'cash_infos') and balance.cash_infos:
                     for cash_info in balance.cash_infos:
-                        if cash_info.currency == currency:
-                            actual_cash = float(cash_info.available_cash)
-                            break
+                        all_currencies.add(cash_info.currency)
 
-                # 如果是融资账户且现金为负，使用购买力
-                if actual_cash < 0:
-                    cash[currency] = buy_power[currency]
-                else:
-                    cash[currency] = actual_cash
+            # 为每个币种获取详细信息
+            for currency in all_currencies:
+                # 获取该币种的购买力和净资产
+                currency_balance = await self.account_balance(currency)
+                if currency_balance and len(currency_balance) > 0:
+                    balance = currency_balance[0]
+
+                    # 获取购买力
+                    buy_power[currency] = float(balance.buy_power) if hasattr(balance, 'buy_power') else 0
+
+                    # 获取净资产
+                    net_assets[currency] = float(balance.net_assets) if hasattr(balance, 'net_assets') else 0
+
+                    # 获取可用现金
+                    actual_cash = 0
+                    if hasattr(balance, 'cash_infos') and balance.cash_infos:
+                        for cash_info in balance.cash_infos:
+                            if cash_info.currency == currency:
+                                actual_cash = float(cash_info.available_cash)
+                                break
+
+                    # 优先使用购买力（如果有），否则使用现金
+                    # 购买力包含了可用现金+融资额度+持仓抵押
+                    if buy_power[currency] > 0:
+                        cash[currency] = buy_power[currency]
+                    else:
+                        cash[currency] = actual_cash
 
             # 获取持仓信息
             positions = []

@@ -438,9 +438,15 @@ class SignalGenerator:
                 return False, "今日已对该标的下过卖单（包括待成交订单）"
 
             # 第4层：时间窗口去重
-            in_cooldown, remaining = self._is_in_cooldown(symbol)
-            if in_cooldown:
-                return False, f"信号冷却期内（还需等待{remaining:.0f}秒）"
+            # 🔥 重要：止损止盈信号不受冷却期限制（必须立即执行）
+            if signal_type in ["STOP_LOSS", "TAKE_PROFIT"]:
+                # 止损止盈无冷却期，确保实时响应
+                logger.debug(f"  ⚡ {symbol}: 止损止盈信号，豁免冷却期检查")
+            else:
+                # 普通SELL信号检查冷却期
+                in_cooldown, remaining = self._is_in_cooldown(symbol)
+                if in_cooldown:
+                    return False, f"信号冷却期内（还需等待{remaining:.0f}秒）"
 
         return True, ""
 
@@ -517,15 +523,14 @@ class SignalGenerator:
 
             logger.debug(f"⚡ {symbol}: 价格变化触发实时计算 (${current_price:.2f})")
 
-            # 优先级1：检查持仓的止损止盈
+            # 优先级1：检查持仓的止损止盈（实时检查）
             if symbol in self.current_positions:
                 # 从Redis获取最新持仓状态
                 has_position = await self.position_manager.has_position(symbol)
                 if has_position:
-                    # TODO: 检查止损止盈逻辑（复用check_exit_signals）
-                    # 暂时跳过，因为现有的check_exit_signals需要account对象
-                    logger.debug(f"  ℹ️  {symbol}: 持仓标的，跳过买入信号分析")
-                    return
+                    # 🔥 实时检查止损止盈（每次价格变化都检查）
+                    await self._check_realtime_stop_loss(symbol, current_price, quote)
+                    return  # 持仓标的不再分析买入信号
 
             # 优先级2：分析买入信号
             signal = await self.analyze_symbol_and_generate_signal(symbol, quote, current_price)
@@ -597,6 +602,117 @@ class SignalGenerator:
 
         # 不满足任何条件，跳过计算
         return False
+
+    async def _check_realtime_stop_loss(self, symbol: str, current_price: float, quote):
+        """
+        实时检查单个持仓的止损止盈（WebSocket实时触发）
+
+        Args:
+            symbol: 标的代码
+            current_price: 当前价格
+            quote: 实时行情对象
+
+        优势：
+        - 实时响应（<1秒）
+        - 每次价格变化都检查
+        - 避免10分钟延迟导致的损失
+        """
+        try:
+            # 1. 获取持仓详情（从Redis）
+            position_detail = await self.position_manager.get_position_detail(symbol)
+            if not position_detail:
+                logger.debug(f"  ℹ️  {symbol}: Redis中无持仓详情")
+                return
+
+            cost_price = position_detail.get('cost_price', 0)
+            quantity = position_detail.get('quantity', 0)
+
+            # 2. 获取止损止盈设置（从数据库）
+            # 注意：account_id 可以为空字符串，stop_manager会处理
+            stops = await self.stop_manager.get_position_stops("", symbol)
+
+            if not stops:
+                # 没有止损止盈设置，跳过检查
+                logger.debug(f"  ℹ️  {symbol}: 无止损止盈设置")
+                return
+
+            stop_loss = stops.get('stop_loss')
+            take_profit = stops.get('take_profit')
+
+            # 3. 检查固定止损（最高优先级）
+            if stop_loss and current_price <= stop_loss:
+                loss_pct = (cost_price - current_price) / cost_price * 100
+
+                # 去重检查
+                should_generate, skip_reason = await self._should_generate_signal(symbol, 'STOP_LOSS')
+                if not should_generate:
+                    logger.debug(f"  ⏭️  {symbol}: 跳过止损信号 - {skip_reason}")
+                    return
+
+                # 生成止损信号
+                signal = {
+                    'symbol': symbol,
+                    'type': 'STOP_LOSS',
+                    'side': 'SELL',
+                    'price': current_price,
+                    'quantity': quantity,
+                    'reason': f"实时触发止损 (设置=${stop_loss:.2f}, 亏损{loss_pct:.1f}%)",
+                    'score': 100,  # 止损最高优先级
+                    'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                    'priority': 100,
+                }
+
+                success = await self.signal_queue.publish_signal(signal)
+                if success:
+                    logger.warning(
+                        f"🚨 {symbol}: 实时止损触发! "
+                        f"${current_price:.2f} <= ${stop_loss:.2f} "
+                        f"(成本${cost_price:.2f}, 亏损{loss_pct:.1f}%)"
+                    )
+                return
+
+            # 4. 检查固定止盈
+            if take_profit and current_price >= take_profit:
+                profit_pct = (current_price - cost_price) / cost_price * 100
+
+                # 去重检查
+                should_generate, skip_reason = await self._should_generate_signal(symbol, 'TAKE_PROFIT')
+                if not should_generate:
+                    logger.debug(f"  ⏭️  {symbol}: 跳过止盈信号 - {skip_reason}")
+                    return
+
+                # 生成止盈信号
+                signal = {
+                    'symbol': symbol,
+                    'type': 'TAKE_PROFIT',
+                    'side': 'SELL',
+                    'price': current_price,
+                    'quantity': quantity,
+                    'reason': f"实时触发止盈 (设置=${take_profit:.2f}, 盈利{profit_pct:.1f}%)",
+                    'score': 95,
+                    'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                    'priority': 95,
+                }
+
+                success = await self.signal_queue.publish_signal(signal)
+                if success:
+                    logger.success(
+                        f"💰 {symbol}: 实时止盈触发! "
+                        f"${current_price:.2f} >= ${take_profit:.2f} "
+                        f"(成本${cost_price:.2f}, 盈利{profit_pct:.1f}%)"
+                    )
+                return
+
+            # 5. 未触发任何条件
+            stop_loss_str = f"${stop_loss:.2f}" if stop_loss else "N/A"
+            take_profit_str = f"${take_profit:.2f}" if take_profit else "N/A"
+            logger.debug(
+                f"  ℹ️  {symbol}: 价格${current_price:.2f} 在正常范围 "
+                f"(止损{stop_loss_str}, 止盈{take_profit_str})"
+            )
+
+        except Exception as e:
+            logger.debug(f"实时止损止盈检查失败 {symbol}: {e}")
 
     async def update_subscription_for_positions(self, position_symbols):
         """

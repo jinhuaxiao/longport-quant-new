@@ -251,6 +251,13 @@ class OrderExecutor:
         # 3. 资金检查
         currency = "HKD" if ".HK" in symbol else "USD"
         available_cash = account["cash"].get(currency, 0)
+        buy_power = account.get("buy_power", {}).get(currency, 0)
+
+        # 显示购买力信息
+        logger.debug(
+            f"  💰 {currency} 资金状态 - 可用: ${available_cash:,.2f}, "
+            f"购买力: ${buy_power:,.2f}"
+        )
 
         if available_cash < 0:
             logger.error(
@@ -500,6 +507,15 @@ class OrderExecutor:
         budget_pct = max(self.min_position_size_pct, min(budget_pct, self.max_position_size_pct))
 
         dynamic_budget = net_assets * budget_pct
+
+        # 🔥 不能超过该币种的实际购买力
+        available_cash = account.get("cash", {}).get(currency, 0)
+        if dynamic_budget > available_cash:
+            logger.warning(
+                f"  ⚠️ 动态预算${dynamic_budget:,.2f}超出{currency}购买力${available_cash:,.2f}，"
+                f"调整为可用金额"
+            )
+            dynamic_budget = available_cash
 
         logger.debug(
             f"  动态预算计算: 评分={score}, 预算比例={budget_pct:.2%}, "
