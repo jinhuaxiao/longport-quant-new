@@ -119,7 +119,7 @@ class OrderExecutor:
                 logger.info("✅ Redis持仓管理器已连接")
 
                 # 🔥 初始化SmartOrderRouter（用于TWAP/VWAP算法订单）
-                db_manager = DatabaseSessionManager(self.settings.database_dsn)
+                db_manager = DatabaseSessionManager(self.settings.database_dsn, auto_init=True)
                 trade_ctx = await trade_client.get_trade_context()
                 self.smart_router = SmartOrderRouter(trade_ctx, db_manager)
                 logger.info("✅ SmartOrderRouter已初始化（支持TWAP/VWAP算法订单）")
@@ -911,8 +911,9 @@ class OrderExecutor:
             duration_seconds: 持续时间（秒），默认1小时
         """
         try:
+            redis = await self.signal_queue._get_redis()
             redis_key = f"trading:twap_execution:{symbol}"
-            await self.signal_queue.redis.setex(redis_key, duration_seconds, "1")
+            await redis.setex(redis_key, duration_seconds, "1")
             logger.debug(f"  🔒 已标记TWAP执行: {symbol} (持续{duration_seconds}秒)")
         except Exception as e:
             logger.warning(f"  ⚠️ 标记TWAP执行失败: {e}")
@@ -925,8 +926,9 @@ class OrderExecutor:
             symbol: 标的代码
         """
         try:
+            redis = await self.signal_queue._get_redis()
             redis_key = f"trading:twap_execution:{symbol}"
-            await self.signal_queue.redis.delete(redis_key)
+            await redis.delete(redis_key)
             logger.debug(f"  🔓 已移除TWAP执行标记: {symbol}")
         except Exception as e:
             logger.warning(f"  ⚠️ 移除TWAP执行标记失败: {e}")

@@ -281,20 +281,15 @@ class SmartOrderRouter:
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
             # Wrap synchronous SDK call with asyncio.to_thread
+            # 正确的参数顺序: symbol, order_type, side, quantity, time_in_force, price
             resp = await asyncio.to_thread(
                 self.trade_context.submit_order,
                 request.symbol,
-                order_side,
-                OrderType.MO,  # MO = Market Order
+                OrderType.MO,  # order_type: Market Order
+                order_side,     # side
                 request.quantity,
                 TimeInForceType.Day,
-                None,  # price (not needed for market orders)
-                None,  # trigger_price
-                None,  # limit_offset
-                None,  # trailing_amount
-                None,  # trailing_percent
-                None,  # outside_rth
-                "SmartRouter-Aggressive"  # remark
+                None  # price (not needed for market orders)
             )
 
             # Track order
@@ -345,20 +340,15 @@ class SmartOrderRouter:
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
             # Wrap synchronous SDK call with asyncio.to_thread
+            # 正确的参数顺序: symbol, order_type, side, quantity, time_in_force, price
             resp = await asyncio.to_thread(
                 self.trade_context.submit_order,
                 request.symbol,
-                order_side,
-                OrderType.LO,  # LO = Limit Order
+                OrderType.LO,  # order_type: Limit Order
+                order_side,     # side
                 request.quantity,
                 TimeInForceType.Day,
-                Decimal(str(limit_price)),  # price
-                None,  # trigger_price
-                None,  # limit_offset
-                None,  # trailing_amount
-                None,  # trailing_percent
-                None,  # outside_rth
-                "SmartRouter-Passive"  # remark
+                Decimal(str(limit_price))  # price
             )
 
             # Track order
