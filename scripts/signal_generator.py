@@ -118,9 +118,19 @@ class SignalGenerator:
             "TSLA.US": {"name": "特斯拉", "sector": "汽车"},
             "META.US": {"name": "Meta", "sector": "科技"},
             "AMD.US": {"name": "AMD", "sector": "科技"},
-            # 杠杆ETF和新增标的
+            # 半导体产业链
+            "TSM.US": {"name": "台积电", "sector": "半导体"},
+            "ASML.US": {"name": "阿斯麦", "sector": "半导体"},
+            # AI & 云计算
+            "PLTR.US": {"name": "Palantir", "sector": "AI"},
+            # 电商 & 金融科技
+            "SHOP.US": {"name": "Shopify", "sector": "电商"},
+            # ETF指数基金
+            "QQQ.US": {"name": "纳指100ETF", "sector": "ETF"},
+            # 杠杆ETF
             "TQQQ.US": {"name": "纳指三倍做多ETF", "sector": "ETF"},
             "NVDU.US": {"name": "英伟达二倍做多ETF", "sector": "ETF"},
+            # 其他
             "RKLB.US": {"name": "火箭实验室", "sector": "航天"},
             "HOOD.US": {"name": "Robinhood", "sector": "金融科技"},
         }
@@ -368,6 +378,24 @@ class SignalGenerator:
         else:
             return False, 0
 
+    async def _is_in_twap_execution(self, symbol: str) -> bool:
+        """
+        检查标的是否正在进行TWAP订单执行
+
+        Args:
+            symbol: 标的代码
+
+        Returns:
+            是否在TWAP执行中
+        """
+        try:
+            redis_key = f"trading:twap_execution:{symbol}"
+            result = await self.signal_queue.redis.get(redis_key)
+            return result is not None
+        except Exception as e:
+            logger.warning(f"检查TWAP执行状态失败: {e}")
+            return False
+
     def _cleanup_signal_history(self):
         """
         清理过期的信号历史记录
@@ -405,24 +433,23 @@ class SignalGenerator:
 
         # === BUY信号的去重检查 ===
         if signal_type in ["BUY", "STRONG_BUY", "WEAK_BUY"]:
-            # 第2层：持仓去重（最关键的检查 - 从Redis实时检查）
-            # 🔥 关键修复：使用Redis检查，跨进程共享，实时更新
-            has_position = await self.position_manager.has_position(symbol)
-            if has_position:
-                return False, "已持有该标的（Redis检查）"
+            # 🔥 修改：移除持仓去重检查，允许对已持仓标的加仓
+            # 原因：如果某标的再次出现强买入信号，应该允许加仓（分批建仓策略）
 
-            # 备用检查：内存缓存（如果Redis失败）
-            if symbol in self.current_positions:
-                logger.debug(f"  ℹ️  {symbol}: Redis未检测到持仓，但内存缓存显示已持有")
-                return False, "已持有该标的（内存缓存）"
+            # TWAP执行检查 - 防止在TWAP订单执行期间生成重复信号
+            if await self._is_in_twap_execution(symbol):
+                return False, "标的正在进行TWAP订单执行"
 
-            # 第3层：时间窗口去重（冷却期检查）
+            # 时间窗口去重（冷却期检查）- 防止短时间内重复买入
             in_cooldown, remaining = self._is_in_cooldown(symbol)
             if in_cooldown:
                 return False, f"信号冷却期内（还需等待{remaining:.0f}秒）"
 
             # 调试日志：记录允许买入的情况
-            if symbol in self.traded_today:
+            has_position = await self.position_manager.has_position(symbol)
+            if has_position:
+                logger.debug(f"  ✅ {symbol}: 已有持仓，允许加仓")
+            elif symbol in self.traded_today:
                 logger.debug(f"  ℹ️  {symbol}: 今日已买过但已卖出（或订单未成交），允许再次买入")
             else:
                 logger.debug(f"  ℹ️  {symbol}: 今日未买过，允许买入")
@@ -530,9 +557,9 @@ class SignalGenerator:
                 if has_position:
                     # 🔥 实时检查止损止盈（每次价格变化都检查）
                     await self._check_realtime_stop_loss(symbol, current_price, quote)
-                    return  # 持仓标的不再分析买入信号
+                    # 🔥 修改：不再直接返回，继续分析买入信号（允许加仓）
 
-            # 优先级2：分析买入信号
+            # 优先级2：分析买入信号（包括已持仓标的的加仓信号）
             signal = await self.analyze_symbol_and_generate_signal(symbol, quote, current_price)
 
             if signal:

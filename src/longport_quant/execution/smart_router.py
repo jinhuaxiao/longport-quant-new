@@ -201,6 +201,77 @@ class SmartOrderRouter:
         # Default to standard execution
         return ExecutionStrategy.AGGRESSIVE
 
+    def _calculate_dynamic_limit_price(
+        self,
+        side: str,
+        reference_price: float,
+        current_market_price: float,
+        max_slippage: float,
+        market_data: dict
+    ) -> tuple[float, bool]:
+        """
+        动态计算限价，控制滑点
+
+        Args:
+            side: 订单方向 (BUY/SELL)
+            reference_price: 初始参考价格
+            current_market_price: 当前市场价格
+            max_slippage: 最大允许滑点 (如0.01=1%)
+            market_data: 实时行情数据 (包含bid/ask)
+
+        Returns:
+            (建议限价, 是否超过滑点限制)
+        """
+        # 计算当前市场价相对参考价的偏差
+        price_deviation = abs(current_market_price - reference_price) / reference_price
+        exceeds_slippage = price_deviation > max_slippage
+
+        if side == "BUY":
+            # 买入：限价不能超过参考价 * (1 + max_slippage)
+            max_acceptable_price = reference_price * (1 + max_slippage)
+
+            # 获取当前卖一价
+            ask_price = market_data.get('ask', current_market_price)
+            if ask_price == 0:
+                ask_price = current_market_price
+
+            # 在ask价基础上略微提高（提高成交概率）
+            suggested_price = ask_price * 1.001
+
+            # 取较小值，确保不超过滑点上限
+            limit_price = min(suggested_price, max_acceptable_price)
+
+            logger.debug(
+                f"动态限价计算(BUY): 参考=${reference_price:.2f}, "
+                f"市场=${current_market_price:.2f}, Ask=${ask_price:.2f}, "
+                f"建议限价=${limit_price:.2f}, 偏差={price_deviation*100:.2f}%, "
+                f"超限={exceeds_slippage}"
+            )
+
+        else:  # SELL
+            # 卖出：限价不能低于参考价 * (1 - max_slippage)
+            min_acceptable_price = reference_price * (1 - max_slippage)
+
+            # 获取当前买一价
+            bid_price = market_data.get('bid', current_market_price)
+            if bid_price == 0:
+                bid_price = current_market_price
+
+            # 在bid价基础上略微降低（提高成交概率）
+            suggested_price = bid_price * 0.999
+
+            # 取较大值，确保不低于滑点下限
+            limit_price = max(suggested_price, min_acceptable_price)
+
+            logger.debug(
+                f"动态限价计算(SELL): 参考=${reference_price:.2f}, "
+                f"市场=${current_market_price:.2f}, Bid=${bid_price:.2f}, "
+                f"建议限价=${limit_price:.2f}, 偏差={price_deviation*100:.2f}%, "
+                f"超限={exceeds_slippage}"
+            )
+
+        return limit_price, exceeds_slippage
+
     async def _execute_aggressive(self, request: OrderRequest) -> ExecutionResult:
         """Execute order aggressively using market orders."""
         logger.info(f"Executing aggressive order for {request.symbol}")
@@ -209,13 +280,21 @@ class SmartOrderRouter:
             # Submit market order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
-            resp = await self.trade_context.submit_order(
-                symbol=request.symbol,
-                side=order_side,
-                order_type=OrderType.MO,  # MO = Market Order
-                quantity=request.quantity,
-                time_in_force=TimeInForceType.Day,
-                remark="SmartRouter-Aggressive"
+            # Wrap synchronous SDK call with asyncio.to_thread
+            resp = await asyncio.to_thread(
+                self.trade_context.submit_order,
+                request.symbol,
+                order_side,
+                OrderType.MO,  # MO = Market Order
+                request.quantity,
+                TimeInForceType.Day,
+                None,  # price (not needed for market orders)
+                None,  # trigger_price
+                None,  # limit_offset
+                None,  # trailing_amount
+                None,  # trailing_percent
+                None,  # outside_rth
+                "SmartRouter-Aggressive"  # remark
             )
 
             # Track order
@@ -265,14 +344,21 @@ class SmartOrderRouter:
             # Submit limit order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
-            resp = await self.trade_context.submit_order(
-                symbol=request.symbol,
-                side=order_side,
-                order_type=OrderType.LO,  # LO = Limit Order
-                price=Decimal(str(limit_price)),
-                quantity=request.quantity,
-                time_in_force=TimeInForceType.Day,
-                remark="SmartRouter-Passive"
+            # Wrap synchronous SDK call with asyncio.to_thread
+            resp = await asyncio.to_thread(
+                self.trade_context.submit_order,
+                request.symbol,
+                order_side,
+                OrderType.LO,  # LO = Limit Order
+                request.quantity,
+                TimeInForceType.Day,
+                Decimal(str(limit_price)),  # price
+                None,  # trigger_price
+                None,  # limit_offset
+                None,  # trailing_amount
+                None,  # trailing_percent
+                None,  # outside_rth
+                "SmartRouter-Passive"  # remark
             )
 
             # Track order
@@ -348,7 +434,7 @@ class SmartOrderRouter:
         )
 
     async def _execute_twap(self, request: OrderRequest) -> ExecutionResult:
-        """Execute order using Time-Weighted Average Price strategy."""
+        """Execute order using Time-Weighted Average Price strategy with dynamic slippage control."""
         logger.info(f"Executing TWAP order for {request.symbol}")
 
         # Divide order into time slices (e.g., execute over 30 minutes)
@@ -357,9 +443,21 @@ class SmartOrderRouter:
         slice_size = request.quantity // num_slices
         interval_seconds = (duration_minutes * 60) / num_slices
 
+        # 保存初始参考价格（用于滑点计算）
+        reference_price = request.limit_price if request.limit_price else 0.0
+        max_slippage = request.max_slippage if request.max_slippage else 0.02  # 默认2%
+        use_dynamic_pricing = request.max_slippage is not None and request.max_slippage > 0
+
         total_filled = 0
         total_value = 0.0
         child_orders = []
+        cumulative_slippage = 0.0  # 累计滑点
+
+        logger.info(
+            f"TWAP配置: 切片数={num_slices}, 间隔={interval_seconds:.0f}秒, "
+            f"参考价=${reference_price:.2f}, 最大滑点={max_slippage*100:.1f}%, "
+            f"动态定价={'启用' if use_dynamic_pricing else '禁用'}"
+        )
 
         for i in range(num_slices):
             # Calculate slice quantity
@@ -369,13 +467,53 @@ class SmartOrderRouter:
             else:
                 slice_qty = slice_size
 
+            # 🔥 更新市场数据（获取最新行情）
+            await self._update_market_data(request.symbol)
+            market_data = self._market_data_cache.get(request.symbol, {})
+            current_market_price = market_data.get('last_price', reference_price)
+
+            # 🔥 计算动态限价（如果启用）
+            if use_dynamic_pricing and reference_price > 0:
+                slice_limit_price, exceeds_slippage = self._calculate_dynamic_limit_price(
+                    side=request.side,
+                    reference_price=reference_price,
+                    current_market_price=current_market_price,
+                    max_slippage=max_slippage,
+                    market_data=market_data
+                )
+
+                # 🔥 检查是否超过滑点限制
+                if exceeds_slippage:
+                    logger.warning(
+                        f"⚠️ TWAP切片{i+1}/{num_slices}: 市场价格偏离过大 "
+                        f"(参考=${reference_price:.2f}, 当前=${current_market_price:.2f}, "
+                        f"偏差={(abs(current_market_price - reference_price) / reference_price)*100:.2f}% > {max_slippage*100:.1f}%)"
+                    )
+
+                    # 检查累计滑点是否已经很高
+                    if cumulative_slippage > max_slippage * 1.2:
+                        logger.error(
+                            f"❌ TWAP停止执行: 累计滑点{cumulative_slippage*100:.2f}% "
+                            f"超过限制{max_slippage*1.2*100:.2f}%"
+                        )
+                        break  # 停止执行剩余切片
+            else:
+                # 使用固定限价（原有逻辑）
+                slice_limit_price = request.limit_price
+
+            logger.info(
+                f"  📊 TWAP切片{i+1}/{num_slices}: "
+                f"{slice_qty}股 @ ${slice_limit_price:.2f} "
+                f"(市场=${current_market_price:.2f})"
+            )
+
             # Execute slice
             slice_request = OrderRequest(
                 symbol=request.symbol,
                 side=request.side,
                 quantity=slice_qty,
                 order_type="LIMIT",
-                limit_price=request.limit_price,
+                limit_price=slice_limit_price,  # 🔥 使用动态限价
                 strategy=ExecutionStrategy.PASSIVE,
                 urgency=request.urgency,
                 signal=request.signal
@@ -387,8 +525,21 @@ class SmartOrderRouter:
                 total_filled += result.filled_quantity
                 total_value += result.filled_quantity * result.average_price
                 child_orders.append(result.order_id)
+
+                # 🔥 计算本切片的滑点
+                if reference_price > 0 and result.average_price > 0:
+                    slice_slippage = abs(result.average_price - reference_price) / reference_price
+                    weight = result.filled_quantity / request.quantity
+                    cumulative_slippage += slice_slippage * weight
+
+                    logger.info(
+                        f"  ✅ 切片{i+1}成交: 数量={result.filled_quantity}股, "
+                        f"均价=${result.average_price:.2f}, "
+                        f"滑点={slice_slippage*100:.2f}%, "
+                        f"累计滑点={cumulative_slippage*100:.2f}%"
+                    )
             else:
-                logger.warning(f"TWAP slice {i+1}/{num_slices} failed")
+                logger.warning(f"  ⚠️ TWAP切片{i+1}/{num_slices}执行失败")
 
             # Wait before next slice
             if i < num_slices - 1:
@@ -396,10 +547,18 @@ class SmartOrderRouter:
 
         avg_price = total_value / total_filled if total_filled > 0 else 0
 
+        # 最终日志输出
+        logger.info(
+            f"📊 TWAP执行完成: 成交{total_filled}/{request.quantity}股, "
+            f"均价=${avg_price:.2f}, 累计滑点={cumulative_slippage*100:.2f}%, "
+            f"子订单数={len(child_orders)}"
+        )
+
         return ExecutionResult(
             success=total_filled > 0,
             filled_quantity=total_filled,
             average_price=avg_price,
+            slippage=cumulative_slippage,  # 🔥 返回累计滑点
             execution_time=datetime.now(),
             child_orders=child_orders
         )
@@ -514,8 +673,8 @@ class SmartOrderRouter:
 
         while (datetime.now() - start_time).seconds < timeout:
             try:
-                # Check order status
-                orders = await self.trade_context.today_orders()
+                # Check order status (wrap synchronous call)
+                orders = await asyncio.to_thread(self.trade_context.today_orders)
 
                 for order in orders:
                     if order.order_id == order_id:
@@ -633,7 +792,8 @@ class SmartOrderRouter:
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an active order."""
         try:
-            await self.trade_context.cancel_order(order_id)
+            # Wrap synchronous SDK call
+            await asyncio.to_thread(self.trade_context.cancel_order, order_id)
 
             # Remove from active orders
             self._active_orders.pop(order_id, None)
@@ -653,10 +813,13 @@ class SmartOrderRouter:
     ) -> bool:
         """Modify an existing order."""
         try:
-            await self.trade_context.modify_order(
-                order_id=order_id,
-                quantity=new_quantity,
-                price=Decimal(str(new_price)) if new_price else None
+            # Note: Longport SDK uses replace_order, not modify_order
+            # Wrap synchronous SDK call
+            await asyncio.to_thread(
+                self.trade_context.replace_order,
+                order_id,
+                new_quantity,
+                Decimal(str(new_price)) if new_price else None
             )
 
             logger.info(f"Order {order_id} modified")

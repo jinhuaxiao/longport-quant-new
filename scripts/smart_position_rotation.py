@@ -2,7 +2,8 @@
 """智能持仓轮换系统 - 解决满仓时强信号无法执行的问题"""
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 from loguru import logger
 import sys
 from pathlib import Path
@@ -35,6 +36,7 @@ class SmartPositionRotator:
         self.order_manager = OrderManager()
         self.stop_manager = StopLossManager()
         self.max_positions = 999  # 不限制持仓数量（与主脚本保持一致）
+        self.beijing_tz = ZoneInfo("Asia/Shanghai")  # 北京时区
 
     async def evaluate_position_strength(self, symbol: str, position: Dict,
                                         quote_client: QuoteDataClient) -> float:
@@ -190,6 +192,75 @@ class SmartPositionRotator:
         except Exception as e:
             logger.debug(f"计算技术评分失败: {e}")
             return 15
+
+    def _is_market_open(self, symbol: str) -> bool:
+        """
+        检查市场是否开盘
+
+        Args:
+            symbol: 标的代码（如 1398.HK, AAPL.US, 300750.SZ）
+
+        Returns:
+            bool: 市场是否开盘
+        """
+        now = datetime.now(self.beijing_tz)
+        weekday = now.weekday()  # 0=周一, 6=周日
+        current_time = now.time()
+
+        if symbol.endswith('.HK'):
+            # 港股交易时间（北京时间）
+            # 周一到周五: 9:30-12:00, 13:00-16:00
+            if weekday >= 5:  # 周六或周日
+                return False
+
+            morning_start = time(9, 30)
+            morning_end = time(12, 0)
+            afternoon_start = time(13, 0)
+            afternoon_end = time(16, 0)
+
+            is_morning = morning_start <= current_time <= morning_end
+            is_afternoon = afternoon_start <= current_time <= afternoon_end
+
+            return is_morning or is_afternoon
+
+        elif symbol.endswith('.US'):
+            # 美股交易时间（北京时间）
+            # 夏令时（3月第二个周日 - 11月第一个周日）: 21:30 - 次日04:00
+            # 冬令时（11月第一个周日 - 次年3月第二个周日）: 22:30 - 次日05:00
+            # 简化处理：使用 21:30 - 次日05:00（涵盖两种情况）
+
+            # 美股周一到周五交易，对应北京时间周二到周六早上
+            market_start = time(21, 30)
+            market_end = time(5, 0)
+
+            # 如果当前是晚上21:30之后，需要是周一到周五
+            if current_time >= market_start:
+                return weekday < 5  # 周一到周五
+            # 如果当前是早上05:00之前，需要是周二到周六
+            elif current_time <= market_end:
+                return 0 < weekday < 6  # 周二到周六
+            else:
+                return False
+
+        elif symbol.endswith('.SH') or symbol.endswith('.SZ'):
+            # A股交易时间（北京时间）
+            # 周一到周五: 9:30-11:30, 13:00-15:00
+            if weekday >= 5:  # 周六或周日
+                return False
+
+            morning_start = time(9, 30)
+            morning_end = time(11, 30)
+            afternoon_start = time(13, 0)
+            afternoon_end = time(15, 0)
+
+            is_morning = morning_start <= current_time <= morning_end
+            is_afternoon = afternoon_start <= current_time <= afternoon_end
+
+            return is_morning or is_afternoon
+
+        else:
+            # 未知市场，默认返回True（不过滤）
+            return True
 
     async def find_weakest_positions(self, positions: Dict,
                                     quote_client: QuoteDataClient,
@@ -412,9 +483,21 @@ class SmartPositionRotator:
             # 按分数从低到高排序
             position_scores.sort(key=lambda x: x[1])
 
-            # 3. 计算新信号评分
+            # 3. 计算新信号评分和币种
             new_signal_score = new_signal.get('score', 0)
-            logger.info(f"\n🎯 新信号评分: {new_signal_score}分 ({new_signal.get('symbol', 'N/A')})")
+            new_signal_symbol = new_signal.get('symbol', 'N/A')
+            logger.info(f"\n🎯 新信号评分: {new_signal_score}分 ({new_signal_symbol})")
+
+            # 确定新信号需要的币种
+            if new_signal_symbol.endswith('.HK') or new_signal_symbol.endswith('.SH') or new_signal_symbol.endswith('.SZ'):
+                new_currency = 'HKD'  # 港股和A股都用HKD账户
+            elif new_signal_symbol.endswith('.US'):
+                new_currency = 'USD'
+            else:
+                new_currency = None  # 未知市场，不做币种限制
+
+            if new_currency:
+                logger.info(f"   需要币种: {new_currency}")
 
             # 4. 逐个卖出弱势持仓，直到资金足够
             total_freed = 0.0
@@ -428,6 +511,37 @@ class SmartPositionRotator:
                     logger.info(
                         f"  ⏭️ {symbol}: 评分{pos_score:.1f}分，"
                         f"与新信号差距{score_diff:.1f}分 < {score_threshold}分，保留"
+                    )
+                    continue
+
+                # 检查币种是否匹配
+                if new_currency:
+                    if symbol.endswith('.HK') or symbol.endswith('.SH') or symbol.endswith('.SZ'):
+                        pos_currency = 'HKD'
+                    elif symbol.endswith('.US'):
+                        pos_currency = 'USD'
+                    else:
+                        pos_currency = None
+
+                    if pos_currency and pos_currency != new_currency:
+                        logger.info(
+                            f"  ⏭️ {symbol}: 币种不匹配（{pos_currency} ≠ {new_currency}），跳过"
+                        )
+                        continue
+
+                # 检查市场是否开盘
+                if not self._is_market_open(symbol):
+                    logger.info(
+                        f"  ⏭️ {symbol}: 市场休市，无法卖出"
+                    )
+                    continue
+
+                # 🔥 关键检查：不要卖出即将买入的标的（避免先卖后买浪费手续费）
+                if symbol == new_signal_symbol:
+                    logger.info(
+                        f"  ⏭️ {symbol}: 是新信号标的，跳过（避免先卖后买浪费手续费）\n"
+                        f"     说明：已持仓评分{pos_score:.1f}分，新信号评分{new_signal_score}分，"
+                        f"这是加仓场景，不应卖出后再买入"
                     )
                     continue
 

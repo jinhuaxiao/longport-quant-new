@@ -31,6 +31,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from longport_quant.config import get_settings
 from longport_quant.execution.client import LongportTradingClient
+from longport_quant.execution.smart_router import SmartOrderRouter, OrderRequest, ExecutionStrategy
 from longport_quant.data.quote_client import QuoteDataClient
 from longport_quant.messaging import SignalQueue
 from longport_quant.notifications.slack import SlackNotifier
@@ -38,6 +39,7 @@ from longport_quant.utils import LotSizeHelper
 from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.stop_manager import StopLossManager
 from longport_quant.persistence.position_manager import RedisPositionManager
+from longport_quant.persistence.db import DatabaseSessionManager
 
 
 class InsufficientFundsError(Exception):
@@ -79,6 +81,7 @@ class OrderExecutor:
         self.trade_client = None
         self.quote_client = None
         self.slack = None
+        self.smart_router = None  # SmartOrderRouter for TWAP/VWAP execution
         self.lot_size_helper = LotSizeHelper()
         self.order_manager = OrderManager()
         self.stop_manager = StopLossManager()
@@ -114,6 +117,12 @@ class OrderExecutor:
                 # 🔥 连接Redis持仓管理器
                 await self.position_manager.connect()
                 logger.info("✅ Redis持仓管理器已连接")
+
+                # 🔥 初始化SmartOrderRouter（用于TWAP/VWAP算法订单）
+                db_manager = DatabaseSessionManager()
+                trade_ctx = await trade_client.get_trade_context()
+                self.smart_router = SmartOrderRouter(trade_ctx, db_manager)
+                logger.info("✅ SmartOrderRouter已初始化（支持TWAP/VWAP算法订单）")
 
                 logger.info("✅ 订单执行器初始化完成")
 
@@ -281,27 +290,35 @@ class OrderExecutor:
             symbol, dynamic_budget, current_price, lot_size
         )
 
-        if quantity <= 0:
+        # 7. 计算所需资金和手数
+        num_lots = quantity // lot_size if quantity > 0 else 0
+        required_cash = current_price * quantity if quantity > 0 else lot_size * current_price
+
+        # 8. 资金不足检查（统一处理，触发智能轮换）
+        if quantity <= 0 or dynamic_budget < (lot_size * current_price):
             logger.warning(
-                f"  ⚠️ {symbol}: 动态预算不足以购买1手 "
-                f"(手数: {lot_size}, 需要: ${lot_size * current_price:.2f}, "
-                f"动态预算: ${dynamic_budget:.2f})"
+                f"  ⚠️ {symbol}: 动态预算不足 "
+                f"(需要至少1手: ${required_cash:.2f}, 可用: ${available_cash:.2f})"
             )
-            raise InsufficientFundsError(f"动态预算不足（需要${lot_size * current_price:.2f}，预算${dynamic_budget:.2f}）")
-
-        num_lots = quantity // lot_size
-        required_cash = current_price * quantity
-
-        # 7. 资金充足性检查（带智能轮换）
-        if required_cash > available_cash:
+            logger.info(
+                f"  📊 当前状态: 币种={currency}, 手数={lot_size}, "
+                f"价格=${current_price:.2f}, 信号评分={score}"
+            )
             logger.warning(
                 f"  ⚠️ {symbol}: 资金不足 "
                 f"(需要 ${required_cash:.2f}, 可用 ${available_cash:.2f})"
             )
+            logger.info(
+                f"  📊 当前状态: 币种={currency}, 数量={quantity}股, "
+                f"价格=${current_price:.2f}, 信号评分={score}"
+            )
 
             # 尝试智能持仓轮换释放资金
             needed_amount = required_cash - available_cash
-            logger.info(f"  🔄 尝试智能持仓轮换释放 ${needed_amount:,.2f}...")
+            logger.info(
+                f"  🔄 尝试智能持仓轮换释放 ${needed_amount:,.2f}...\n"
+                f"     策略: 卖出评分较低的持仓，为评分{score}分的新信号腾出空间"
+            )
 
             rotation_success, freed_amount = await self._try_smart_rotation(
                 signal, needed_amount
@@ -317,6 +334,28 @@ class OrderExecutor:
 
                     if available_cash >= required_cash:
                         logger.success(f"  💰 轮换后可用资金: ${available_cash:,.2f}，继续执行订单")
+
+                        # 重新计算动态预算和购买数量
+                        net_assets = account.get("net_assets", {}).get(currency, 0)
+                        dynamic_budget = self._calculate_dynamic_budget(score, net_assets, currency, account)
+
+                        quantity = self.lot_size_helper.calculate_order_quantity(
+                            symbol, dynamic_budget, current_price, lot_size
+                        )
+
+                        if quantity <= 0:
+                            raise InsufficientFundsError(
+                                f"轮换后预算仍不足以购买1手（预算${dynamic_budget:.2f}）"
+                            )
+
+                        # 更新 num_lots 和 required_cash
+                        num_lots = quantity // lot_size
+                        required_cash = current_price * quantity
+
+                        logger.info(
+                            f"  📊 轮换后重新计算: 预算=${dynamic_budget:.2f}, "
+                            f"数量={quantity}股 ({num_lots}手), 需要${required_cash:.2f}"
+                        )
                     else:
                         logger.warning(
                             f"  ⚠️ 轮换后资金仍不足 "
@@ -347,39 +386,94 @@ class OrderExecutor:
             symbol=symbol
         )
 
-        # 10. 提交订单
+        # 10. 提交订单（使用SmartOrderRouter的TWAP策略）
         try:
-            order = await self.trade_client.submit_order({
-                "symbol": symbol,
-                "side": "BUY",
-                "quantity": quantity,
-                "price": order_price
-            })
+            # 创建订单请求
+            order_request = OrderRequest(
+                symbol=symbol,
+                side="BUY",
+                quantity=quantity,
+                order_type="LIMIT",
+                limit_price=order_price,
+                strategy=ExecutionStrategy.TWAP,  # 使用TWAP策略
+                urgency=5,  # 中等紧急度
+                max_slippage=0.01,  # 允许1%滑点
+                signal=signal,
+                metadata={
+                    "signal_type": signal_type,
+                    "score": score,
+                    "stop_loss": signal.get('stop_loss'),
+                    "take_profit": signal.get('take_profit')
+                }
+            )
+
+            # 🔒 标记TWAP执行状态（防止重复信号，持续1小时）
+            await self._mark_twap_execution(symbol, duration_seconds=3600)
+
+            # 执行TWAP订单
+            logger.info(f"📊 使用TWAP策略执行订单（将在30分钟内分批下单）...")
+            try:
+                execution_result = await self.smart_router.execute_order(order_request)
+
+                if not execution_result.success:
+                    raise Exception(f"订单执行失败: {execution_result.error_message}")
+            finally:
+                # 🔓 执行完成后移除标记（无论成功或失败）
+                await self._unmark_twap_execution(symbol)
+
+            # 使用平均价格和填充数量
+            final_price = execution_result.average_price if execution_result.average_price > 0 else order_price
+            final_quantity = execution_result.filled_quantity if execution_result.filled_quantity > 0 else quantity
 
             logger.success(
-                f"\n✅ 开仓订单已提交: {order['order_id']}\n"
+                f"\n✅ TWAP开仓订单已完成: {execution_result.order_id}\n"
                 f"   标的: {symbol}\n"
                 f"   类型: {signal_type}\n"
                 f"   评分: {score}/100\n"
-                f"   数量: {quantity}股 ({num_lots}手 × {lot_size}股/手)\n"
-                f"   下单价: ${order_price:.2f}\n"
-                f"   总额: ${order_price * quantity:.2f}\n"
+                f"   数量: {final_quantity}股 ({num_lots}手 × {lot_size}股/手)\n"
+                f"   平均价: ${final_price:.2f}\n"
+                f"   总额: ${final_price * final_quantity:.2f}\n"
+                f"   滑点: {execution_result.slippage*100:.2f}%\n"
+                f"   子订单: {len(execution_result.child_orders)}个\n"
                 f"   止损位: ${signal.get('stop_loss', 0):.2f}\n"
                 f"   止盈位: ${signal.get('take_profit', 0):.2f}"
             )
+
+            # 用于后续逻辑的订单信息（保持兼容性）
+            order = {
+                'order_id': execution_result.order_id,
+                'child_orders': execution_result.child_orders
+            }
 
             # 🔥 【关键修复】立即更新Redis持仓（防止重复开仓）
             try:
                 await self.position_manager.add_position(
                     symbol=symbol,
-                    quantity=quantity,
-                    cost_price=order_price,
+                    quantity=final_quantity,  # 使用实际成交数量
+                    cost_price=final_price,   # 使用TWAP平均价
                     order_id=order.get('order_id', ''),
                     notify=True  # 发布Pub/Sub通知
                 )
-                logger.info(f"  ✅ Redis持仓已更新: {symbol}")
+                logger.info(f"  ✅ Redis持仓已更新: {symbol} (TWAP平均价: ${final_price:.2f})")
             except Exception as e:
                 logger.error(f"  ❌ Redis持仓更新失败: {e}")
+                # 不影响订单执行，继续
+
+            # 🔥 【关键修复】保存订单记录到数据库（防止重复买入）
+            # 保存所有子订单记录
+            try:
+                # 保存父订单（主订单）
+                await self.order_manager.save_order(
+                    order_id=order.get('order_id', ''),
+                    symbol=symbol,
+                    side="BUY",
+                    quantity=final_quantity,  # 使用实际成交数量
+                    price=final_price,        # 使用TWAP平均价
+                    status="Filled" if execution_result.filled_quantity == quantity else "Partial"
+                )
+                logger.info(f"  ✅ 订单记录已保存: {order.get('order_id', '')} ({len(execution_result.child_orders)}个子订单)")
+            except Exception as e:
+                logger.error(f"  ❌ 订单记录保存失败: {e}")
                 # 不影响订单执行，继续
 
             # 11. 记录止损止盈
@@ -429,23 +523,52 @@ class OrderExecutor:
             symbol=symbol
         )
 
-        # 提交订单
+        # 提交订单（使用SmartOrderRouter的自适应策略）
         try:
-            order = await self.trade_client.submit_order({
-                "symbol": symbol,
-                "side": "SELL",
-                "quantity": quantity,
-                "price": order_price
-            })
+            # 创建订单请求
+            # 止损/止盈订单使用高紧急度（自动选择AGGRESSIVE策略）
+            order_request = OrderRequest(
+                symbol=symbol,
+                side="SELL",
+                quantity=quantity,
+                order_type="LIMIT",
+                limit_price=order_price,
+                strategy=ExecutionStrategy.ADAPTIVE,  # 自适应策略
+                urgency=8,  # 高紧急度（止损/止盈需要快速执行）
+                max_slippage=0.015,  # 允许1.5%滑点
+                signal=signal,
+                metadata={
+                    "reason": reason,
+                    "signal_type": signal_type
+                }
+            )
+
+            # 执行订单
+            logger.info(f"📊 使用自适应策略执行平仓订单（{reason}）...")
+            execution_result = await self.smart_router.execute_order(order_request)
+
+            if not execution_result.success:
+                raise Exception(f"订单执行失败: {execution_result.error_message}")
+
+            # 使用平均价格和填充数量
+            final_price = execution_result.average_price if execution_result.average_price > 0 else order_price
+            final_quantity = execution_result.filled_quantity if execution_result.filled_quantity > 0 else quantity
 
             logger.success(
-                f"\n✅ 平仓订单已提交: {order['order_id']}\n"
+                f"\n✅ 平仓订单已完成: {execution_result.order_id}\n"
                 f"   标的: {symbol}\n"
                 f"   原因: {reason}\n"
-                f"   数量: {quantity}股\n"
-                f"   价格: ${order_price:.2f}\n"
-                f"   总额: ${order_price * quantity:.2f}"
+                f"   数量: {final_quantity}股\n"
+                f"   平均价: ${final_price:.2f}\n"
+                f"   总额: ${final_price * final_quantity:.2f}\n"
+                f"   滑点: {execution_result.slippage*100:.2f}%"
             )
+
+            # 用于后续逻辑的订单信息（保持兼容性）
+            order = {
+                'order_id': execution_result.order_id,
+                'child_orders': execution_result.child_orders
+            }
 
             # 🔥 【关键修复】立即从Redis移除持仓（允许再次买入）
             try:
@@ -458,13 +581,28 @@ class OrderExecutor:
                 logger.error(f"  ❌ Redis持仓移除失败: {e}")
                 # 不影响订单执行，继续
 
+            # 🔥 【关键修复】保存订单记录到数据库（防止重复卖出）
+            try:
+                await self.order_manager.save_order(
+                    order_id=order.get('order_id', ''),
+                    symbol=symbol,
+                    side="SELL",
+                    quantity=final_quantity,  # 使用实际成交数量
+                    price=final_price,        # 使用实际平均价
+                    status="Filled" if execution_result.filled_quantity == quantity else "Partial"
+                )
+                logger.info(f"  ✅ 订单记录已保存: {order.get('order_id', '')}")
+            except Exception as e:
+                logger.error(f"  ❌ 订单记录保存失败: {e}")
+                # 不影响订单执行，继续
+
             # 清除止损止盈记录
             if symbol in self.positions_with_stops:
                 del self.positions_with_stops[symbol]
 
             # 发送Slack通知
             if self.slack:
-                await self._send_sell_notification(symbol, signal, order, quantity, order_price)
+                await self._send_sell_notification(symbol, signal, order, final_quantity, final_price)
 
         except Exception as e:
             logger.error(f"❌ 提交平仓订单失败: {e}")
@@ -732,25 +870,66 @@ class OrderExecutor:
             rotator = SmartPositionRotator()
 
             # 调用智能轮换释放资金
+            logger.info(
+                f"  📊 智能轮换参数: 新信号={signal.get('symbol', 'N/A')} "
+                f"评分={signal.get('score', 0)}, 需要资金=${needed_amount:,.2f}"
+            )
+
             success, freed = await rotator.try_free_up_funds(
                 needed_amount=needed_amount,
                 new_signal=signal,
                 trade_client=self.trade_client,
                 quote_client=self.quote_client,
-                score_threshold=10  # 新信号需高出10分才替换
+                score_threshold=5  # 新信号需高出5分才替换（降低阈值，更容易轮换）
             )
+
+            if success:
+                logger.success(f"  ✅ 智能轮换成功释放: ${freed:,.2f}")
+            else:
+                logger.warning(f"  ⚠️ 智能轮换未能释放足够资金: ${freed:,.2f}")
 
             return success, freed
 
         except ImportError as e:
             logger.error(f"❌ 导入SmartPositionRotator失败: {e}")
             logger.warning("⚠️ 智能轮换功能不可用，跳过轮换尝试")
+            logger.info("   提示：检查 scripts/smart_position_rotation.py 是否存在")
             return False, 0.0
         except Exception as e:
             logger.error(f"❌ 智能轮换执行失败: {e}")
             import traceback
             logger.debug(traceback.format_exc())
+            logger.warning("   建议：检查持仓数据和行情数据是否正常")
             return False, 0.0
+
+    async def _mark_twap_execution(self, symbol: str, duration_seconds: int = 3600):
+        """
+        标记标的为TWAP执行中状态（防止重复信号）
+
+        Args:
+            symbol: 标的代码
+            duration_seconds: 持续时间（秒），默认1小时
+        """
+        try:
+            redis_key = f"trading:twap_execution:{symbol}"
+            await self.signal_queue.redis.setex(redis_key, duration_seconds, "1")
+            logger.debug(f"  🔒 已标记TWAP执行: {symbol} (持续{duration_seconds}秒)")
+        except Exception as e:
+            logger.warning(f"  ⚠️ 标记TWAP执行失败: {e}")
+
+    async def _unmark_twap_execution(self, symbol: str):
+        """
+        移除标的的TWAP执行中标记
+
+        Args:
+            symbol: 标的代码
+        """
+        try:
+            redis_key = f"trading:twap_execution:{symbol}"
+            await self.signal_queue.redis.delete(redis_key)
+            logger.debug(f"  🔓 已移除TWAP执行标记: {symbol}")
+        except Exception as e:
+            logger.warning(f"  ⚠️ 移除TWAP执行标记失败: {e}")
 
 
 async def main():

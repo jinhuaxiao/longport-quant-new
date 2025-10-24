@@ -273,26 +273,64 @@ class LongportTradingClient:
                 if currency_balance and len(currency_balance) > 0:
                     balance = currency_balance[0]
 
-                    # 获取购买力
+                    # 获取购买力（仅供参考，不作为下单依据）
                     buy_power[currency] = float(balance.buy_power) if hasattr(balance, 'buy_power') else 0
 
                     # 获取净资产
                     net_assets[currency] = float(balance.net_assets) if hasattr(balance, 'net_assets') else 0
 
-                    # 获取可用现金
+                    # 获取详细现金信息
                     actual_cash = 0
+                    withdraw_cash_amount = 0
+                    frozen_cash_amount = 0
+
                     if hasattr(balance, 'cash_infos') and balance.cash_infos:
                         for cash_info in balance.cash_infos:
                             if cash_info.currency == currency:
+                                # 可用现金（可能未扣除挂单冻结）
                                 actual_cash = float(cash_info.available_cash)
+
+                                # 获取可提现金（已扣除所有冻结，最准确）
+                                if hasattr(cash_info, 'withdraw_cash'):
+                                    withdraw_cash_amount = float(cash_info.withdraw_cash)
+
+                                # 获取冻结资金（挂单占用）
+                                if hasattr(cash_info, 'frozen_cash'):
+                                    frozen_cash_amount = float(cash_info.frozen_cash)
                                 break
 
-                    # 优先使用购买力（如果有），否则使用现金
-                    # 购买力包含了可用现金+融资额度+持仓抵押
-                    if buy_power[currency] > 0:
+                    # 获取融资额度信息
+                    remaining_finance = 0
+                    if hasattr(balance, 'remaining_finance_amount'):
+                        remaining_finance = float(balance.remaining_finance_amount)
+
+                    # 选择合适的可用资金
+                    # 1. 如果 available_cash 为负数（使用了融资），则使用 buy_power
+                    # 2. 否则使用 available_cash（已扣除冻结资金）
+                    if actual_cash < 0:
+                        # 账户使用了融资，现金为负数，使用购买力
                         cash[currency] = buy_power[currency]
+                        logger.debug(
+                            f"{currency} 账户使用融资: "
+                            f"欠款=${actual_cash:,.2f}, "
+                            f"购买力=${buy_power[currency]:,.2f}"
+                        )
                     else:
+                        # 正常情况，使用可用现金
                         cash[currency] = actual_cash
+
+                    # 记录资金详情（用于调试）
+                    if withdraw_cash_amount != actual_cash or frozen_cash_amount > 0:
+                        logger.debug(
+                            f"{currency} 资金详情: "
+                            f"可用=${actual_cash:,.2f}, "
+                            f"可提=${withdraw_cash_amount:,.2f}, "
+                            f"冻结=${frozen_cash_amount:,.2f}, "
+                            f"购买力=${buy_power[currency]:,.2f}"
+                        )
+
+                    # 注意：不再使用 buy_power 作为可用资金，因为它可能包含已用完的融资额度
+                    # 如果需要使用融资，应该单独判断 remaining_finance 是否足够
 
             # 获取持仓信息
             positions = []
