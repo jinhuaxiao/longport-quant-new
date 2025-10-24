@@ -119,7 +119,7 @@ class OrderExecutor:
                 logger.info("✅ Redis持仓管理器已连接")
 
                 # 🔥 初始化SmartOrderRouter（用于TWAP/VWAP算法订单）
-                db_manager = DatabaseSessionManager()
+                db_manager = DatabaseSessionManager(self.settings.database_dsn)
                 trade_ctx = await trade_client.get_trade_context()
                 self.smart_router = SmartOrderRouter(trade_ctx, db_manager)
                 logger.info("✅ SmartOrderRouter已初始化（支持TWAP/VWAP算法订单）")
