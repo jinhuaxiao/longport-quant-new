@@ -389,8 +389,9 @@ class SignalGenerator:
             是否在TWAP执行中
         """
         try:
+            redis = await self.signal_queue._get_redis()
             redis_key = f"trading:twap_execution:{symbol}"
-            result = await self.signal_queue.redis.get(redis_key)
+            result = await redis.get(redis_key)
             return result is not None
         except Exception as e:
             logger.warning(f"检查TWAP执行状态失败: {e}")
