@@ -725,31 +725,35 @@ class SmartOrderRouter:
         return await self._execute_aggressive(request)
 
     async def _update_market_data(self, symbol: str) -> None:
-        """Update cached market data."""
+        """Update cached market data with timeout to prevent blocking."""
         try:
-            # Get real-time quote
-            async with self.db.session() as session:
-                stmt = select(RealtimeQuote).where(
-                    RealtimeQuote.symbol == symbol
-                ).order_by(RealtimeQuote.timestamp.desc()).limit(1)
+            # Add timeout to prevent blocking if database is unavailable
+            async with asyncio.timeout(2.0):  # 2 second timeout
+                # Get real-time quote
+                async with self.db.session() as session:
+                    stmt = select(RealtimeQuote).where(
+                        RealtimeQuote.symbol == symbol
+                    ).order_by(RealtimeQuote.timestamp.desc()).limit(1)
 
-                result = await session.execute(stmt)
-                quote = result.scalar_one_or_none()
+                    result = await session.execute(stmt)
+                    quote = result.scalar_one_or_none()
 
-                if quote:
-                    self._market_data_cache[symbol] = {
-                        'last_price': float(quote.last_done) if quote.last_done else 0,
-                        'bid': float(quote.bid_price) if quote.bid_price else 0,
-                        'ask': float(quote.ask_price) if quote.ask_price else 0,
-                        'bid_volume': quote.bid_volume,
-                        'ask_volume': quote.ask_volume,
-                        'volume': quote.volume,
-                        'timestamp': quote.timestamp
-                    }
+                    if quote:
+                        self._market_data_cache[symbol] = {
+                            'last_price': float(quote.last_done) if quote.last_done else 0,
+                            'bid': float(quote.bid_price) if quote.bid_price else 0,
+                            'ask': float(quote.ask_price) if quote.ask_price else 0,
+                            'bid_volume': quote.bid_volume,
+                            'ask_volume': quote.ask_volume,
+                            'volume': quote.volume,
+                            'timestamp': quote.timestamp
+                        }
 
-                    # Estimate average volume (simplified)
-                    self._market_data_cache[symbol]['avg_volume'] = quote.volume / 4  # Assume 4 hours into trading
+                        # Estimate average volume (simplified)
+                        self._market_data_cache[symbol]['avg_volume'] = quote.volume / 4  # Assume 4 hours into trading
 
+        except asyncio.TimeoutError:
+            logger.warning(f"Database query timeout for {symbol}, skipping market data update")
         except Exception as e:
             logger.error(f"Failed to update market data: {e}")
 
