@@ -443,46 +443,73 @@ class SmartOrderRouter:
             child_orders=child_orders
         )
 
-    def _should_use_twap(self, symbol: str, quantity: int, num_slices: int) -> tuple[bool, str]:
+    def _calculate_twap_slices(self, symbol: str, quantity: int, desired_slices: int) -> tuple[bool, int, str]:
         """
-        判断订单是否适合使用TWAP切片策略
+        计算TWAP订单的最佳切片数，智能调整以保证每片都是整手
 
         Args:
             symbol: 股票代码
             quantity: 订单数量（股数）
-            num_slices: 计划的切片数量
+            desired_slices: 期望的切片数量
 
         Returns:
-            (是否适合TWAP, 原因说明)
+            (是否适合TWAP, 实际切片数, 原因说明)
         """
         # 使用保守的手数规格估算（避免异步API调用）
-        # HK stocks: 常见手数为100-5000股/手，使用保守值1000
-        # US stocks: 1股/手
         if ".US" in symbol:
             assumed_lot_size = 1
-            min_slice_qty = 100  # 美股每个切片至少100股
-            min_total_qty = 1000  # 总量至少1000股才用TWAP
+            min_lots_per_slice = 100  # 美股每个切片至少100股
+            min_total_lots = 1000  # 总量至少1000股
         else:
-            # 港股使用保守的手数规格
-            assumed_lot_size = 1000  # 保守估计（对于蓝筹股如1398.HK）
-            min_slice_qty = 5000  # 每个切片至少5000股（5手 × 1000股/手）
-            min_total_qty = 50000  # 总量至少50000股（50手）才用TWAP
+            # 港股保守估计
+            assumed_lot_size = 1000  # 对于蓝筹股如1398.HK
+            min_lots_per_slice = 3  # 每个切片至少3手（降低要求以支持更多订单）
+            min_total_lots = 10  # 总量至少10手（约10000股）
 
-        slice_qty = quantity / num_slices
+        # 计算总手数
+        total_lots = quantity // assumed_lot_size
 
-        # 检查1: 切片后是否为整手（针对港股）
-        if ".HK" in symbol and slice_qty % assumed_lot_size != 0:
-            return False, f"切片后可能不是整手 ({slice_qty}股/片，假设{assumed_lot_size}股/手)"
+        # 检查1: 订单是否为整手
+        if quantity % assumed_lot_size != 0:
+            return False, 0, f"订单{quantity}股不是整手（假设{assumed_lot_size}股/手）"
 
-        # 检查2: 每个切片的数量是否足够
-        if slice_qty < min_slice_qty:
-            return False, f"每个切片仅{slice_qty:.0f}股，低于最小要求{min_slice_qty}股"
+        # 检查2: 总量是否足够
+        if total_lots < min_total_lots:
+            return False, 0, f"总共{total_lots}手（{quantity}股），低于TWAP最低要求{min_total_lots}手"
 
-        # 检查3: 总数量是否足够分片
-        if quantity < min_total_qty:
-            return False, f"总共{quantity}股，低于TWAP阈值{min_total_qty}股"
+        # 检查3: 找到合适的切片数（能整除总手数，且每片>=最小手数）
+        # 优先选择接近desired_slices的值
+        candidates = []
 
-        return True, f"满足TWAP条件（总计{quantity}股，每片约{slice_qty:.0f}股）"
+        # 向下搜索（从desired_slices到1）
+        for slices in range(desired_slices, 0, -1):
+            if total_lots % slices == 0:
+                lots_per_slice = total_lots // slices
+                if lots_per_slice >= min_lots_per_slice:
+                    candidates.append((slices, lots_per_slice))
+
+        # 向上搜索（从desired_slices+1开始，但不超过总手数）
+        for slices in range(desired_slices + 1, min(total_lots + 1, desired_slices + 5)):
+            if total_lots % slices == 0:
+                lots_per_slice = total_lots // slices
+                if lots_per_slice >= min_lots_per_slice:
+                    candidates.append((slices, lots_per_slice))
+
+        if not candidates:
+            return False, 0, f"无法找到合适切片数（{total_lots}手，每片需≥{min_lots_per_slice}手）"
+
+        # 选择最接近desired_slices的方案
+        best = min(candidates, key=lambda x: abs(x[0] - desired_slices))
+        actual_slices, lots_per_slice = best
+
+        reason = (
+            f"TWAP切片: {actual_slices}片 × {lots_per_slice}手/片 "
+            f"({lots_per_slice * assumed_lot_size}股/片) = {total_lots}手（{quantity}股）"
+        )
+        if actual_slices != desired_slices:
+            reason += f" [已从{desired_slices}片调整]"
+
+        return True, actual_slices, reason
 
     async def _execute_twap(self, request: OrderRequest) -> ExecutionResult:
         """Execute order using Time-Weighted Average Price strategy with dynamic slippage control."""
@@ -490,16 +517,21 @@ class SmartOrderRouter:
 
         # Divide order into time slices (e.g., execute over 30 minutes)
         duration_minutes = 30
-        num_slices = min(10, max(3, request.quantity // 1000))
+        desired_slices = min(10, max(3, request.quantity // 1000))
 
-        # 检查订单是否适合使用TWAP策略
-        should_use, reason = self._should_use_twap(request.symbol, request.quantity, num_slices)
+        # 🔥 智能计算TWAP切片数（自动调整以保证整手）
+        should_use, num_slices, reason = self._calculate_twap_slices(
+            request.symbol, request.quantity, desired_slices
+        )
         if not should_use:
             logger.warning(f"TWAP不适合此订单，降级为单个LO限价单: {reason}")
-            logger.info(f"  原订单: {request.quantity}股，计划{num_slices}个切片")
+            logger.info(f"  原订单: {request.quantity}股，期望{desired_slices}个切片")
             logger.info(f"  降级策略: 使用单个限价单执行")
             # 降级为单个限价单
             return await self._execute_passive(request)
+
+        # 使用调整后的切片数
+        logger.info(f"✅ {reason}")
         slice_size = request.quantity // num_slices
         interval_seconds = (duration_minutes * 60) / num_slices
 
