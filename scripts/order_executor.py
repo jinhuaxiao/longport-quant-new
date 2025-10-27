@@ -50,9 +50,15 @@ class InsufficientFundsError(Exception):
 class OrderExecutor:
     """订单执行器（从队列消费信号并执行）"""
 
-    def __init__(self):
-        """初始化订单执行器"""
-        self.settings = get_settings()
+    def __init__(self, account_id: str | None = None):
+        """
+        初始化订单执行器
+
+        Args:
+            account_id: 账号ID，如果指定则从configs/accounts/{account_id}.env加载配置
+        """
+        self.settings = get_settings(account_id=account_id)
+        self.account_id = account_id or "default"
         self.beijing_tz = ZoneInfo('Asia/Shanghai')
 
         # 初始化消息队列
@@ -934,9 +940,14 @@ class OrderExecutor:
             logger.warning(f"  ⚠️ 移除TWAP执行标记失败: {e}")
 
 
-async def main():
-    """主函数"""
-    executor = OrderExecutor()
+async def main(account_id: str | None = None):
+    """
+    主函数
+
+    Args:
+        account_id: 账号ID，如果指定则从configs/accounts/{account_id}.env加载配置
+    """
+    executor = OrderExecutor(account_id=account_id)
 
     try:
         await executor.run()
@@ -947,6 +958,29 @@ async def main():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="订单执行器 (Order Executor) - 从Redis队列消费交易信号并执行订单",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 使用默认配置（.env文件）
+  python3 scripts/order_executor.py
+
+  # 使用指定账号配置
+  python3 scripts/order_executor.py --account-id paper_001
+  python3 scripts/order_executor.py --account-id live_001
+        """
+    )
+    parser.add_argument(
+        "--account-id",
+        type=str,
+        default=None,
+        help="账号ID（如 paper_001 或 live_001），将从 configs/accounts/{account_id}.env 加载配置"
+    )
+    args = parser.parse_args()
+
     print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║               订单执行器 (Order Executor)                     ║
@@ -959,4 +993,11 @@ if __name__ == "__main__":
 ║  • 记录止损止盈                                               ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
-    asyncio.run(main())
+
+    if args.account_id:
+        print(f"📌 使用账号配置: {args.account_id}")
+        print(f"📁 配置文件: configs/accounts/{args.account_id}.env\n")
+    else:
+        print(f"📌 使用默认配置: .env\n")
+
+    asyncio.run(main(account_id=args.account_id))

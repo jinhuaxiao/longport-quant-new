@@ -1,5 +1,6 @@
 """Runtime configuration loaded from env variables or config files."""
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import List
@@ -20,6 +21,9 @@ class LongportCredentials(BaseSettings):
 
 class Settings(BaseSettings):
     """Application level settings."""
+
+    # 账号标识（用于多账号支持）
+    account_id: str | None = Field(None, alias="ACCOUNT_ID")
 
     environment: str = Field("development", alias="ENVIRONMENT")
     timezone: str = Field("Asia/Hong_Kong", alias="TRADING_TIMEZONE")
@@ -66,6 +70,24 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    def __init__(self, **kwargs):
+        """初始化Settings，支持从account_id加载配置"""
+        # 如果指定了account_id，优先从configs/accounts/{account_id}.env加载
+        account_id = kwargs.get("account_id") or os.getenv("ACCOUNT_ID")
+        if account_id:
+            account_env_file = Path(f"configs/accounts/{account_id}.env")
+            if account_env_file.exists():
+                # 临时修改model_config的env_file
+                self.__class__.model_config["env_file"] = str(account_env_file)
+
+        super().__init__(**kwargs)
+
+        # 如果有account_id，自动为队列key添加后缀以实现隔离
+        if self.account_id:
+            self.signal_queue_key = f"{self.signal_queue_key}:{self.account_id}"
+            self.signal_processing_key = f"{self.signal_processing_key}:{self.account_id}"
+            self.signal_failed_key = f"{self.signal_failed_key}:{self.account_id}"
+
     @field_validator("database_dsn", mode="before")
     @classmethod
     def _normalise_postgres_dsn(cls, value: str) -> str:
@@ -89,11 +111,17 @@ class Settings(BaseSettings):
         )
 
 
-@lru_cache()
-def get_settings() -> Settings:
-    """Return cached settings instance."""
+def get_settings(account_id: str | None = None) -> Settings:
+    """
+    Return settings instance.
 
-    return Settings()  # type: ignore[call-arg]
+    Args:
+        account_id: 账号ID，如果指定则从configs/accounts/{account_id}.env加载配置
+
+    Returns:
+        Settings instance
+    """
+    return Settings(account_id=account_id)  # type: ignore[call-arg]
 
 
 __all__ = ["Settings", "get_settings", "LongportCredentials"]

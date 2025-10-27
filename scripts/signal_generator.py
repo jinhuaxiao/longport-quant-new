@@ -55,15 +55,17 @@ def sanitize_unicode(text: str) -> str:
 class SignalGenerator:
     """信号生成器（只负责分析和生成信号，不执行订单）"""
 
-    def __init__(self, use_builtin_watchlist=False, max_iterations=None):
+    def __init__(self, use_builtin_watchlist=False, max_iterations=None, account_id: str | None = None):
         """
         初始化信号生成器
 
         Args:
             use_builtin_watchlist: 是否使用内置监控列表
             max_iterations: 最大迭代次数，None表示无限循环
+            account_id: 账号ID，如果指定则从configs/accounts/{account_id}.env加载配置
         """
-        self.settings = get_settings()
+        self.settings = get_settings(account_id=account_id)
+        self.account_id = account_id or "default"
         self.beijing_tz = ZoneInfo('Asia/Shanghai')
         self.use_builtin_watchlist = use_builtin_watchlist
         self.max_iterations = max_iterations
@@ -1769,9 +1771,14 @@ class SignalGenerator:
         return exit_signals
 
 
-async def main():
-    """主函数"""
-    generator = SignalGenerator(use_builtin_watchlist=True)
+async def main(account_id: str | None = None):
+    """
+    主函数
+
+    Args:
+        account_id: 账号ID，如果指定则从configs/accounts/{account_id}.env加载配置
+    """
+    generator = SignalGenerator(use_builtin_watchlist=True, account_id=account_id)
 
     try:
         await generator.run()
@@ -1782,6 +1789,29 @@ async def main():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="信号生成器 (Signal Generator) - 扫描市场并生成交易信号",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 使用默认配置（.env文件）
+  python3 scripts/signal_generator.py
+
+  # 使用指定账号配置
+  python3 scripts/signal_generator.py --account-id paper_001
+  python3 scripts/signal_generator.py --account-id live_001
+        """
+    )
+    parser.add_argument(
+        "--account-id",
+        type=str,
+        default=None,
+        help="账号ID（如 paper_001 或 live_001），将从 configs/accounts/{account_id}.env 加载配置"
+    )
+    args = parser.parse_args()
+
     print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║               信号生成器 (Signal Generator)                   ║
@@ -1793,4 +1823,11 @@ if __name__ == "__main__":
 ║  • 检查止损止盈条件                                           ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
-    asyncio.run(main())
+
+    if args.account_id:
+        print(f"📌 使用账号配置: {args.account_id}")
+        print(f"📁 配置文件: configs/accounts/{args.account_id}.env\n")
+    else:
+        print(f"📌 使用默认配置: .env\n")
+
+    asyncio.run(main(account_id=args.account_id))

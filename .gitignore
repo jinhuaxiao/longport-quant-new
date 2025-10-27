@@ -10,3 +10,8 @@ logs/
 .mypy_cache/
 .pytest_cache/
 
+# 账号配置文件（包含敏感API凭证）
+configs/accounts/*.env
+# 但保留配置目录结构和README
+!configs/accounts/README.md
+
