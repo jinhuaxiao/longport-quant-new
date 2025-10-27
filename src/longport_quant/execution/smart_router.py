@@ -461,10 +461,10 @@ class SmartOrderRouter:
             min_lots_per_slice = 100  # 美股每个切片至少100股
             min_total_lots = 1000  # 总量至少1000股
         else:
-            # 港股保守估计
+            # 港股保守估计 - 只有大订单才使用TWAP，小订单直接LO
             assumed_lot_size = 1000  # 对于蓝筹股如1398.HK
-            min_lots_per_slice = 3  # 每个切片至少3手（降低要求以支持更多订单）
-            min_total_lots = 10  # 总量至少10手（约10000股）
+            min_lots_per_slice = 5  # 每个切片至少5手（5000股）
+            min_total_lots = 50  # 总量至少50手（50000股）才使用TWAP
 
         # 计算总手数
         total_lots = quantity // assumed_lot_size
