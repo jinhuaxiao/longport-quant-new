@@ -95,7 +95,7 @@ list_accounts() {
             fi
 
             echo -e "  ${GREEN}•${NC} ${account_id} (${account_type})"
-            ((count++))
+            count=$((count + 1))
         fi
     done
 
