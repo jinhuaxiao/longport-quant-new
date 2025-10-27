@@ -72,6 +72,80 @@ class LongportTradingClient:
         logger.debug("Submit order response: {}", payload)
         return payload
 
+    async def submit_conditional_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        trigger_price: float,
+        limit_price: float | None = None,
+        remark: str | None = None
+    ) -> Dict[str, Any]:
+        """
+        提交LIT条件单（Limit If Touched - 到价止盈止损）
+
+        Args:
+            symbol: 标的代码 (e.g., "1398.HK", "NVDA.US")
+            side: 买卖方向 ("BUY" or "SELL")
+            quantity: 数量
+            trigger_price: 触发价格（当市价达到此价格时触发订单）
+            limit_price: 限价价格（触发后以此价格下限价单），如果为None则使用trigger_price
+            remark: 备注
+
+        Returns:
+            包含order_id的字典
+
+        Example:
+            # 止损单：当价格跌到100时，以99.5卖出
+            await client.submit_conditional_order(
+                symbol="1398.HK",
+                side="SELL",
+                quantity=1000,
+                trigger_price=100.0,
+                limit_price=99.5,
+                remark="Stop Loss Backup"
+            )
+
+            # 止盈单：当价格涨到120时，以120卖出
+            await client.submit_conditional_order(
+                symbol="1398.HK",
+                side="SELL",
+                quantity=1000,
+                trigger_price=120.0,
+                limit_price=120.0,
+                remark="Take Profit Backup"
+            )
+        """
+        ctx = await self._ensure_context()
+        try:
+            # 如果没有指定limit_price，使用trigger_price
+            if limit_price is None:
+                limit_price = trigger_price
+
+            response = await asyncio.to_thread(
+                ctx.submit_order,
+                symbol,
+                openapi.OrderType.LIT,  # Limit If Touched
+                self._resolve_side(side),
+                Decimal(str(quantity)),
+                openapi.TimeInForceType.GoodTilCanceled,  # GTC - 订单一直有效直到取消
+                self._resolve_price(limit_price),  # 触发后的限价
+                trigger_price=self._resolve_price(trigger_price),  # 触发价格
+                remark=remark or f"Conditional Order - {side}"
+            )
+
+            payload = {"order_id": response.order_id}
+            logger.info(
+                f"✅ 条件单已提交: {symbol} {side} {quantity}股, "
+                f"触发价=${trigger_price:.2f}, 限价=${limit_price:.2f}, "
+                f"订单ID={response.order_id}"
+            )
+            return payload
+
+        except OpenApiException as exc:
+            logger.error(f"❌ 提交条件单失败: {exc}")
+            raise
+
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         ctx = await self._ensure_context()
         try:
@@ -258,6 +332,7 @@ class LongportTradingClient:
             cash = {}
             buy_power = {}
             net_assets = {}
+            remaining_finance = {}  # 剩余融资额度
 
             # 先收集所有币种（从 cash_infos）
             all_currencies = set()
@@ -300,9 +375,10 @@ class LongportTradingClient:
                                 break
 
                     # 获取融资额度信息
-                    remaining_finance = 0
+                    remaining_finance_amt = 0
                     if hasattr(balance, 'remaining_finance_amount'):
-                        remaining_finance = float(balance.remaining_finance_amount)
+                        remaining_finance_amt = float(balance.remaining_finance_amount)
+                        remaining_finance[currency] = remaining_finance_amt
 
                     # 选择合适的可用资金
                     # 1. 如果 available_cash 为负数（使用了融资），则使用 buy_power
@@ -350,6 +426,7 @@ class LongportTradingClient:
                 "cash": cash,
                 "buy_power": buy_power,
                 "net_assets": net_assets,
+                "remaining_finance": remaining_finance,  # 剩余可用融资额度
                 "positions": positions,
                 "position_count": len(positions)
             }
@@ -361,6 +438,7 @@ class LongportTradingClient:
                 "cash": {"HKD": 0, "USD": 0},
                 "buy_power": {"HKD": 0, "USD": 0},
                 "net_assets": {"HKD": 0, "USD": 0},
+                "remaining_finance": {"HKD": 0, "USD": 0},
                 "positions": [],
                 "position_count": 0
             }

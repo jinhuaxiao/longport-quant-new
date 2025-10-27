@@ -7,7 +7,13 @@ from typing import List
 
 from pydantic import AnyHttpUrl, AnyUrl, Field, HttpUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic_settings.sources import TomlConfigSettingsSource
+from pydantic_settings.sources import (
+    DotEnvSettingsSource,
+    EnvSettingsSource,
+    InitSettingsSource,
+    SecretsSettingsSource,
+    TomlConfigSettingsSource,
+)
 
 
 class LongportCredentials(BaseSettings):
@@ -24,6 +30,9 @@ class Settings(BaseSettings):
 
     # 账号标识（用于多账号支持）
     account_id: str | None = Field(None, alias="ACCOUNT_ID")
+
+    # 类变量：存储当前账号ID用于配置源判断
+    _account_id_for_settings: str | None = None
 
     environment: str = Field("development", alias="ENVIRONMENT")
     timezone: str = Field("Asia/Hong_Kong", alias="TRADING_TIMEZONE")
@@ -72,13 +81,11 @@ class Settings(BaseSettings):
 
     def __init__(self, **kwargs):
         """初始化Settings，支持从account_id加载配置"""
-        # 如果指定了account_id，优先从configs/accounts/{account_id}.env加载
+        # 如果指定了account_id，存储到类变量供settings_customise_sources使用
         account_id = kwargs.get("account_id") or os.getenv("ACCOUNT_ID")
         if account_id:
-            account_env_file = Path(f"configs/accounts/{account_id}.env")
-            if account_env_file.exists():
-                # 临时修改model_config的env_file
-                self.__class__.model_config["env_file"] = str(account_env_file)
+            # 存储account_id用于配置源判断（不再修改model_config）
+            self.__class__._account_id_for_settings = account_id
 
         super().__init__(**kwargs)
 
@@ -96,19 +103,58 @@ class Settings(BaseSettings):
         return value
 
     @classmethod
-    def settings_customise_sources(cls, *args, **kwargs):
-        init_settings = kwargs.get("init_settings", args[0] if len(args) > 0 else None)
-        env_settings = kwargs.get("env_settings", args[1] if len(args) > 1 else None)
-        dotenv_settings = kwargs.get("dotenv_settings", args[2] if len(args) > 2 else None)
-        file_secret_settings = kwargs.get("file_secret_settings", args[3] if len(args) > 3 else None)
-        toml_settings = TomlConfigSettingsSource(cls, toml_file="configs/settings.toml")
-        return (
-            init_settings,
-            toml_settings,
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings: InitSettingsSource,
+        env_settings: EnvSettingsSource,
+        dotenv_settings: DotEnvSettingsSource,
+        file_secret_settings: SecretsSettingsSource,
+    ):
+        """
+        自定义配置源优先级，实现配置继承：
+        1. init_settings（初始化参数）- 最高优先级
+        2. account_dotenv（账号特定配置，如 paper_001.env）- 覆盖全局配置
+        3. env_settings（环境变量）
+        4. dotenv_settings（全局 .env 文件）- 默认值
+        5. toml_settings（TOML 配置文件）
+        6. file_secret_settings（secrets 文件）- 最低优先级
+        """
+        # 基础配置源列表
+        sources = [init_settings]
+
+        # 如果有 account_id，添加账号特定配置源（优先级高于全局配置）
+        if cls._account_id_for_settings:
+            account_env_file = Path(f"configs/accounts/{cls._account_id_for_settings}.env")
+            if account_env_file.exists():
+                account_dotenv = DotEnvSettingsSource(
+                    settings_cls,
+                    env_file=str(account_env_file),
+                    env_file_encoding="utf-8",
+                )
+                sources.append(account_dotenv)
+
+        # 添加环境变量配置源
+        sources.append(env_settings)
+
+        # 添加全局 .env 配置源（作为默认值）
+        base_dotenv = DotEnvSettingsSource(
+            settings_cls,
+            env_file=".env",
+            env_file_encoding="utf-8",
         )
+        sources.append(base_dotenv)
+
+        # 添加 TOML 配置源
+        toml_file = Path("configs/settings.toml")
+        if toml_file.exists():
+            toml_settings = TomlConfigSettingsSource(settings_cls, toml_file=toml_file)
+            sources.append(toml_settings)
+
+        # 添加 secrets 配置源
+        sources.append(file_secret_settings)
+
+        return tuple(sources)
 
 
 def get_settings(account_id: str | None = None) -> Settings:

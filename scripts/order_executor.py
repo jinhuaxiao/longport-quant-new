@@ -119,6 +119,9 @@ class OrderExecutor:
                 # 初始化Slack（可选）
                 if self.settings.slack_webhook_url:
                     self.slack = SlackNotifier(str(self.settings.slack_webhook_url))
+                    logger.info(f"✅ Slack通知已初始化: {str(self.settings.slack_webhook_url)[:50]}...")
+                else:
+                    logger.warning("⚠️ 未配置SLACK_WEBHOOK_URL，Slack通知已禁用")
 
                 # 🔥 连接Redis持仓管理器
                 await self.position_manager.connect()
@@ -267,11 +270,12 @@ class OrderExecutor:
         currency = "HKD" if ".HK" in symbol else "USD"
         available_cash = account["cash"].get(currency, 0)
         buy_power = account.get("buy_power", {}).get(currency, 0)
+        remaining_finance = account.get("remaining_finance", {}).get(currency, 0)
 
-        # 显示购买力信息
+        # 显示购买力和融资额度信息
         logger.debug(
             f"  💰 {currency} 资金状态 - 可用: ${available_cash:,.2f}, "
-            f"购买力: ${buy_power:,.2f}"
+            f"购买力: ${buy_power:,.2f}, 剩余融资额度: ${remaining_finance:,.2f}"
         )
 
         if available_cash < 0:
@@ -490,16 +494,72 @@ class OrderExecutor:
                 "atr": signal.get('indicators', {}).get('atr'),
             }
 
-            # 保存到数据库
+            # 🔥 提交备份条件单（LIT）- 混合止损策略
+            backup_stop_order_id = None
+            backup_profit_order_id = None
+
             try:
-                await self.stop_manager.set_position_stops(
-                    account_id=account.get("account_id", ""),
+                stop_loss = signal.get('stop_loss')
+                take_profit = signal.get('take_profit')
+
+                if stop_loss and stop_loss > 0:
+                    # 转换为 float 避免 Decimal 类型错误
+                    stop_loss_float = float(stop_loss)
+
+                    # 提交止损备份条件单
+                    stop_result = await self.trade_client.submit_conditional_order(
+                        symbol=symbol,
+                        side="SELL",
+                        quantity=final_quantity,
+                        trigger_price=stop_loss_float,
+                        limit_price=stop_loss_float * 0.995,  # 触发后以略低价格限价卖出，确保成交
+                        remark=f"Backup Stop Loss @ ${stop_loss_float:.2f}"
+                    )
+                    backup_stop_order_id = stop_result.get('order_id')
+                    logger.success(f"  ✅ 止损备份条件单已提交: {backup_stop_order_id}")
+
+                if take_profit and take_profit > 0:
+                    # 转换为 float 避免 Decimal 类型错误
+                    take_profit_float = float(take_profit)
+
+                    # 提交止盈备份条件单
+                    profit_result = await self.trade_client.submit_conditional_order(
+                        symbol=symbol,
+                        side="SELL",
+                        quantity=final_quantity,
+                        trigger_price=take_profit_float,
+                        limit_price=take_profit_float,  # 止盈使用触发价本身
+                        remark=f"Backup Take Profit @ ${take_profit_float:.2f}"
+                    )
+                    backup_profit_order_id = profit_result.get('order_id')
+                    logger.success(f"  ✅ 止盈备份条件单已提交: {backup_profit_order_id}")
+
+                logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所条件单（备份）")
+
+            except Exception as e:
+                logger.warning(f"⚠️ 提交备份条件单失败（不影响主流程）: {e}")
+                import traceback
+                logger.debug(f"  详细错误: {traceback.format_exc()}")
+                # 即使备份条件单失败，也继续保存止损设置（客户端监控仍然工作）
+
+            # 保存到数据库（包括备份条件单ID）
+            try:
+                # 统一转换为 float 避免类型错误
+                await self.stop_manager.save_stop(
                     symbol=symbol,
-                    stop_loss=signal.get('stop_loss'),
-                    take_profit=signal.get('take_profit')
+                    entry_price=float(final_price),  # 使用实际成交均价
+                    stop_loss=float(signal.get('stop_loss')) if signal.get('stop_loss') else None,
+                    take_profit=float(signal.get('take_profit')) if signal.get('take_profit') else None,
+                    atr=float(signal.get('indicators', {}).get('atr')) if signal.get('indicators', {}).get('atr') else None,
+                    quantity=int(final_quantity),  # 转换为 int
+                    strategy='advanced_technical',
+                    backup_stop_loss_order_id=backup_stop_order_id,
+                    backup_take_profit_order_id=backup_profit_order_id
                 )
             except Exception as e:
                 logger.warning(f"⚠️ 保存止损止盈失败: {e}")
+                import traceback
+                logger.debug(f"  详细错误: {traceback.format_exc()}")
 
             # 12. 发送Slack通知
             if self.slack:
@@ -507,6 +567,15 @@ class OrderExecutor:
 
         except Exception as e:
             logger.error(f"❌ 提交订单失败: {e}")
+
+            # 发送失败通知到 Slack
+            if self.slack:
+                await self._send_failure_notification(
+                    symbol=symbol,
+                    signal=signal,
+                    error=str(e)
+                )
+
             raise
 
     async def _execute_sell_order(self, signal: Dict):
@@ -516,6 +585,35 @@ class OrderExecutor:
         quantity = signal.get('quantity', 0)
         current_price = signal.get('price', 0)
         reason = signal.get('reason', '平仓')
+
+        # 🔥 取消备份条件单（客户端监控优先触发）
+        try:
+            stops = await self.stop_manager.get_stop_for_symbol(symbol)
+            if stops:
+                backup_stop_order_id = stops.get('backup_stop_loss_order_id')
+                backup_profit_order_id = stops.get('backup_take_profit_order_id')
+
+                cancelled_orders = []
+                if backup_stop_order_id:
+                    try:
+                        await self.trade_client.cancel_order(backup_stop_order_id)
+                        cancelled_orders.append(f"止损单({backup_stop_order_id})")
+                    except Exception as e:
+                        logger.debug(f"  取消止损备份单失败（可能已触发或不存在）: {e}")
+
+                if backup_profit_order_id:
+                    try:
+                        await self.trade_client.cancel_order(backup_profit_order_id)
+                        cancelled_orders.append(f"止盈单({backup_profit_order_id})")
+                    except Exception as e:
+                        logger.debug(f"  取消止盈备份单失败（可能已触发或不存在）: {e}")
+
+                if cancelled_orders:
+                    logger.info(f"  ✅ 已取消备份条件单: {', '.join(cancelled_orders)}")
+                    logger.info(f"  📋 客户端监控触发在先，交易所备份单已作废")
+
+        except Exception as e:
+            logger.warning(f"⚠️ 查询/取消备份条件单失败（不影响主流程）: {e}")
 
         # 获取买卖盘
         bid_price, ask_price = await self._get_bid_ask(symbol)
@@ -652,14 +750,34 @@ class OrderExecutor:
 
         dynamic_budget = net_assets * budget_pct
 
-        # 🔥 不能超过该币种的实际购买力
+        # 🔥 不能超过该币种的实际购买力和融资额度
         available_cash = account.get("cash", {}).get(currency, 0)
-        if dynamic_budget > available_cash:
-            logger.warning(
-                f"  ⚠️ 动态预算${dynamic_budget:,.2f}超出{currency}购买力${available_cash:,.2f}，"
-                f"调整为可用金额"
-            )
-            dynamic_budget = available_cash
+        remaining_finance = account.get("remaining_finance", {}).get(currency, 0)
+
+        # 如果账户使用融资（available_cash为负），检查剩余融资额度
+        if available_cash < 0:
+            # 使用融资账户，限制不超过剩余融资额度
+            if remaining_finance > 0 and dynamic_budget > remaining_finance:
+                logger.warning(
+                    f"  ⚠️ 动态预算${dynamic_budget:,.2f}超出剩余融资额度${remaining_finance:,.2f}，"
+                    f"调整为剩余额度"
+                )
+                dynamic_budget = remaining_finance
+            elif remaining_finance <= 1000:
+                # 融资额度不足，严重警告
+                logger.error(
+                    f"  ❌ 剩余融资额度不足: ${remaining_finance:,.2f}，"
+                    f"无法下单（需要${dynamic_budget:,.2f}）"
+                )
+                raise InsufficientFundsError(f"融资额度不足: 剩余${remaining_finance:,.2f}")
+        else:
+            # 普通账户，不能超过可用现金
+            if dynamic_budget > available_cash:
+                logger.warning(
+                    f"  ⚠️ 动态预算${dynamic_budget:,.2f}超出{currency}可用资金${available_cash:,.2f}，"
+                    f"调整为可用金额"
+                )
+                dynamic_budget = available_cash
 
         logger.debug(
             f"  动态预算计算: 评分={score}, 预算比例={budget_pct:.2%}, "
@@ -849,6 +967,32 @@ class OrderExecutor:
 
         except Exception as e:
             logger.warning(f"⚠️ 发送Slack通知失败: {e}")
+
+    async def _send_failure_notification(
+        self,
+        symbol: str,
+        signal: Dict,
+        error: str
+    ):
+        """发送订单执行失败通知到Slack"""
+        try:
+            signal_type = signal.get('type', 'BUY')
+            score = signal.get('score', 0)
+            price = signal.get('price', 0)
+
+            message = (
+                f"❌ **订单执行失败**\n"
+                f"标的: {symbol}\n"
+                f"类型: {signal_type}\n"
+                f"评分: {score}\n"
+                f"价格: ${price:.2f}\n"
+                f"错误: {error}\n"
+            )
+
+            await self.slack.send(message)
+
+        except Exception as e:
+            logger.warning(f"⚠️ 发送失败通知到Slack时出错: {e}")
 
     async def _try_smart_rotation(
         self,

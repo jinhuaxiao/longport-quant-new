@@ -47,40 +47,54 @@ class StopLossManager:
 
     async def save_stop(self, symbol: str, entry_price: float, stop_loss: float,
                        take_profit: float, atr: float = None, quantity: int = None,
-                       strategy: str = 'advanced_technical'):
-        """保存止损止盈设置"""
+                       strategy: str = 'advanced_technical',
+                       backup_stop_loss_order_id: str = None,
+                       backup_take_profit_order_id: str = None):
+        """保存止损止盈设置（包括备份条件单ID）"""
         await self.connect()
 
         try:
             async with self.pool.acquire() as conn:
-                # 先将该标的之前的活跃记录设为cancelled
+                # 🔥 修复：先删除该标的所有旧的cancelled记录（避免唯一约束冲突）
+                await conn.execute("""
+                    DELETE FROM position_stops
+                    WHERE symbol = $1 AND status = 'cancelled'
+                """, symbol)
+
+                # 将该标的之前的活跃记录设为cancelled
                 await conn.execute("""
                     UPDATE position_stops
                     SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
                     WHERE symbol = $1 AND status = 'active'
                 """, symbol)
 
-                # 插入新记录
+                # 插入新记录（包括备份条件单ID）
                 await conn.execute("""
                     INSERT INTO position_stops (
                         symbol, entry_price, stop_loss, take_profit,
-                        atr, quantity, strategy, status
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
-                """, symbol, entry_price, stop_loss, take_profit, atr, quantity, strategy)
+                        atr, quantity, strategy, status,
+                        backup_stop_loss_order_id, backup_take_profit_order_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9)
+                """, symbol, entry_price, stop_loss, take_profit, atr, quantity, strategy,
+                    backup_stop_loss_order_id, backup_take_profit_order_id)
 
-            logger.info(f"✅ 已保存 {symbol} 的止损止盈设置到数据库")
+            backup_info = ""
+            if backup_stop_loss_order_id or backup_take_profit_order_id:
+                backup_info = f" (备份单: SL={backup_stop_loss_order_id or 'N/A'}, TP={backup_take_profit_order_id or 'N/A'})"
+            logger.info(f"✅ 已保存 {symbol} 的止损止盈设置到数据库{backup_info}")
 
         except Exception as e:
             logger.error(f"保存止损止盈失败: {e}")
 
     async def load_active_stops(self) -> Dict[str, Dict]:
-        """加载所有活跃的止损止盈设置"""
+        """加载所有活跃的止损止盈设置（包括备份条件单ID）"""
         await self.connect()
 
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch("""
-                    SELECT symbol, entry_price, stop_loss, take_profit, atr, quantity
+                    SELECT symbol, entry_price, stop_loss, take_profit, atr, quantity,
+                           backup_stop_loss_order_id, backup_take_profit_order_id
                     FROM position_stops
                     WHERE status = 'active'
                 """)
@@ -92,7 +106,9 @@ class StopLossManager:
                     'stop_loss': float(row['stop_loss']),
                     'take_profit': float(row['take_profit']),
                     'atr': float(row['atr']) if row['atr'] else None,
-                    'quantity': row['quantity']
+                    'quantity': row['quantity'],
+                    'backup_stop_loss_order_id': row['backup_stop_loss_order_id'],
+                    'backup_take_profit_order_id': row['backup_take_profit_order_id']
                 }
 
             logger.info(f"📂 从数据库加载了 {len(stops)} 个止损止盈设置")
@@ -132,13 +148,14 @@ class StopLossManager:
         await self.update_stop_status(symbol, 'cancelled')
 
     async def get_stop_for_symbol(self, symbol: str) -> Optional[Dict]:
-        """获取特定标的的活跃止损止盈设置"""
+        """获取特定标的的活跃止损止盈设置（包括备份条件单ID）"""
         await self.connect()
 
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow("""
-                    SELECT entry_price, stop_loss, take_profit, atr, quantity
+                    SELECT entry_price, stop_loss, take_profit, atr, quantity,
+                           backup_stop_loss_order_id, backup_take_profit_order_id
                     FROM position_stops
                     WHERE symbol = $1 AND status = 'active'
                 """, symbol)
@@ -149,7 +166,9 @@ class StopLossManager:
                     'stop_loss': float(row['stop_loss']),
                     'take_profit': float(row['take_profit']),
                     'atr': float(row['atr']) if row['atr'] else None,
-                    'quantity': row['quantity']
+                    'quantity': row['quantity'],
+                    'backup_stop_loss_order_id': row['backup_stop_loss_order_id'],
+                    'backup_take_profit_order_id': row['backup_take_profit_order_id']
                 }
             return None
 

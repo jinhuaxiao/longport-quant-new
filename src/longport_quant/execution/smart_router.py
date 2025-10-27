@@ -94,6 +94,74 @@ class SmartOrderRouter:
         self._order_slices: Dict[str, List[OrderSlice]] = {}
         self._market_data_cache: Dict[str, Dict] = {}
 
+    def _round_price_to_tick(self, symbol: str, price: float) -> float:
+        """
+        将价格舍入到有效的tick size
+
+        Args:
+            symbol: 股票代码
+            price: 原始价格
+
+        Returns:
+            符合tick size规则的价格
+        """
+        if ".US" in symbol:
+            # 美股：通常是0.01
+            tick_size = 0.01
+            decimal_places = 2
+        else:
+            # 港股tick size规则
+            if price < 0.01:
+                tick_size = 0.001
+                decimal_places = 3
+            elif price < 0.25:
+                tick_size = 0.001
+                decimal_places = 3
+            elif price < 0.50:
+                tick_size = 0.005
+                decimal_places = 3
+            elif price < 10.00:
+                tick_size = 0.01
+                decimal_places = 2
+            elif price < 20.00:
+                tick_size = 0.02
+                decimal_places = 2
+            elif price < 100.00:
+                tick_size = 0.05
+                decimal_places = 2
+            elif price < 200.00:
+                tick_size = 0.10
+                decimal_places = 2  # 改为2位，因为0.10精度是2位小数
+            elif price < 500.00:
+                tick_size = 0.20
+                decimal_places = 2  # 改为2位，因为0.20精度是2位小数
+            elif price < 1000.00:
+                tick_size = 0.50
+                decimal_places = 2  # 改为2位，因为0.50精度是2位小数
+            elif price < 2000.00:
+                tick_size = 1.00
+                decimal_places = 0  # 整数
+            elif price < 5000.00:
+                tick_size = 2.00
+                decimal_places = 0  # 整数
+            else:
+                tick_size = 5.00
+                decimal_places = 0  # 整数
+
+        # 舍入到最接近的tick
+        rounded = round(price / tick_size) * tick_size
+        # 根据tick size确定合适的小数位数
+        result = round(rounded, decimal_places)
+
+        # 打印tick size调整详情
+        if abs(result - price) > 0.0001:
+            logger.debug(
+                f"  🎯 Tick Size调整: {symbol} ${price:.4f} → ${result:.{decimal_places}f} "
+                f"(tick_size={tick_size}, 小数位={decimal_places})"
+            )
+
+        return result
+
     async def execute_order(self, request: OrderRequest) -> ExecutionResult:
         """
         Execute an order using smart routing.
@@ -203,6 +271,7 @@ class SmartOrderRouter:
 
     def _calculate_dynamic_limit_price(
         self,
+        symbol: str,
         side: str,
         reference_price: float,
         current_market_price: float,
@@ -213,6 +282,7 @@ class SmartOrderRouter:
         动态计算限价，控制滑点
 
         Args:
+            symbol: 股票代码
             side: 订单方向 (BUY/SELL)
             reference_price: 初始参考价格
             current_market_price: 当前市场价格
@@ -236,10 +306,14 @@ class SmartOrderRouter:
                 ask_price = current_market_price
 
             # 在ask价基础上略微提高（提高成交概率）
-            suggested_price = ask_price * 1.001
+            # 转换为 float 避免 Decimal * float 类型错误
+            suggested_price = float(ask_price) * 1.001
 
             # 取较小值，确保不超过滑点上限
             limit_price = min(suggested_price, max_acceptable_price)
+
+            # 🔥 舍入到有效的tick size
+            limit_price = self._round_price_to_tick(symbol, limit_price)
 
             logger.debug(
                 f"动态限价计算(BUY): 参考=${reference_price:.2f}, "
@@ -258,10 +332,14 @@ class SmartOrderRouter:
                 bid_price = current_market_price
 
             # 在bid价基础上略微降低（提高成交概率）
-            suggested_price = bid_price * 0.999
+            # 转换为 float 避免 Decimal * float 类型错误
+            suggested_price = float(bid_price) * 0.999
 
             # 取较大值，确保不低于滑点下限
             limit_price = max(suggested_price, min_acceptable_price)
+
+            # 🔥 舍入到有效的tick size
+            limit_price = self._round_price_to_tick(symbol, limit_price)
 
             logger.debug(
                 f"动态限价计算(SELL): 参考=${reference_price:.2f}, "
@@ -280,10 +358,6 @@ class SmartOrderRouter:
             # Submit market order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
-            # 判断是否为美股（需要outside_rth参数）
-            from longport.openapi import OutsideRTH
-            outside_rth_param = OutsideRTH.RTH_ONLY if ".US" in request.symbol else None
-
             # Wrap synchronous SDK call with asyncio.to_thread
             # 正确的参数顺序: symbol, order_type, side, quantity, time_in_force, price, ...
             resp = await asyncio.to_thread(
@@ -298,8 +372,7 @@ class SmartOrderRouter:
                 None,  # limit_offset
                 None,  # trailing_amount
                 None,  # trailing_percent
-                None,  # expire_date
-                outside_rth_param  # outside_rth (美股必需)
+                None   # expire_date
             )
 
             # Track order
@@ -346,15 +419,34 @@ class SmartOrderRouter:
                 else:
                     limit_price = ask  # Join the ask
 
+            # 🔥 确保价格符合tick size（统一处理）
+            original_limit_price = limit_price
+            limit_price = self._round_price_to_tick(request.symbol, limit_price)
+
+            logger.info(f"  💰 下单参数: {request.side} {request.quantity}股 @ ${limit_price:.2f}")
+
+            # 打印详细参数用于调试
+            logger.debug(
+                f"  📋 订单详细参数:\n"
+                f"     symbol={request.symbol}\n"
+                f"     side={request.side}\n"
+                f"     quantity={request.quantity}\n"
+                f"     limit_price(原始)=${original_limit_price:.4f}\n"
+                f"     limit_price(调整后)=${limit_price:.4f}\n"
+                f"     order_type=LO\n"
+                f"     time_in_force=Day"
+            )
+
             # Submit limit order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
-            # 判断是否为美股（需要outside_rth参数）
-            from longport.openapi import OutsideRTH
-            outside_rth_param = OutsideRTH.RTH_ONLY if ".US" in request.symbol else None
+            # 转换为 Decimal 并打印最终值
+            price_decimal = Decimal(str(limit_price))
+            logger.debug(f"  🔢 最终提交价格(Decimal): {price_decimal}")
 
             # Wrap synchronous SDK call with asyncio.to_thread
             # 正确的参数顺序: symbol, order_type, side, quantity, time_in_force, price, ...
+            # 注意：outside_rth参数已移除，因为不是所有SDK版本都支持
             resp = await asyncio.to_thread(
                 self.trade_context.submit_order,
                 request.symbol,
@@ -362,14 +454,15 @@ class SmartOrderRouter:
                 order_side,     # side
                 request.quantity,
                 TimeInForceType.Day,
-                Decimal(str(limit_price)),  # price
+                price_decimal,  # price
                 None,  # trigger_price
                 None,  # limit_offset
                 None,  # trailing_amount
                 None,  # trailing_percent
-                None,  # expire_date
-                outside_rth_param  # outside_rth (美股必需)
+                None  # expire_date
             )
+
+            logger.info(f"  ✅ 订单已提交: order_id={resp.order_id}")
 
             # Track order
             self._active_orders[resp.order_id] = request
@@ -463,8 +556,8 @@ class SmartOrderRouter:
         else:
             # 港股保守估计 - 只有大订单才使用TWAP，小订单直接LO
             assumed_lot_size = 1000  # 对于蓝筹股如1398.HK
-            min_lots_per_slice = 5  # 每个切片至少5手（5000股）
-            min_total_lots = 50  # 总量至少50手（50000股）才使用TWAP
+            min_lots_per_slice = 3  # 每个切片至少3手（3000股）
+            min_total_lots = 20  # 总量至少20手（20000股）才使用TWAP
 
         # 计算总手数
         total_lots = quantity // assumed_lot_size
@@ -567,6 +660,7 @@ class SmartOrderRouter:
             # 🔥 计算动态限价（如果启用）
             if use_dynamic_pricing and reference_price > 0:
                 slice_limit_price, exceeds_slippage = self._calculate_dynamic_limit_price(
+                    symbol=request.symbol,
                     side=request.side,
                     reference_price=reference_price,
                     current_market_price=current_market_price,
@@ -766,31 +860,83 @@ class SmartOrderRouter:
         start_time = datetime.now()
         filled_quantity = 0
         total_value = 0.0
+        poll_count = 0
+
+        logger.info(f"  ⏳ 开始监控订单成交: {order_id}, 超时={timeout}秒")
 
         while (datetime.now() - start_time).seconds < timeout:
             try:
+                poll_count += 1
+
                 # Check order status (wrap synchronous call)
                 orders = await asyncio.to_thread(self.trade_context.today_orders)
 
+                order_found = False
                 for order in orders:
                     if order.order_id == order_id:
-                        if order.status in ["FilledStatus", "PartiallyFilledStatus"]:
-                            filled_quantity = order.filled_quantity
-                            # Calculate average price from executed value
-                            if order.filled_quantity > 0:
-                                avg_price = float(order.filled_amount) / order.filled_quantity
+                        order_found = True
+
+                        # 🔥 记录订单状态（每5秒记录一次）
+                        # Use correct attribute names: executed_quantity, executed_price
+                        if poll_count % 5 == 1 or poll_count == 1:
+                            logger.debug(
+                                f"  📊 订单状态检查 (#{poll_count}): "
+                                f"status={order.status}, "
+                                f"executed={order.executed_quantity}/{order.quantity}, "
+                                f"price=${order.price}"
+                            )
+
+                        # Convert status to string for comparison
+                        status_str = str(order.status)
+
+                        if "Filled" in status_str and "Partially" not in status_str:
+                            # Fully filled
+                            # 转换为 int 避免 Decimal 类型错误
+                            filled_quantity = int(order.executed_quantity)
+                            if order.executed_quantity > 0:
+                                # Use executed_price directly from order
+                                avg_price = float(order.executed_price)
+                                logger.info(f"  ✅ 订单已完全成交: {filled_quantity}股 @ ${avg_price:.2f}")
                                 return filled_quantity, avg_price
-                        elif order.status in ["RejectedStatus", "CancelledStatus", "ExpiredStatus"]:
-                            logger.warning(f"Order {order_id} status: {order.status}")
+
+                        elif "PartiallyFilled" in status_str or "Partially" in status_str:
+                            # Partially filled - continue waiting
+                            # 转换为 int 避免 Decimal 类型错误
+                            filled_quantity = int(order.executed_quantity)
+                            if poll_count % 5 == 0:
+                                logger.info(f"  ⏳ 订单部分成交: {filled_quantity}股，继续等待...")
+
+                        elif any(x in status_str for x in ["Rejected", "Cancelled", "Expired"]):
+                            logger.warning(f"  ❌ 订单异常状态: {status_str}")
+                            # Log the rejection reason if available
+                            if hasattr(order, 'msg') and order.msg:
+                                logger.warning(f"  ❌ 拒绝原因: {order.msg}")
                             return 0, 0.0
 
+                        elif "NewStatus" in status_str or "Pending" in status_str:
+                            # Order is pending, continue waiting
+                            if poll_count % 10 == 1:
+                                logger.debug(f"  ⏳ 订单等待成交中: {status_str}")
+
+                        break
+
+                if not order_found and poll_count <= 3:
+                    logger.warning(f"  ⚠️ 订单{order_id}在today_orders中未找到 (尝试{poll_count}/3)")
+
             except Exception as e:
-                logger.error(f"Error checking order status: {e}")
+                logger.error(f"  ❌ 检查订单状态时出错: {e}")
 
             await asyncio.sleep(1)
 
-        logger.warning(f"Timeout waiting for order {order_id} to fill")
-        return filled_quantity, total_value / filled_quantity if filled_quantity > 0 else 0
+        logger.warning(f"  ⏰ 订单等待超时({timeout}秒): {order_id}, 已轮询{poll_count}次")
+
+        # 返回部分成交数量（如果有）
+        if filled_quantity > 0:
+            avg_price = total_value / filled_quantity
+            logger.info(f"  ⚠️ 超时但有部分成交: {filled_quantity}股 @ ${avg_price:.2f}")
+            return filled_quantity, avg_price
+
+        return 0, 0.0
 
     def _create_order_slices(
         self,
