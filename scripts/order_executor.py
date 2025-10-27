@@ -32,6 +32,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from longport_quant.config import get_settings
 from longport_quant.execution.client import LongportTradingClient
 from longport_quant.execution.smart_router import SmartOrderRouter, OrderRequest, ExecutionStrategy
+from longport_quant.execution.risk_assessor import RiskAssessor
 from longport_quant.data.quote_client import QuoteDataClient
 from longport_quant.messaging import SignalQueue
 from longport_quant.notifications.slack import SlackNotifier
@@ -91,6 +92,9 @@ class OrderExecutor:
         self.lot_size_helper = LotSizeHelper()
         self.order_manager = OrderManager()
         self.stop_manager = StopLossManager()
+
+        # 【新增】风险评估器 - 智能决策备份条件单
+        self.risk_assessor = RiskAssessor(config=self.settings.backup_orders)
 
         # 【新增】Redis持仓管理器 - 跨进程共享持仓状态
         self.position_manager = RedisPositionManager(
@@ -494,53 +498,71 @@ class OrderExecutor:
                 "atr": signal.get('indicators', {}).get('atr'),
             }
 
-            # 🔥 提交备份条件单（LIT）- 混合止损策略
+            # 🔥 智能评估是否提交备份条件单（LIT）- 混合止损策略
             backup_stop_order_id = None
             backup_profit_order_id = None
 
-            try:
-                stop_loss = signal.get('stop_loss')
-                take_profit = signal.get('take_profit')
+            if self.settings.backup_orders.enabled:
+                # 执行风险评估
+                risk_assessment = self.risk_assessor.assess(
+                    symbol=symbol,
+                    signal=signal,
+                    quantity=final_quantity,
+                    price=final_price
+                )
 
-                if stop_loss and stop_loss > 0:
-                    # 转换为 float 避免 Decimal 类型错误
-                    stop_loss_float = float(stop_loss)
+                # 打印风险评估结果
+                logger.info(self.risk_assessor.format_assessment_log(risk_assessment))
 
-                    # 提交止损备份条件单
-                    stop_result = await self.trade_client.submit_conditional_order(
-                        symbol=symbol,
-                        side="SELL",
-                        quantity=final_quantity,
-                        trigger_price=stop_loss_float,
-                        limit_price=stop_loss_float * 0.995,  # 触发后以略低价格限价卖出，确保成交
-                        remark=f"Backup Stop Loss @ ${stop_loss_float:.2f}"
-                    )
-                    backup_stop_order_id = stop_result.get('order_id')
-                    logger.success(f"  ✅ 止损备份条件单已提交: {backup_stop_order_id}")
+                # 根据评估结果决定是否提交备份条件单
+                if risk_assessment['should_backup']:
+                    try:
+                        stop_loss = signal.get('stop_loss')
+                        take_profit = signal.get('take_profit')
 
-                if take_profit and take_profit > 0:
-                    # 转换为 float 避免 Decimal 类型错误
-                    take_profit_float = float(take_profit)
+                        if stop_loss and stop_loss > 0:
+                            # 转换为 float 避免 Decimal 类型错误
+                            stop_loss_float = float(stop_loss)
 
-                    # 提交止盈备份条件单
-                    profit_result = await self.trade_client.submit_conditional_order(
-                        symbol=symbol,
-                        side="SELL",
-                        quantity=final_quantity,
-                        trigger_price=take_profit_float,
-                        limit_price=take_profit_float,  # 止盈使用触发价本身
-                        remark=f"Backup Take Profit @ ${take_profit_float:.2f}"
-                    )
-                    backup_profit_order_id = profit_result.get('order_id')
-                    logger.success(f"  ✅ 止盈备份条件单已提交: {backup_profit_order_id}")
+                            # 提交止损备份条件单
+                            stop_result = await self.trade_client.submit_conditional_order(
+                                symbol=symbol,
+                                side="SELL",
+                                quantity=final_quantity,
+                                trigger_price=stop_loss_float,
+                                limit_price=stop_loss_float * 0.995,  # 触发后以略低价格限价卖出，确保成交
+                                remark=f"Backup Stop Loss @ ${stop_loss_float:.2f}"
+                            )
+                            backup_stop_order_id = stop_result.get('order_id')
+                            logger.success(f"  ✅ 止损备份条件单已提交: {backup_stop_order_id}")
 
-                logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所条件单（备份）")
+                        if take_profit and take_profit > 0:
+                            # 转换为 float 避免 Decimal 类型错误
+                            take_profit_float = float(take_profit)
 
-            except Exception as e:
-                logger.warning(f"⚠️ 提交备份条件单失败（不影响主流程）: {e}")
-                import traceback
-                logger.debug(f"  详细错误: {traceback.format_exc()}")
-                # 即使备份条件单失败，也继续保存止损设置（客户端监控仍然工作）
+                            # 提交止盈备份条件单
+                            profit_result = await self.trade_client.submit_conditional_order(
+                                symbol=symbol,
+                                side="SELL",
+                                quantity=final_quantity,
+                                trigger_price=take_profit_float,
+                                limit_price=take_profit_float,  # 止盈使用触发价本身
+                                remark=f"Backup Take Profit @ ${take_profit_float:.2f}"
+                            )
+                            backup_profit_order_id = profit_result.get('order_id')
+                            logger.success(f"  ✅ 止盈备份条件单已提交: {backup_profit_order_id}")
+
+                        logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所条件单（备份）")
+
+                    except Exception as e:
+                        logger.warning(f"⚠️ 提交备份条件单失败（不影响主流程）: {e}")
+                        import traceback
+                        logger.debug(f"  详细错误: {traceback.format_exc()}")
+                        # 即使备份条件单失败，也继续保存止损设置（客户端监控仍然工作）
+                else:
+                    logger.info(f"  ℹ️ 低风险交易，依赖客户端监控（节省成本）")
+            else:
+                logger.info(f"  ⚙️ 备份条件单功能已禁用")
 
             # 保存到数据库（包括备份条件单ID）
             try:

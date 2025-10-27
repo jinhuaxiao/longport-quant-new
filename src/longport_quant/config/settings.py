@@ -25,6 +25,35 @@ class LongportCredentials(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
+class BackupOrderConfig(BaseSettings):
+    """备份条件单智能决策配置"""
+
+    # 全局开关
+    enabled: bool = Field(True, alias="BACKUP_ORDERS_ENABLED")
+
+    # 风险评估阈值 (0-100)
+    risk_threshold: int = Field(60, alias="BACKUP_ORDERS_RISK_THRESHOLD")
+
+    # 风险因素权重配置
+    atr_weight: int = Field(40, alias="BACKUP_ORDERS_ATR_WEIGHT")
+    price_weight: int = Field(20, alias="BACKUP_ORDERS_PRICE_WEIGHT")
+    signal_weight: int = Field(20, alias="BACKUP_ORDERS_SIGNAL_WEIGHT")
+    stop_loss_weight: int = Field(20, alias="BACKUP_ORDERS_STOP_LOSS_WEIGHT")
+
+    # ATR风险阈值
+    atr_ratio_high: float = Field(0.03, alias="BACKUP_ORDERS_ATR_RATIO_HIGH")
+    atr_ratio_medium: float = Field(0.02, alias="BACKUP_ORDERS_ATR_RATIO_MEDIUM")
+    atr_ratio_low: float = Field(0.015, alias="BACKUP_ORDERS_ATR_RATIO_LOW")
+
+    # 信号强度阈值
+    weak_signal_threshold: int = Field(60, alias="BACKUP_ORDERS_WEAK_SIGNAL_THRESHOLD")
+
+    # 止损幅度阈值
+    wide_stop_loss_pct: float = Field(0.05, alias="BACKUP_ORDERS_WIDE_STOP_LOSS_PCT")
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+
 class Settings(BaseSettings):
     """Application level settings."""
 
@@ -71,6 +100,9 @@ class Settings(BaseSettings):
 
     health_port: int = Field(8080, alias="HEALTHCHECK_PORT")
     slack_webhook_url: HttpUrl | None = Field(None, alias="SLACK_WEBHOOK_URL")
+
+    # 备份条件单配置
+    backup_orders: BackupOrderConfig = Field(default_factory=BackupOrderConfig)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -170,4 +202,4 @@ def get_settings(account_id: str | None = None) -> Settings:
     return Settings(account_id=account_id)  # type: ignore[call-arg]
 
 
-__all__ = ["Settings", "get_settings", "LongportCredentials"]
+__all__ = ["Settings", "get_settings", "LongportCredentials", "BackupOrderConfig"]
