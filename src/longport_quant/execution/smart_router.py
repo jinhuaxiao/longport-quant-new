@@ -280,8 +280,12 @@ class SmartOrderRouter:
             # Submit market order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
+            # 判断是否为美股（需要outside_rth参数）
+            from longport.openapi import OutsideRTH
+            outside_rth_param = OutsideRTH.RTH_ONLY if ".US" in request.symbol else None
+
             # Wrap synchronous SDK call with asyncio.to_thread
-            # 正确的参数顺序: symbol, order_type, side, quantity, time_in_force, price
+            # 正确的参数顺序: symbol, order_type, side, quantity, time_in_force, price, ...
             resp = await asyncio.to_thread(
                 self.trade_context.submit_order,
                 request.symbol,
@@ -289,7 +293,13 @@ class SmartOrderRouter:
                 order_side,     # side
                 request.quantity,
                 TimeInForceType.Day,
-                None  # price (not needed for market orders)
+                None,  # price (not needed for market orders)
+                None,  # trigger_price
+                None,  # limit_offset
+                None,  # trailing_amount
+                None,  # trailing_percent
+                None,  # expire_date
+                outside_rth_param  # outside_rth (美股必需)
             )
 
             # Track order
@@ -339,8 +349,12 @@ class SmartOrderRouter:
             # Submit limit order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
+            # 判断是否为美股（需要outside_rth参数）
+            from longport.openapi import OutsideRTH
+            outside_rth_param = OutsideRTH.RTH_ONLY if ".US" in request.symbol else None
+
             # Wrap synchronous SDK call with asyncio.to_thread
-            # 正确的参数顺序: symbol, order_type, side, quantity, time_in_force, price
+            # 正确的参数顺序: symbol, order_type, side, quantity, time_in_force, price, ...
             resp = await asyncio.to_thread(
                 self.trade_context.submit_order,
                 request.symbol,
@@ -348,7 +362,13 @@ class SmartOrderRouter:
                 order_side,     # side
                 request.quantity,
                 TimeInForceType.Day,
-                Decimal(str(limit_price))  # price
+                Decimal(str(limit_price)),  # price
+                None,  # trigger_price
+                None,  # limit_offset
+                None,  # trailing_amount
+                None,  # trailing_percent
+                None,  # expire_date
+                outside_rth_param  # outside_rth (美股必需)
             )
 
             # Track order
@@ -423,6 +443,47 @@ class SmartOrderRouter:
             child_orders=child_orders
         )
 
+    def _should_use_twap(self, symbol: str, quantity: int, num_slices: int) -> tuple[bool, str]:
+        """
+        判断订单是否适合使用TWAP切片策略
+
+        Args:
+            symbol: 股票代码
+            quantity: 订单数量（股数）
+            num_slices: 计划的切片数量
+
+        Returns:
+            (是否适合TWAP, 原因说明)
+        """
+        # 使用保守的手数规格估算（避免异步API调用）
+        # HK stocks: 常见手数为100-5000股/手，使用保守值1000
+        # US stocks: 1股/手
+        if ".US" in symbol:
+            assumed_lot_size = 1
+            min_slice_qty = 100  # 美股每个切片至少100股
+            min_total_qty = 1000  # 总量至少1000股才用TWAP
+        else:
+            # 港股使用保守的手数规格
+            assumed_lot_size = 1000  # 保守估计（对于蓝筹股如1398.HK）
+            min_slice_qty = 5000  # 每个切片至少5000股（5手 × 1000股/手）
+            min_total_qty = 50000  # 总量至少50000股（50手）才用TWAP
+
+        slice_qty = quantity / num_slices
+
+        # 检查1: 切片后是否为整手（针对港股）
+        if ".HK" in symbol and slice_qty % assumed_lot_size != 0:
+            return False, f"切片后可能不是整手 ({slice_qty}股/片，假设{assumed_lot_size}股/手)"
+
+        # 检查2: 每个切片的数量是否足够
+        if slice_qty < min_slice_qty:
+            return False, f"每个切片仅{slice_qty:.0f}股，低于最小要求{min_slice_qty}股"
+
+        # 检查3: 总数量是否足够分片
+        if quantity < min_total_qty:
+            return False, f"总共{quantity}股，低于TWAP阈值{min_total_qty}股"
+
+        return True, f"满足TWAP条件（总计{quantity}股，每片约{slice_qty:.0f}股）"
+
     async def _execute_twap(self, request: OrderRequest) -> ExecutionResult:
         """Execute order using Time-Weighted Average Price strategy with dynamic slippage control."""
         logger.info(f"Executing TWAP order for {request.symbol}")
@@ -430,6 +491,15 @@ class SmartOrderRouter:
         # Divide order into time slices (e.g., execute over 30 minutes)
         duration_minutes = 30
         num_slices = min(10, max(3, request.quantity // 1000))
+
+        # 检查订单是否适合使用TWAP策略
+        should_use, reason = self._should_use_twap(request.symbol, request.quantity, num_slices)
+        if not should_use:
+            logger.warning(f"TWAP不适合此订单，降级为单个LO限价单: {reason}")
+            logger.info(f"  原订单: {request.quantity}股，计划{num_slices}个切片")
+            logger.info(f"  降级策略: 使用单个限价单执行")
+            # 降级为单个限价单
+            return await self._execute_passive(request)
         slice_size = request.quantity // num_slices
         interval_seconds = (duration_minutes * 60) / num_slices
 
