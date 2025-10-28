@@ -152,64 +152,101 @@ class OrderExecutor:
 
                 logger.info(f"📥 开始监听信号队列: {self.settings.signal_queue_key}")
                 logger.info(f"🔄 最大重试次数: {self.settings.signal_max_retries}")
+                logger.info(f"🎯 批量处理模式: 窗口={self.settings.signal_batch_window}秒, 批大小={self.settings.signal_batch_size}")
+                logger.info(f"📊 智能优先级: 高分信号优先，止损信号立即执行")
                 logger.info("")
 
                 while True:
                     try:
-                        # 从队列消费信号（阻塞等待）
-                        signal = await self.signal_queue.consume_signal()
+                        # 【新批量模式】收集一批信号
+                        batch = await self._consume_batch()
 
-                        if not signal:
-                            # 队列为空，短暂等待
+                        if not batch:
+                            # 批次为空，短暂等待
                             await asyncio.sleep(1)
                             continue
 
-                        symbol = signal.get('symbol')
-                        signal_type = signal.get('type')
-                        score = signal.get('score', 0)
-
                         logger.info(f"\n{'='*70}")
-                        logger.info(f"📥 收到信号: {symbol}, 类型={signal_type}, 评分={score}")
-                        logger.info(f"{'='*70}")
+                        logger.info(f"🚀 开始处理批次: {len(batch)}个信号")
+                        logger.info(f"{'='*70}\n")
 
-                        # 执行订单（带超时保护）
-                        try:
-                            # 60秒超时保护
-                            await asyncio.wait_for(
-                                self.execute_order(signal),
-                                timeout=60.0
+                        # 处理批次中的每个信号（按score降序）
+                        remaining_signals = []
+                        funds_exhausted = False
+
+                        for idx, signal in enumerate(batch, 1):
+                            symbol = signal.get('symbol')
+                            signal_type = signal.get('type')
+                            score = signal.get('score', 0)
+
+                            logger.info(f"\n--- [{idx}/{len(batch)}] 处理信号: {symbol} ---")
+                            logger.info(f"  类型={signal_type}, 评分={score}")
+
+                            # 执行订单（带超时保护）
+                            try:
+                                # 60秒超时保护
+                                await asyncio.wait_for(
+                                    self.execute_order(signal),
+                                    timeout=60.0
+                                )
+
+                                # 标记信号处理完成
+                                await self.signal_queue.mark_signal_completed(signal)
+                                logger.success(f"  ✅ [{idx}/{len(batch)}] {symbol} 处理完成")
+
+                            except asyncio.TimeoutError:
+                                error_msg = "订单执行超时（60秒）"
+                                logger.error(f"  ❌ {error_msg}: {symbol}")
+
+                                # 标记信号失败（会自动重试）
+                                await self.signal_queue.mark_signal_failed(
+                                    signal,
+                                    error_message=error_msg,
+                                    retry=True
+                                )
+
+                            except InsufficientFundsError as e:
+                                # 资金不足：停止处理当前批次，剩余信号延迟重试
+                                logger.warning(f"  ⚠️ [{idx}/{len(batch)}] {symbol}: 资金不足")
+                                logger.info(f"  💡 策略：将剩余{len(batch)-idx}个信号延迟重试")
+
+                                # 当前信号也加入待重新入队列表
+                                remaining_signals.append(signal)
+
+                                # 将后续所有信号也加入待重新入队列表
+                                remaining_signals.extend(batch[idx:])
+
+                                funds_exhausted = True
+                                break  # 跳出循环，不再处理本批次剩余信号
+
+                            except Exception as e:
+                                error_msg = f"{type(e).__name__}: {str(e)}"
+                                logger.error(f"  ❌ 执行订单失败: {error_msg}")
+
+                                # 标记信号失败（会自动重试）
+                                await self.signal_queue.mark_signal_failed(
+                                    signal,
+                                    error_message=error_msg,
+                                    retry=True
+                                )
+
+                        # 批次处理完成后的统计
+                        logger.info(f"\n{'='*70}")
+                        if funds_exhausted:
+                            logger.warning(f"⚠️ 批次处理中断: 资金不足")
+                            logger.info(f"  已处理: {idx-1}/{len(batch)}个信号")
+                            logger.info(f"  待重试: {len(remaining_signals)}个信号")
+
+                            # 重新入队剩余信号
+                            requeued = await self._requeue_remaining(
+                                remaining_signals,
+                                reason="资金不足"
                             )
+                            logger.info(f"  ✅ 已重新入队: {requeued}个信号")
+                        else:
+                            logger.success(f"✅ 批次处理完成: {len(batch)}/{len(batch)}个信号")
 
-                            # 标记信号处理完成
-                            await self.signal_queue.mark_signal_completed(signal)
-
-                        except asyncio.TimeoutError:
-                            error_msg = "订单执行超时（60秒）"
-                            logger.error(f"❌ {error_msg}: {symbol}")
-
-                            # 标记信号失败（会自动重试）
-                            await self.signal_queue.mark_signal_failed(
-                                signal,
-                                error_message=error_msg,
-                                retry=True
-                            )
-
-                        except InsufficientFundsError as e:
-                            # 资金不足：直接标记为完成，不重试
-                            # （避免资金不足的信号反复重试浪费资源）
-                            logger.info(f"  ℹ️ {symbol}: 资金不足，跳过此信号")
-                            await self.signal_queue.mark_signal_completed(signal)
-
-                        except Exception as e:
-                            error_msg = f"{type(e).__name__}: {str(e)}"
-                            logger.error(f"❌ 执行订单失败: {error_msg}")
-
-                            # 标记信号失败（会自动重试）
-                            await self.signal_queue.mark_signal_failed(
-                                signal,
-                                error_message=error_msg,
-                                retry=True
-                            )
+                        logger.info(f"{'='*70}\n")
 
                     except asyncio.CancelledError:
                         logger.info("⚠️ 收到取消信号，正在退出...")
@@ -1139,6 +1176,150 @@ class OrderExecutor:
             logger.debug(f"  🔓 已移除TWAP执行标记: {symbol}")
         except Exception as e:
             logger.warning(f"  ⚠️ 移除TWAP执行标记失败: {e}")
+
+    async def _consume_batch(self) -> list[Dict]:
+        """
+        收集一批信号（批量决策窗口）
+
+        策略：等待signal_batch_window秒，收集最多signal_batch_size个信号
+        止损/止盈信号（priority >= stop_loss_priority）立即返回，不等待
+
+        Returns:
+            list[Dict]: 信号列表，按score降序排列
+        """
+        import time
+
+        batch = []
+        batch_start = time.time()
+        batch_window = self.settings.signal_batch_window
+        batch_size = self.settings.signal_batch_size
+        stop_loss_priority = self.settings.stop_loss_priority
+
+        logger.debug(f"📦 开始收集信号批次（窗口={batch_window}秒，最多{batch_size}个）")
+
+        while len(batch) < batch_size:
+            # 计算剩余等待时间
+            elapsed = time.time() - batch_start
+            remaining_time = batch_window - elapsed
+
+            if remaining_time <= 0:
+                # 时间窗口已满
+                logger.debug(f"  ⏰ 批次收集窗口已满（{batch_window}秒）")
+                break
+
+            try:
+                # 尝试消费信号（带超时）
+                signal = await asyncio.wait_for(
+                    self.signal_queue.consume_signal(),
+                    timeout=min(remaining_time, 1.0)  # 最多等待1秒
+                )
+
+                if signal:
+                    priority = signal.get('score', 0)
+                    symbol = signal.get('symbol', 'N/A')
+                    signal_type = signal.get('type', 'UNKNOWN')
+
+                    logger.debug(f"  📥 收集到信号: {symbol} (type={signal_type}, score={priority})")
+
+                    # 止损/止盈信号立即返回（优先级999）
+                    if priority >= stop_loss_priority:
+                        logger.info(f"  🚨 收到高优先级信号({priority}分)，立即执行: {symbol}")
+                        batch.insert(0, signal)  # 插入到开头
+                        break
+
+                    batch.append(signal)
+
+            except asyncio.TimeoutError:
+                # 超时，继续等待或结束
+                if len(batch) > 0:
+                    # 已有信号，继续等待看是否有更多信号
+                    continue
+                else:
+                    # 无信号且时间未到，继续等待
+                    continue
+            except Exception as e:
+                logger.warning(f"  ⚠️ 消费信号时出错: {e}")
+                break
+
+        # 按score降序排序（高分优先）
+        if batch:
+            batch.sort(key=lambda x: x.get('score', 0), reverse=True)
+
+            logger.info(
+                f"📦 批次收集完成: {len(batch)}个信号, "
+                f"分数范围=[{batch[-1].get('score', 0)}-{batch[0].get('score', 0)}]"
+            )
+
+            # 打印批次明细
+            for idx, sig in enumerate(batch, 1):
+                logger.info(
+                    f"  #{idx} {sig.get('symbol', 'N/A')} - "
+                    f"{sig.get('type', 'UNKNOWN')} ({sig.get('score', 0)}分)"
+                )
+        else:
+            logger.debug("  📦 批次为空，未收集到信号")
+
+        return batch
+
+    async def _requeue_remaining(
+        self,
+        remaining_signals: list[Dict],
+        reason: str = "资金不足"
+    ) -> int:
+        """
+        将剩余信号重新入队（延迟重试）
+
+        Args:
+            remaining_signals: 剩余的信号列表
+            reason: 重新入队原因
+
+        Returns:
+            int: 成功重新入队的数量
+        """
+        if not remaining_signals:
+            return 0
+
+        logger.info(
+            f"♻️ 重新入队{len(remaining_signals)}个信号（{reason}），"
+            f"{self.settings.funds_retry_delay}分钟后重试"
+        )
+
+        requeued_count = 0
+
+        for signal in remaining_signals:
+            symbol = signal.get('symbol', 'N/A')
+            score = signal.get('score', 0)
+
+            # 检查重试次数
+            retry_count = signal.get('retry_count', 0)
+            if retry_count >= self.settings.funds_retry_max:
+                logger.warning(
+                    f"  ⚠️ {symbol} 已达最大重试次数({self.settings.funds_retry_max})，"
+                    f"标记为完成"
+                )
+                await self.signal_queue.mark_signal_completed(signal)
+                continue
+
+            # 增加重试计数
+            signal['retry_count'] = retry_count + 1
+
+            # 延迟重新入队
+            success = await self.signal_queue.requeue_with_delay(
+                signal,
+                delay_minutes=self.settings.funds_retry_delay,
+                priority_penalty=20  # 每次重试降低20分
+            )
+
+            if success:
+                requeued_count += 1
+                logger.info(
+                    f"  ✅ {symbol} 已重新入队（第{signal['retry_count']}次重试，"
+                    f"分数{score}→{score-20}）"
+                )
+            else:
+                logger.error(f"  ❌ {symbol} 重新入队失败")
+
+        return requeued_count
 
 
 async def main(account_id: str | None = None):

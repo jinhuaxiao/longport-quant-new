@@ -237,6 +237,14 @@ class SignalQueue:
             signal_json, score = result[0]
             signal = self._deserialize_signal(signal_json)
 
+            # 检查是否需要延迟处理
+            if 'retry_after' in signal:
+                if time.time() < signal['retry_after']:
+                    # 未到重试时间，放回队列
+                    await redis.zadd(self.queue_key, {signal_json: score})
+                    logger.debug(f"⏰ 信号未到重试时间，跳过: {signal.get('symbol')}")
+                    return None  # 继续取下一个
+
             # 保存原始JSON（用于后续删除）
             # ⚠️ 重要：必须使用原始JSON，因为signal对象会被修改
             signal['_original_json'] = signal_json
@@ -345,10 +353,23 @@ class SignalQueue:
             else:
                 # 移到失败队列
                 failed_signal_json = self._serialize_signal(signal)
+                current_time = time.time()
                 await redis.zadd(
                     self.failed_key,
-                    {failed_signal_json: time.time()}
+                    {failed_signal_json: current_time}
                 )
+
+                # 🔥 自动清理1小时前的失败信号（防止堆积）
+                one_hour_ago = current_time - 3600
+                removed_count = await redis.zremrangebyscore(
+                    self.failed_key,
+                    '-inf',
+                    one_hour_ago
+                )
+                if removed_count > 0:
+                    logger.debug(
+                        f"🗑️ 自动清理了{removed_count}个过期失败信号（>1小时）"
+                    )
 
                 logger.error(
                     f"❌ 信号处理失败（已达最大重试次数）: "
@@ -360,6 +381,50 @@ class SignalQueue:
         except Exception as e:
             logger.error(f"❌ 标记失败失败: {e}")
             return False
+
+    async def requeue_with_delay(
+        self,
+        signal: Dict,
+        delay_minutes: int = 30,
+        priority_penalty: int = 20
+    ) -> bool:
+        """
+        延迟重新入队（用于资金不足场景）
+
+        Args:
+            signal: 信号数据
+            delay_minutes: 延迟分钟数
+            priority_penalty: 优先级惩罚（降低分数避免死循环）
+
+        Returns:
+            bool: 是否成功重新入队
+        """
+        # ⚠️ 使用原始JSON从processing队列删除
+        original_json = signal.get('_original_json')
+        if original_json:
+            try:
+                redis = await self._get_redis()
+                await redis.zrem(self.processing_key, original_json)
+            except:
+                pass
+
+        # 设置重试时间戳
+        signal['retry_after'] = time.time() + (delay_minutes * 60)
+
+        # 降低优先级
+        original_priority = signal.get('score', 0)
+        new_priority = max(0, original_priority - priority_penalty)
+
+        # 重新发布
+        result = await self.publish_signal(signal, priority=new_priority)
+
+        if result:
+            logger.debug(
+                f"💤 信号延迟重新入队: {signal['symbol']}, "
+                f"{delay_minutes}分钟后重试, 优先级{original_priority}→{new_priority}"
+            )
+
+        return result
 
     async def get_queue_size(self) -> int:
         """获取主队列大小"""
@@ -386,6 +451,25 @@ class SignalQueue:
             return await redis.zcard(self.failed_key)
         except Exception as e:
             logger.error(f"❌ 获取失败队列大小失败: {e}")
+            return 0
+
+    async def get_lowest_score(self) -> float:
+        """
+        获取队列中最低的信号分数
+
+        Returns:
+            float: 最低分数，队列为空返回0
+        """
+        try:
+            redis = await self._get_redis()
+            # ZRANGE获取score最大的一个（因为用负数，最大=-最低）
+            result = await redis.zrange(self.queue_key, -1, -1, withscores=True)
+            if result:
+                signal_json, score = result[0]
+                return -score  # 转回正数
+            return 0
+        except Exception as e:
+            logger.error(f"❌ 获取队列最低分数失败: {e}")
             return 0
 
     async def get_all_signals(self, limit: int = 100) -> List[Dict]:

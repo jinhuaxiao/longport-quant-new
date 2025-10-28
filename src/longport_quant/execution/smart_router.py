@@ -79,7 +79,8 @@ class SmartOrderRouter:
     def __init__(
         self,
         trade_context: TradeContext,
-        db: DatabaseSessionManager
+        db: DatabaseSessionManager,
+        quote_client = None
     ):
         """
         Initialize smart order router.
@@ -87,12 +88,16 @@ class SmartOrderRouter:
         Args:
             trade_context: LongPort trade context
             db: Database session manager
+            quote_client: Optional QuoteDataClient for fetching tick size info
         """
         self.trade_context = trade_context
         self.db = db
+        self.quote_client = quote_client
         self._active_orders: Dict[str, OrderRequest] = {}
         self._order_slices: Dict[str, List[OrderSlice]] = {}
         self._market_data_cache: Dict[str, Dict] = {}
+        self._tick_size_cache: Dict[str, float] = {}  # Cache for tick sizes from API
+        self._lot_size_cache: Dict[str, int] = {}  # Cache for lot sizes (board lots)
 
     def _round_price_to_tick(self, symbol: str, price: float) -> float:
         """
@@ -161,6 +166,65 @@ class SmartOrderRouter:
             )
 
         return result
+
+    async def _get_lot_size(self, symbol: str) -> int:
+        """
+        获取股票的手数（买卖单位/Board Lot）
+
+        Args:
+            symbol: 股票代码
+
+        Returns:
+            手数（每手股数）
+        """
+        # 如果已缓存，直接返回
+        if symbol in self._lot_size_cache:
+            return self._lot_size_cache[symbol]
+
+        # 尝试从API获取
+        if self.quote_client:
+            try:
+                static_info = await self.quote_client.get_static_info([symbol])
+                if static_info and len(static_info) > 0:
+                    lot_size = getattr(static_info[0], 'board_lot', None)
+                    if lot_size and lot_size > 0:
+                        self._lot_size_cache[symbol] = lot_size
+                        logger.debug(f"  📊 {symbol} 手数: {lot_size}股/手 (来自API)")
+                        return lot_size
+            except Exception as e:
+                logger.warning(f"Failed to get lot size for {symbol}: {e}")
+
+        # 使用默认值
+        default_lot_size = 1 if ".US" in symbol else 100
+        self._lot_size_cache[symbol] = default_lot_size
+        logger.debug(f"  📊 {symbol} 手数: {default_lot_size}股/手 (默认值)")
+        return default_lot_size
+
+    async def _validate_and_adjust_quantity(self, symbol: str, quantity: int) -> int:
+        """
+        验证并调整订单数量，确保是手数的整数倍
+
+        Args:
+            symbol: 股票代码
+            quantity: 原始订单数量
+
+        Returns:
+            调整后的订单数量（手数的整数倍）
+        """
+        lot_size = await self._get_lot_size(symbol)
+
+        # 检查是否为手数的整数倍
+        if quantity % lot_size != 0:
+            # 向下取整到最接近的手数倍数
+            adjusted_qty = (quantity // lot_size) * lot_size
+            logger.warning(
+                f"  ⚠️ {symbol}: 订单数量{quantity}股不是手数{lot_size}的倍数，"
+                f"已自动调整为{adjusted_qty}股（{adjusted_qty // lot_size}手）"
+            )
+            return adjusted_qty
+
+        logger.debug(f"  ✅ {symbol}: 订单数量{quantity}股有效（{quantity // lot_size}手 × {lot_size}股/手）")
+        return quantity
 
     async def execute_order(self, request: OrderRequest) -> ExecutionResult:
         """
@@ -355,6 +419,17 @@ class SmartOrderRouter:
         logger.info(f"Executing aggressive order for {request.symbol}")
 
         try:
+            # 🔥 验证并调整订单数量（确保是手数的整数倍）
+            original_quantity = request.quantity
+            request.quantity = await self._validate_and_adjust_quantity(request.symbol, request.quantity)
+
+            if request.quantity != original_quantity:
+                logger.info(f"  📊 数量已调整: {original_quantity} → {request.quantity}股")
+
+            if request.quantity == 0:
+                logger.error(f"  ❌ 调整后数量为0，无法下单")
+                return ExecutionResult(success=False, error_message="调整后数量为0，无法下单")
+
             # Submit market order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
@@ -437,6 +512,17 @@ class SmartOrderRouter:
                 f"     time_in_force=Day"
             )
 
+            # 🔥 验证并调整订单数量（确保是手数的整数倍）
+            original_quantity = request.quantity
+            request.quantity = await self._validate_and_adjust_quantity(request.symbol, request.quantity)
+
+            if request.quantity != original_quantity:
+                logger.info(f"  📊 数量已调整: {original_quantity} → {request.quantity}股")
+
+            if request.quantity == 0:
+                logger.error(f"  ❌ 调整后数量为0，无法下单")
+                return ExecutionResult(success=False, error_message="调整后数量为0，无法下单")
+
             # Submit limit order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
@@ -483,6 +569,72 @@ class SmartOrderRouter:
             )
 
         except Exception as e:
+            error_str = str(e)
+            # 🔥 增强错误处理：对602035错误进行自动重试（使用市场价格）
+            if "602035" in error_str or "Wrong bid size" in error_str:
+                logger.warning(f"  ⚠️ 遇到602035错误，尝试使用实时市场价格重试...")
+                logger.debug(f"  原始错误: {error_str}")
+
+                try:
+                    # 重新获取最新市场数据
+                    await self._update_market_data(request.symbol)
+                    market_data = self._market_data_cache.get(request.symbol, {})
+
+                    # 使用市场价格（ask for buy, bid for sell）
+                    if request.side == "BUY":
+                        retry_price = market_data.get('ask', limit_price)
+                        if retry_price <= 0:
+                            retry_price = market_data.get('last_price', limit_price)
+                        logger.info(f"  🔄 重试价格策略: 使用ASK价格 ${retry_price:.2f}")
+                    else:
+                        retry_price = market_data.get('bid', limit_price)
+                        if retry_price <= 0:
+                            retry_price = market_data.get('last_price', limit_price)
+                        logger.info(f"  🔄 重试价格策略: 使用BID价格 ${retry_price:.2f}")
+
+                    # 调整到tick size
+                    retry_price = self._round_price_to_tick(request.symbol, retry_price)
+
+                    # 转换为Decimal
+                    price_decimal = Decimal(str(retry_price))
+                    logger.info(f"  💰 重试订单参数: {request.side} {request.quantity}股 @ ${retry_price:.2f}")
+
+                    # 重试提交订单
+                    order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
+                    resp = await asyncio.to_thread(
+                        self.trade_context.submit_order,
+                        request.symbol,
+                        OrderType.LO,
+                        order_side,
+                        request.quantity,
+                        TimeInForceType.Day,
+                        price_decimal,
+                        None, None, None, None, None
+                    )
+
+                    logger.success(f"  ✅ 重试成功！订单已提交: order_id={resp.order_id}")
+
+                    # Track order
+                    self._active_orders[resp.order_id] = request
+
+                    # Wait for fill
+                    filled_qty, avg_price = await self._wait_for_fill(resp.order_id, timeout=60)
+
+                    if filled_qty < request.quantity:
+                        logger.warning(f"Partial fill: {filled_qty}/{request.quantity}")
+
+                    return ExecutionResult(
+                        success=True,
+                        order_id=resp.order_id,
+                        filled_quantity=filled_qty,
+                        average_price=avg_price,
+                        execution_time=datetime.now()
+                    )
+
+                except Exception as retry_error:
+                    logger.error(f"  ❌ 重试也失败: {retry_error}")
+                    return ExecutionResult(success=False, error_message=f"原始错误: {error_str}, 重试错误: {str(retry_error)}")
+
             logger.error(f"Passive execution failed: {e}")
             return ExecutionResult(success=False, error_message=str(e))
 
