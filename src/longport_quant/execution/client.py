@@ -197,11 +197,13 @@ class LongportTradingClient:
             expire_date = date.today() + timedelta(days=expire_days)
 
             # 使用TSLPPCT订单类型
+            # 注意：对于止损单，side应该表示原始仓位方向而不是止损触发后的操作方向
+            # 例如：持有多头仓位时，side=Buy表示这是保护多头仓位的止损单
             response = await asyncio.to_thread(
                 ctx.submit_order,
                 symbol,
                 openapi.OrderType.TSLPPCT,  # Trailing Stop Loss Percent
-                self._resolve_side(side),
+                openapi.OrderSide.Buy,  # 表示原始仓位方向（多头），API会自动理解为"价格下跌时卖出"
                 Decimal(str(quantity)),
                 openapi.TimeInForceType.GoodTilDate,  # GTD - 直到过期日期
                 submitted_price=None,  # 跟踪止损不需要价格
@@ -277,11 +279,13 @@ class LongportTradingClient:
             expire_date = date.today() + timedelta(days=expire_days)
 
             # 使用TSMPCT订单类型
+            # 注意：对于止盈单，side应该表示原始仓位方向而不是止盈触发后的操作方向
+            # 例如：持有多头仓位时，side=Buy表示这是保护多头仓位的止盈单
             response = await asyncio.to_thread(
                 ctx.submit_order,
                 symbol,
                 openapi.OrderType.TSMPCT,  # Trailing Stop Market Percent (for profit)
-                self._resolve_side(side),
+                openapi.OrderSide.Buy,  # 表示原始仓位方向（多头），API会自动理解为"价格回撤时卖出"
                 Decimal(str(quantity)),
                 openapi.TimeInForceType.GoodTilDate,  # GTD - 直到过期日期
                 submitted_price=None,  # 跟踪止盈不需要价格
