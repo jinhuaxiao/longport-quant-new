@@ -51,6 +51,12 @@ class BackupOrderConfig(BaseSettings):
     # 止损幅度阈值
     wide_stop_loss_pct: float = Field(0.05, alias="BACKUP_ORDERS_WIDE_STOP_LOSS_PCT")
 
+    # 跟踪止损配置
+    use_trailing_stop: bool = Field(True, alias="BACKUP_ORDERS_USE_TRAILING_STOP")
+    trailing_stop_percent: float = Field(0.02, alias="BACKUP_ORDERS_TRAILING_STOP_PERCENT")  # 2%
+    trailing_stop_limit_offset: float = Field(0.005, alias="BACKUP_ORDERS_TRAILING_STOP_LIMIT_OFFSET")  # 0.5%
+    trailing_stop_expire_days: int = Field(7, alias="BACKUP_ORDERS_TRAILING_STOP_EXPIRE_DAYS")  # GTD 7天
+
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
 
 

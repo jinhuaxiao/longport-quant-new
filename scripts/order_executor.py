@@ -521,20 +521,36 @@ class OrderExecutor:
                         take_profit = signal.get('take_profit')
 
                         if stop_loss and stop_loss > 0:
-                            # 转换为 float 避免 Decimal 类型错误
-                            stop_loss_float = float(stop_loss)
-
-                            # 提交止损备份条件单
-                            stop_result = await self.trade_client.submit_conditional_order(
-                                symbol=symbol,
-                                side="SELL",
-                                quantity=final_quantity,
-                                trigger_price=stop_loss_float,
-                                limit_price=stop_loss_float * 0.995,  # 触发后以略低价格限价卖出，确保成交
-                                remark=f"Backup Stop Loss @ ${stop_loss_float:.2f}"
-                            )
-                            backup_stop_order_id = stop_result.get('order_id')
-                            logger.success(f"  ✅ 止损备份条件单已提交: {backup_stop_order_id}")
+                            # 🔥 智能选择：跟踪止损 vs 固定止损
+                            if self.settings.backup_orders.use_trailing_stop:
+                                # 使用跟踪止损（TSLPPCT）- 自动跟随价格上涨锁定利润
+                                stop_result = await self.trade_client.submit_trailing_stop(
+                                    symbol=symbol,
+                                    side="SELL",
+                                    quantity=final_quantity,
+                                    trailing_percent=self.settings.backup_orders.trailing_stop_percent,
+                                    limit_offset=self.settings.backup_orders.trailing_stop_limit_offset,
+                                    expire_days=self.settings.backup_orders.trailing_stop_expire_days,
+                                    remark=f"Trailing Stop {self.settings.backup_orders.trailing_stop_percent*100:.1f}%"
+                                )
+                                backup_stop_order_id = stop_result.get('order_id')
+                                logger.success(
+                                    f"  ✅ 跟踪止损备份单已提交: {backup_stop_order_id} "
+                                    f"(跟踪{self.settings.backup_orders.trailing_stop_percent*100:.1f}%)"
+                                )
+                            else:
+                                # 使用固定止损（LIT）- 传统到价止损
+                                stop_loss_float = float(stop_loss)
+                                stop_result = await self.trade_client.submit_conditional_order(
+                                    symbol=symbol,
+                                    side="SELL",
+                                    quantity=final_quantity,
+                                    trigger_price=stop_loss_float,
+                                    limit_price=stop_loss_float * 0.995,  # 触发后以略低价格限价卖出，确保成交
+                                    remark=f"Backup Stop Loss @ ${stop_loss_float:.2f}"
+                                )
+                                backup_stop_order_id = stop_result.get('order_id')
+                                logger.success(f"  ✅ 固定止损备份条件单已提交: {backup_stop_order_id}")
 
                         if take_profit and take_profit > 0:
                             # 转换为 float 避免 Decimal 类型错误
@@ -552,7 +568,9 @@ class OrderExecutor:
                             backup_profit_order_id = profit_result.get('order_id')
                             logger.success(f"  ✅ 止盈备份条件单已提交: {backup_profit_order_id}")
 
-                        logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所条件单（备份）")
+                        # 打印策略说明
+                        stop_type = "跟踪止损(TSLPPCT)" if self.settings.backup_orders.use_trailing_stop else "固定止损(LIT)"
+                        logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所{stop_type}+固定止盈（备份）")
 
                     except Exception as e:
                         logger.warning(f"⚠️ 提交备份条件单失败（不影响主流程）: {e}")
