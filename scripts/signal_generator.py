@@ -266,6 +266,12 @@ class SignalGenerator:
         self.signal_history = {}  # {symbol: last_signal_time}
         self.signal_cooldown = 900  # 信号冷却期（秒），15分钟内不重复生成同一标的的信号（修复：从5分钟延长到15分钟）
 
+        # 🚫 防止频繁交易的历史记录（通过Redis共享）
+        self.sell_history = {}  # {symbol: last_sell_time} - 用于卖出后再买入冷却期
+        self.buy_history = {}   # {symbol: buy_time} - 用于最小持仓时间检查
+        self.redis_sell_history_key = f"{self.settings.redis_url.split('//')[-1].split('/')[0]}:trading:sell_history"
+        self.redis_buy_history_key = f"{self.settings.redis_url.split('//')[-1].split('/')[0]}:trading:buy_history"
+
         # 🔥 WebSocket实时订阅相关（事件驱动模式）
         self.websocket_enabled = False  # WebSocket订阅标志
         self.subscribed_symbols = set()  # 已订阅的股票列表
@@ -525,6 +531,22 @@ class SignalGenerator:
             if await self._is_in_twap_execution(symbol):
                 return False, "标的正在进行TWAP订单执行"
 
+            # 🚫 防止频繁交易 - 卖出后再买入冷却期检查
+            if self.settings.enable_reentry_cooldown and symbol in self.sell_history:
+                last_sell_time = self.sell_history[symbol]
+                elapsed = (datetime.now(self.beijing_tz) - last_sell_time).total_seconds()
+                if elapsed < self.settings.reentry_cooldown:
+                    remaining = self.settings.reentry_cooldown - elapsed
+                    logger.info(
+                        f"  🚫 {symbol}: 卖出后再买入冷却期内 "
+                        f"(已过{elapsed/3600:.1f}小时，还需{remaining/3600:.1f}小时)"
+                    )
+                    return False, f"卖出后再买入冷却期内（还需{remaining/3600:.1f}小时）"
+                else:
+                    # 冷却期已过，移除历史记录
+                    del self.sell_history[symbol]
+                    logger.debug(f"  ✅ {symbol}: 卖出后再买入冷却期已过，允许买入")
+
             # 时间窗口去重（冷却期检查）- 防止短时间内重复买入
             in_cooldown, remaining = self._is_in_cooldown(symbol)
             if in_cooldown:
@@ -548,6 +570,22 @@ class SignalGenerator:
             # 第3层：今日卖单去重（包括pending订单）
             if symbol in self.sold_today:
                 return False, "今日已对该标的下过卖单（包括待成交订单）"
+
+            # 🚫 防止频繁交易 - 最小持仓时间检查（止损止盈豁免）
+            if (
+                self.settings.enable_min_holding_period
+                and symbol in self.buy_history
+                and signal_type not in ["STOP_LOSS", "TAKE_PROFIT"]  # 止损止盈不受限制
+            ):
+                buy_time = self.buy_history[symbol]
+                holding_time = (datetime.now(self.beijing_tz) - buy_time).total_seconds()
+                if holding_time < self.settings.min_holding_period:
+                    remaining = self.settings.min_holding_period - holding_time
+                    logger.info(
+                        f"  🚫 {symbol}: 持仓时间不足 "
+                        f"(已持有{holding_time/60:.0f}分钟，还需{remaining/60:.0f}分钟)"
+                    )
+                    return False, f"持仓时间不足（还需{remaining/60:.0f}分钟）"
 
             # 第4层：时间窗口去重
             # 🔥 重要：止损止盈信号不受冷却期限制（必须立即执行）
@@ -1390,8 +1428,20 @@ class SignalGenerator:
         logger.info(f"    趋势得分: {trend_score}/10 ({trend_reason})")
         score += trend_score
 
+        # 🚫 防止频繁交易 - 交易成本惩罚（降低频繁交易动机）
+        original_score = score
+        if self.settings.enable_transaction_cost_penalty:
+            # 将交易成本（百分比）转换为评分扣减（假设满分100对应10%的收益潜力）
+            # 例如：0.2%交易成本 = 2分扣减（0.2% / 10% * 100 = 2）
+            cost_penalty = int(self.settings.transaction_cost_pct * 1000)  # 0.002 * 1000 = 2
+            score = max(0, score - cost_penalty)
+            logger.info(f"    💰 交易成本惩罚: -{cost_penalty}分 (成本比例: {self.settings.transaction_cost_pct*100:.2f}%)")
+
         # 总分和决策
-        logger.info(f"\n  📈 综合评分: {score}/100")
+        logger.info(
+            f"\n  📈 综合评分: {score}/100"
+            + (f" (原始分: {original_score})" if self.settings.enable_transaction_cost_penalty else "")
+        )
 
         # 判断是否生成信号
         if score >= 30:  # 弱买入以上

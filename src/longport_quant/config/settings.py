@@ -103,6 +103,14 @@ class Settings(BaseSettings):
     signal_queue_max_size: int = Field(1000, alias="SIGNAL_QUEUE_MAX_SIZE")
     order_executor_workers: int = Field(1, alias="ORDER_EXECUTOR_WORKERS")
 
+    # 批量信号处理配置（智能混合模式 - 高分信号优先）
+    signal_batch_window: float = Field(15.0, alias="SIGNAL_BATCH_WINDOW")  # 等待15秒收集信号
+    signal_batch_size: int = Field(5, alias="SIGNAL_BATCH_SIZE")  # 每批最多5个信号
+    stop_loss_priority: int = Field(999, alias="STOP_LOSS_PRIORITY")  # 止损止盈优先级（立即执行）
+    min_signal_score: int = Field(40, alias="MIN_SIGNAL_SCORE")  # 最低分数阈值
+    funds_retry_max: int = Field(3, alias="FUNDS_RETRY_MAX")  # 资金不足最大重试次数
+    funds_retry_delay: int = Field(30, alias="FUNDS_RETRY_DELAY")  # 资金不足重试延迟（分钟）
+
     watchlist_path: Path = Field(Path("configs/watchlist.yml"), alias="WATCHLIST_PATH")
     strategy_modules: List[str] = Field(default_factory=list, alias="STRATEGY_MODULES")
     active_markets: List[str] = Field(default_factory=list, alias="ACTIVE_MARKETS")
@@ -115,6 +123,16 @@ class Settings(BaseSettings):
 
     # 备份条件单配置
     backup_orders: BackupOrderConfig = Field(default_factory=BackupOrderConfig)
+
+    # 🚫 防止频繁交易配置
+    enable_reentry_cooldown: bool = Field(True, alias="ENABLE_REENTRY_COOLDOWN")  # 启用卖出后再买入冷却期
+    reentry_cooldown: int = Field(10800, alias="REENTRY_COOLDOWN")  # 卖出后再买入冷却期（秒，默认3小时=10800）
+    enable_min_holding_period: bool = Field(True, alias="ENABLE_MIN_HOLDING_PERIOD")  # 启用最小持仓时间
+    min_holding_period: int = Field(1800, alias="MIN_HOLDING_PERIOD")  # 最小持仓时间（秒，默认30分钟=1800）
+    enable_signal_confirmation: bool = Field(False, alias="ENABLE_SIGNAL_CONFIRMATION")  # 启用信号确认机制（可选）
+    signal_confirmation_count: int = Field(2, alias="SIGNAL_CONFIRMATION_COUNT")  # 信号确认次数
+    enable_transaction_cost_penalty: bool = Field(True, alias="ENABLE_TRANSACTION_COST_PENALTY")  # 启用交易成本惩罚
+    transaction_cost_pct: float = Field(0.002, alias="TRANSACTION_COST_PCT")  # 交易成本比例（0.2%）
 
     model_config = SettingsConfigDict(
         env_file=".env",
