@@ -225,6 +225,86 @@ class LongportTradingClient:
             logger.error(f"❌ 提交跟踪止损单失败: {exc}")
             raise
 
+    async def submit_trailing_profit(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        trailing_percent: float,
+        limit_offset: float | None = None,
+        expire_days: int = 7,
+        remark: str | None = None
+    ) -> Dict[str, Any]:
+        """
+        提交TSMPCT跟踪止盈单（Trailing Stop Market Percent）
+
+        跟踪止盈会自动跟随价格下跌而调整止盈位，实现"让利润奔跑"：
+        - 价格上涨时：止盈位保持不变（不限制上涨空间）
+        - 价格从高点回撤时：止盈位跟随回撤
+        - 触发时：回撤达到trailing_percent时以市价或限价卖出
+
+        Args:
+            symbol: 标的代码 (e.g., "1398.HK", "NVDA.US")
+            side: 买卖方向 ("SELL" for take profit)
+            quantity: 数量
+            trailing_percent: 跟踪百分比 (e.g., 0.06 = 6%)
+            limit_offset: 触发后的限价偏移 (e.g., 0.005 = 0.5%), None表示市价单
+            expire_days: 有效期天数（GTD - Good Till Date）
+            remark: 备注
+
+        Returns:
+            包含order_id的字典
+
+        Example:
+            # 跟踪止盈6%：当价格从高点回撤6%时触发卖出
+            # 假设买入价100，涨到150，止盈位=150*(1-6%)=141
+            # 如果继续涨到180，止盈位=180*(1-6%)=169.2
+            # 实现"让利润奔跑"：不限制上涨，仅在回撤时退出
+            await client.submit_trailing_profit(
+                symbol="1398.HK",
+                side="SELL",
+                quantity=1000,
+                trailing_percent=0.06,  # 6%
+                limit_offset=0.005,     # 0.5% 触发后保护
+                expire_days=7,
+                remark="Trailing Profit 6%"
+            )
+        """
+        ctx = await self._ensure_context()
+        try:
+            # 计算过期日期
+            from datetime import date, timedelta
+            expire_date = date.today() + timedelta(days=expire_days)
+
+            # 使用TSMPCT订单类型
+            response = await asyncio.to_thread(
+                ctx.submit_order,
+                symbol,
+                openapi.OrderType.TSMPCT,  # Trailing Stop Market Percent (for profit)
+                self._resolve_side(side),
+                Decimal(str(quantity)),
+                openapi.TimeInForceType.GoodTilDate,  # GTD - 直到过期日期
+                submitted_price=None,  # 跟踪止盈不需要价格
+                trailing_percent=Decimal(str(trailing_percent)),  # 跟踪百分比
+                limit_offset=Decimal(str(limit_offset)) if limit_offset else None,  # 限价偏移
+                expire_date=expire_date,  # 过期日期
+                remark=remark or f"Trailing Profit {trailing_percent*100:.1f}%"
+            )
+
+            payload = {"order_id": response.order_id}
+            logger.info(
+                f"✅ 跟踪止盈单已提交: {symbol} {side} {quantity}股, "
+                f"跟踪={trailing_percent*100:.1f}%, "
+                f"限价偏移={limit_offset*100:.2f}% (如有), "
+                f"过期={expire_date}, "
+                f"订单ID={response.order_id}"
+            )
+            return payload
+
+        except OpenApiException as exc:
+            logger.error(f"❌ 提交跟踪止盈单失败: {exc}")
+            raise
+
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         ctx = await self._ensure_context()
         try:

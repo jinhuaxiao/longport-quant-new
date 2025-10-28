@@ -553,24 +553,41 @@ class OrderExecutor:
                                 logger.success(f"  ✅ 固定止损备份条件单已提交: {backup_stop_order_id}")
 
                         if take_profit and take_profit > 0:
-                            # 转换为 float 避免 Decimal 类型错误
-                            take_profit_float = float(take_profit)
-
-                            # 提交止盈备份条件单
-                            profit_result = await self.trade_client.submit_conditional_order(
-                                symbol=symbol,
-                                side="SELL",
-                                quantity=final_quantity,
-                                trigger_price=take_profit_float,
-                                limit_price=take_profit_float,  # 止盈使用触发价本身
-                                remark=f"Backup Take Profit @ ${take_profit_float:.2f}"
-                            )
-                            backup_profit_order_id = profit_result.get('order_id')
-                            logger.success(f"  ✅ 止盈备份条件单已提交: {backup_profit_order_id}")
+                            # 🔥 智能选择：跟踪止盈 vs 固定止盈（实现"让利润奔跑"）
+                            if self.settings.backup_orders.use_trailing_profit:
+                                # 使用跟踪止盈（TSMPCT）- 不限制上涨空间，仅在回撤时退出
+                                profit_result = await self.trade_client.submit_trailing_profit(
+                                    symbol=symbol,
+                                    side="SELL",
+                                    quantity=final_quantity,
+                                    trailing_percent=self.settings.backup_orders.trailing_profit_percent,
+                                    limit_offset=self.settings.backup_orders.trailing_profit_limit_offset,
+                                    expire_days=self.settings.backup_orders.trailing_profit_expire_days,
+                                    remark=f"Trailing Profit {self.settings.backup_orders.trailing_profit_percent*100:.1f}%"
+                                )
+                                backup_profit_order_id = profit_result.get('order_id')
+                                logger.success(
+                                    f"  ✅ 跟踪止盈备份单已提交: {backup_profit_order_id} "
+                                    f"(跟踪{self.settings.backup_orders.trailing_profit_percent*100:.1f}%)"
+                                )
+                            else:
+                                # 使用固定止盈（LIT）- 传统到价止盈
+                                take_profit_float = float(take_profit)
+                                profit_result = await self.trade_client.submit_conditional_order(
+                                    symbol=symbol,
+                                    side="SELL",
+                                    quantity=final_quantity,
+                                    trigger_price=take_profit_float,
+                                    limit_price=take_profit_float,  # 止盈使用触发价本身
+                                    remark=f"Backup Take Profit @ ${take_profit_float:.2f}"
+                                )
+                                backup_profit_order_id = profit_result.get('order_id')
+                                logger.success(f"  ✅ 固定止盈备份条件单已提交: {backup_profit_order_id}")
 
                         # 打印策略说明
                         stop_type = "跟踪止损(TSLPPCT)" if self.settings.backup_orders.use_trailing_stop else "固定止损(LIT)"
-                        logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所{stop_type}+固定止盈（备份）")
+                        profit_type = "跟踪止盈(TSMPCT)" if self.settings.backup_orders.use_trailing_profit else "固定止盈(LIT)"
+                        logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所{stop_type}+{profit_type}（备份）")
 
                     except Exception as e:
                         logger.warning(f"⚠️ 提交备份条件单失败（不影响主流程）: {e}")
