@@ -17,6 +17,7 @@ from longport_quant.data.quote_client import QuoteDataClient
 from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.stop_manager import StopLossManager
 from longport_quant.features.technical_indicators import TechnicalIndicators
+from longport_quant.persistence.position_manager import RedisPositionManager
 from longport import openapi
 import numpy as np
 
@@ -35,8 +36,14 @@ class SmartPositionRotator:
         self.settings = get_settings()
         self.order_manager = OrderManager()
         self.stop_manager = StopLossManager()
+        self.position_manager = RedisPositionManager(
+            redis_url=self.settings.redis_url,
+            key_prefix="trading"
+        )
         self.max_positions = 999  # 不限制持仓数量（与主脚本保持一致）
         self.beijing_tz = ZoneInfo("Asia/Shanghai")  # 北京时区
+        # 刚建仓的标的至少持有10分钟后才允许轮换，避免频繁买卖
+        self.min_hold_seconds = 600
 
     async def evaluate_position_strength(self, symbol: str, position: Dict,
                                         quote_client: QuoteDataClient) -> float:
@@ -429,8 +436,8 @@ class SmartPositionRotator:
         new_signal: Dict,
         trade_client: LongportTradingClient,
         quote_client: QuoteDataClient,
-        score_threshold: int = 10
-    ) -> Tuple[bool, float]:
+        score_threshold: int = 15
+    ) -> Tuple[bool, float, List[Dict[str, float]]]:
         """
         尝试释放指定金额的资金（可卖出多个弱势持仓）
 
@@ -439,40 +446,39 @@ class SmartPositionRotator:
             new_signal: 新信号数据（包含symbol, score等）
             trade_client: 交易客户端
             quote_client: 行情客户端
-            score_threshold: 评分阈值差（默认10分）
+            score_threshold: 评分阈值差（默认15分）
 
         Returns:
-            (成功与否, 实际释放的资金量)
+            (成功与否, 实际释放的资金量, 卖出明细列表)
         """
         try:
             logger.info(f"\n💰 尝试释放资金: 需要 ${needed_amount:,.2f}")
+            await self.position_manager.connect()
 
             # 1. 获取当前持仓
             positions_resp = await trade_client.stock_positions()
-            positions = {}
+            positions: Dict[str, Dict[str, float]] = {}
 
             for channel in positions_resp.channels:
                 for pos in channel.positions:
-                    # 估算持仓市值（数量 × 成本价，简化估算）
-                    # ⚠️ 需要转换Decimal为float避免类型错误
                     quantity = float(pos.quantity) if pos.quantity else 0
                     cost_price = float(pos.cost_price) if pos.cost_price else 0
                     market_value = quantity * cost_price
 
                     positions[pos.symbol] = {
-                        "quantity": quantity,  # 保存为float
+                        "quantity": quantity,
                         "cost": cost_price,
                         "market_value": market_value,
-                        "days_held": 0  # 简化处理
+                        "days_held": 0
                     }
 
             if not positions:
                 logger.warning("⚠️ 没有持仓可以轮换")
-                return False, 0.0
+                return False, 0.0, []
 
             # 2. 评估所有持仓强度
             logger.info(f"\n📊 评估所有持仓强度...")
-            position_scores = []
+            position_scores: List[Tuple[str, float, Dict]] = []
 
             for symbol, position in positions.items():
                 score = await self.evaluate_position_strength(
@@ -488,23 +494,21 @@ class SmartPositionRotator:
             new_signal_symbol = new_signal.get('symbol', 'N/A')
             logger.info(f"\n🎯 新信号评分: {new_signal_score}分 ({new_signal_symbol})")
 
-            # 确定新信号需要的币种
-            if new_signal_symbol.endswith('.HK') or new_signal_symbol.endswith('.SH') or new_signal_symbol.endswith('.SZ'):
-                new_currency = 'HKD'  # 港股和A股都用HKD账户
+            if new_signal_symbol.endswith(('.HK', '.SH', '.SZ')):
+                new_currency = 'HKD'
             elif new_signal_symbol.endswith('.US'):
                 new_currency = 'USD'
             else:
-                new_currency = None  # 未知市场，不做币种限制
+                new_currency = None
 
             if new_currency:
                 logger.info(f"   需要币种: {new_currency}")
 
             # 4. 逐个卖出弱势持仓，直到资金足够
             total_freed = 0.0
-            sold_positions = []
+            sold_positions: List[Dict[str, float]] = []
 
             for symbol, pos_score, position in position_scores:
-                # 检查评分差距
                 score_diff = new_signal_score - pos_score
 
                 if score_diff < score_threshold:
@@ -514,9 +518,8 @@ class SmartPositionRotator:
                     )
                     continue
 
-                # 检查币种是否匹配
                 if new_currency:
-                    if symbol.endswith('.HK') or symbol.endswith('.SH') or symbol.endswith('.SZ'):
+                    if symbol.endswith(('.HK', '.SH', '.SZ')):
                         pos_currency = 'HKD'
                     elif symbol.endswith('.US'):
                         pos_currency = 'USD'
@@ -529,14 +532,32 @@ class SmartPositionRotator:
                         )
                         continue
 
-                # 检查市场是否开盘
                 if not self._is_market_open(symbol):
+                    logger.info(f"  ⏭️ {symbol}: 市场休市，无法卖出")
+                    continue
+
+                hold_seconds = None
+                try:
+                    detail = await self.position_manager.get_position_detail(symbol)
+                except Exception as e:
+                    logger.debug(f"  ⚠️ 获取持仓详情失败，继续默认流程: {e}")
+                    detail = None
+
+                if detail and detail.get("added_at"):
+                    try:
+                        added_at = datetime.fromisoformat(detail["added_at"])
+                        hold_seconds = (datetime.now(self.beijing_tz) - added_at).total_seconds()
+                    except Exception as parse_err:
+                        logger.debug(f"  ⚠️ 解析持仓时间失败: {parse_err}")
+                        hold_seconds = None
+
+                if hold_seconds is not None and hold_seconds < self.min_hold_seconds:
                     logger.info(
-                        f"  ⏭️ {symbol}: 市场休市，无法卖出"
+                        f"  ⏭️ {symbol}: 持仓仅 {hold_seconds/60:.1f} 分钟，"
+                        f"未达到智能轮换最短持有 {self.min_hold_seconds/60:.1f} 分钟，保留"
                     )
                     continue
 
-                # 🔥 关键检查：不要卖出即将买入的标的（避免先卖后买浪费手续费）
                 if symbol == new_signal_symbol:
                     logger.info(
                         f"  ⏭️ {symbol}: 是新信号标的，跳过（避免先卖后买浪费手续费）\n"
@@ -545,7 +566,6 @@ class SmartPositionRotator:
                     )
                     continue
 
-                # 评分差距足够，考虑卖出
                 market_value = position["market_value"]
 
                 logger.warning(
@@ -554,9 +574,7 @@ class SmartPositionRotator:
                 )
                 logger.info(f"     预计释放资金: ${market_value:,.2f}")
 
-                # 执行卖出
                 try:
-                    # 获取实时价格用于市价单
                     quotes = await quote_client.get_realtime_quote([symbol])
                     if quotes and len(quotes) > 0:
                         current_price = float(quotes[0].last_done)
@@ -567,64 +585,68 @@ class SmartPositionRotator:
                         "symbol": symbol,
                         "side": "SELL",
                         "quantity": position["quantity"],
-                        "price": current_price,  # 使用限价单（当前价）
+                        "price": current_price,
                         "remark": f"Smart rotation: free up ${needed_amount:.0f} for {new_signal.get('symbol', 'N/A')}"
                     })
 
-                    # 估算释放的资金（数量 × 当前价）
                     freed_amount = position["quantity"] * current_price
                     total_freed += freed_amount
-                    sold_positions.append(symbol)
+                    sold_positions.append({
+                        "symbol": symbol,
+                        "order_id": order_resp.get('order_id', 'N/A'),
+                        "freed_amount": freed_amount,
+                        "score": pos_score,
+                        "score_diff": score_diff,
+                        "hold_minutes": hold_seconds / 60 if hold_seconds is not None else None
+                    })
 
                     logger.success(
                         f"     ✅ 卖出成功: 订单ID={order_resp.get('order_id', 'N/A')}, "
                         f"释放${freed_amount:,.2f}"
                     )
 
-                    # 更新止损记录
                     try:
                         await self.stop_manager.update_stop_status(
-                            symbol, "rotated_funds"  # 缩短为14字符以适应数据库限制
+                            symbol, "rotated_funds"
                         )
                     except Exception:
                         pass
 
-                    # 检查是否已释放足够资金
                     if total_freed >= needed_amount:
                         logger.success(
                             f"\n💰 资金释放成功！\n"
                             f"   需要: ${needed_amount:,.2f}\n"
                             f"   已释放: ${total_freed:,.2f}\n"
-                            f"   卖出持仓: {', '.join(sold_positions)}"
+                            f"   卖出持仓: {', '.join(p['symbol'] for p in sold_positions)}"
                         )
-                        return True, total_freed
+                        return True, total_freed, sold_positions
 
                 except Exception as e:
                     logger.error(f"     ❌ 卖出{symbol}失败: {e}")
                     continue
 
-            # 5. 检查最终结果
             if total_freed >= needed_amount:
                 logger.success(
                     f"\n💰 资金释放成功！已释放${total_freed:,.2f} (需要${needed_amount:,.2f})"
                 )
-                return True, total_freed
-            else:
-                logger.warning(
-                    f"\n⚠️ 资金释放不足：已释放${total_freed:,.2f}，"
-                    f"还需${needed_amount - total_freed:,.2f}\n"
-                    f"   可能原因：\n"
-                    f"   1. 所有持仓评分都高于新信号（保护优质持仓）\n"
-                    f"   2. 可卖持仓市值不足\n"
-                    f"   建议：跳过此信号或降低买入数量"
-                )
-                return False, total_freed
+                return True, total_freed, sold_positions
+
+            logger.warning(
+                f"\n⚠️ 资金释放不足：已释放${total_freed:,.2f}，"
+                f"还需${needed_amount - total_freed:,.2f}\n"
+                f"   可能原因：\n"
+                f"   1. 所有持仓评分都高于新信号（保护优质持仓）\n"
+                f"   2. 可卖持仓市值不足\n"
+                f"   建议：跳过此信号或降低买入数量"
+            )
+            return False, total_freed, sold_positions
 
         except Exception as e:
-            logger.error(f"❌ 尝试释放资金失败: {e}")
+            logger.error(f"❌ 智能轮换执行失败: {e}")
             import traceback
             logger.debug(traceback.format_exc())
-            return False, 0.0
+            logger.warning("   建议：检查持仓数据和行情数据是否正常")
+            return False, 0.0, []
 
 
 async def test_rotation():

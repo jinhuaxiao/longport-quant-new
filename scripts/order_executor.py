@@ -380,7 +380,7 @@ class OrderExecutor:
                     f"     策略: 卖出评分较低的持仓，为评分{score}分的新信号腾出空间"
                 )
 
-                rotation_success, freed_amount = await self._try_smart_rotation(
+                rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
                     signal, needed_amount
                 )
             elif needed_amount <= 0:
@@ -401,6 +401,16 @@ class OrderExecutor:
                 )
                 rotation_success = False
                 freed_amount = 0
+                rotation_details = []
+
+            if rotation_details:
+                await self._notify_rotation_result(
+                    new_signal=signal,
+                    needed_amount=needed_amount,
+                    freed_amount=freed_amount,
+                    sold_positions=rotation_details,
+                    success=rotation_success
+                )
 
             if rotation_success:
                 logger.success(f"  ✅ 智能轮换成功，已释放 ${freed_amount:,.2f}")
@@ -1243,7 +1253,7 @@ class OrderExecutor:
         self,
         signal: Dict,
         needed_amount: float
-    ) -> tuple[bool, float]:
+    ) -> tuple[bool, float, list[dict]]:
         """
         尝试通过智能持仓轮换释放资金
 
@@ -1252,7 +1262,7 @@ class OrderExecutor:
             needed_amount: 需要释放的资金量
 
         Returns:
-            (成功与否, 实际释放的资金量)
+            (成功与否, 实际释放的资金量, 卖出明细列表)
         """
         try:
             # 动态导入SmartPositionRotator
@@ -1270,7 +1280,7 @@ class OrderExecutor:
                 f"评分={signal.get('score', 0)}, 需要资金=${needed_amount:,.2f}"
             )
 
-            success, freed = await rotator.try_free_up_funds(
+            success, freed, sold_positions = await rotator.try_free_up_funds(
                 needed_amount=needed_amount,
                 new_signal=signal,
                 trade_client=self.trade_client,
@@ -1283,19 +1293,62 @@ class OrderExecutor:
             else:
                 logger.warning(f"  ⚠️ 智能轮换未能释放足够资金: ${freed:,.2f}")
 
-            return success, freed
+            return success, freed, sold_positions
 
         except ImportError as e:
             logger.error(f"❌ 导入SmartPositionRotator失败: {e}")
             logger.warning("⚠️ 智能轮换功能不可用，跳过轮换尝试")
             logger.info("   提示：检查 scripts/smart_position_rotation.py 是否存在")
-            return False, 0.0
+            return False, 0.0, []
         except Exception as e:
             logger.error(f"❌ 智能轮换执行失败: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             logger.warning("   建议：检查持仓数据和行情数据是否正常")
-            return False, 0.0
+            return False, 0.0, []
+
+    async def _notify_rotation_result(
+        self,
+        new_signal: Dict,
+        needed_amount: float,
+        freed_amount: float,
+        sold_positions: list[dict],
+        success: bool
+    ):
+        """发送智能轮换结果到Slack，方便排查持仓被动调整"""
+        if not self.slack or not sold_positions:
+            return
+
+        symbol = new_signal.get('symbol', 'N/A')
+        score = new_signal.get('score', 0)
+        status_emoji = "✅" if success else "⚠️"
+        status_text = "资金释放成功" if success else "资金仍不足"
+
+        details_lines = []
+        for pos in sold_positions:
+            line = f"   • {pos.get('symbol', 'N/A')}: 释放${pos.get('freed_amount', 0):,.2f}"
+            if pos.get('score') is not None:
+                line += f" (评分{pos['score']:.1f}, 差距{pos.get('score_diff', 0):.1f})"
+            if pos.get('hold_minutes') is not None:
+                line += f", 持有{pos['hold_minutes']:.1f}分钟"
+            if pos.get('order_id'):
+                line += f", 订单ID {pos['order_id']}"
+            details_lines.append(line)
+
+        message = (
+            "♻️ *智能持仓轮换执行*\n\n"
+            f"{status_emoji} {status_text}\n"
+            f"📈 新信号: {symbol} ({score}分)\n"
+            f"🎯 目标释放: ${needed_amount:,.2f}\n"
+            f"💰 实际释放: ${freed_amount:,.2f}\n"
+            "📉 卖出明细:\n"
+            + "\n".join(details_lines)
+        )
+
+        try:
+            await self.slack.send(message)
+        except Exception as e:
+            logger.warning(f"⚠️ 智能轮换通知发送失败: {e}")
 
     async def _mark_twap_execution(self, symbol: str, duration_seconds: int = 3600):
         """

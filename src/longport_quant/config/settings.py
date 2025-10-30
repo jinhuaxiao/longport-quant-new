@@ -42,15 +42,15 @@ class BackupOrderConfig(BaseSettings):
     # 止损幅度阈值
     wide_stop_loss_pct: float = Field(0.05, alias="BACKUP_ORDERS_WIDE_STOP_LOSS_PCT")
 
-    # 跟踪止损配置
+    # 跟踪止损配置（🔥 调整：2%→5%，减少误触发）
     use_trailing_stop: bool = Field(True, alias="BACKUP_ORDERS_USE_TRAILING_STOP")
-    trailing_stop_percent: float = Field(0.02, alias="BACKUP_ORDERS_TRAILING_STOP_PERCENT")  # 2%
+    trailing_stop_percent: float = Field(0.05, alias="BACKUP_ORDERS_TRAILING_STOP_PERCENT")  # 5% (从2%提高)
     trailing_stop_limit_offset: float = Field(0.005, alias="BACKUP_ORDERS_TRAILING_STOP_LIMIT_OFFSET")  # 0.5%
     trailing_stop_expire_days: int = Field(7, alias="BACKUP_ORDERS_TRAILING_STOP_EXPIRE_DAYS")  # GTD 7天
 
-    # 跟踪止盈配置（"让利润奔跑"策略）
+    # 跟踪止盈配置（"让利润奔跑"策略，🔥 调整：6%→10%）
     use_trailing_profit: bool = Field(True, alias="BACKUP_ORDERS_USE_TRAILING_PROFIT")
-    trailing_profit_percent: float = Field(0.06, alias="BACKUP_ORDERS_TRAILING_PROFIT_PERCENT")  # 6%
+    trailing_profit_percent: float = Field(0.10, alias="BACKUP_ORDERS_TRAILING_PROFIT_PERCENT")  # 10% (从6%提高)
     trailing_profit_limit_offset: float = Field(0.005, alias="BACKUP_ORDERS_TRAILING_PROFIT_LIMIT_OFFSET")  # 0.5%
     trailing_profit_expire_days: int = Field(7, alias="BACKUP_ORDERS_TRAILING_PROFIT_EXPIRE_DAYS")  # GTD 7天
 

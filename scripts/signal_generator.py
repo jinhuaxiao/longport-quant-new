@@ -747,6 +747,9 @@ class SignalGenerator:
                     logger.debug(f"  ⏭️  {symbol}: 跳过止损信号 - {skip_reason}")
                     return
 
+                # 🔥 获取买入时间（用于计算持仓时长）
+                entry_time = position_detail.get('entry_time')
+
                 # 生成止损信号
                 signal = {
                     'symbol': symbol,
@@ -758,6 +761,14 @@ class SignalGenerator:
                     'score': 100,  # 止损最高优先级
                     'timestamp': datetime.now(self.beijing_tz).isoformat(),
                     'priority': 100,
+                    # 🔥 增强数据：供Slack通知使用
+                    'cost_price': cost_price,
+                    'entry_time': entry_time,
+                    'indicators': {  # 简单记录当前价格信息
+                        'current_price': current_price,
+                        'stop_loss': stop_loss,
+                        'loss_pct': loss_pct,
+                    },
                 }
 
                 success = await self.signal_queue.publish_signal(signal)
@@ -779,6 +790,9 @@ class SignalGenerator:
                     logger.debug(f"  ⏭️  {symbol}: 跳过止盈信号 - {skip_reason}")
                     return
 
+                # 🔥 获取买入时间（用于计算持仓时长）
+                entry_time = position_detail.get('entry_time')
+
                 # 生成止盈信号
                 signal = {
                     'symbol': symbol,
@@ -790,6 +804,14 @@ class SignalGenerator:
                     'score': 95,
                     'timestamp': datetime.now(self.beijing_tz).isoformat(),
                     'priority': 95,
+                    # 🔥 增强数据：供Slack通知使用
+                    'cost_price': cost_price,
+                    'entry_time': entry_time,
+                    'indicators': {  # 简单记录当前价格信息
+                        'current_price': current_price,
+                        'take_profit': take_profit,
+                        'profit_pct': profit_pct,
+                    },
                 }
 
                 success = await self.signal_queue.publish_signal(signal)
@@ -1640,11 +1662,11 @@ class SignalGenerator:
             score += 15
             reasons.append("成交量萎缩")
 
-        # 根据评分决定动作
-        if score >= 50:
+        # 根据评分决定动作（🔥 提高门槛避免过早止盈）
+        if score >= 70:  # 从50提高到70
             action = "TAKE_PROFIT_NOW"
             adjusted_take_profit = current_price  # 立即止盈
-        elif score >= 30:
+        elif score >= 50:  # 从30提高到50
             action = "TAKE_PROFIT_EARLY"
             adjusted_take_profit = current_price * 1.05  # 提前止盈（+5%）
         elif score >= 10:
@@ -1754,6 +1776,40 @@ class SignalGenerator:
                         f"     原因: {', '.join(reasons) if reasons else '无'}"
                     )
 
+                    # 🔥 检查最小持仓时间（智能止盈也需要遵守）
+                    entry_time_str = position.get('entry_time')
+                    if (
+                        self.settings.enable_min_holding_period
+                        and entry_time_str
+                        and action in ["TAKE_PROFIT_NOW", "TAKE_PROFIT_EARLY"]
+                    ):
+                        try:
+                            entry_time = datetime.fromisoformat(entry_time_str)
+                            holding_seconds = (datetime.now(self.beijing_tz) - entry_time).total_seconds()
+
+                            if holding_seconds < self.settings.min_holding_period:
+                                holding_minutes = holding_seconds / 60
+                                required_minutes = self.settings.min_holding_period / 60
+                                logger.info(
+                                    f"  ⏭️ {symbol}: 跳过智能止盈 - 持仓时间不足\n"
+                                    f"     持仓时长: {holding_minutes:.1f}分钟 < {required_minutes:.0f}分钟\n"
+                                    f"     评分={score:+d}, 收益={profit_pct:+.2f}%\n"
+                                    f"     原因: {', '.join(reasons[:2])}"
+                                )
+                                continue  # 跳过这个标的，检查下一个
+                        except Exception as e:
+                            logger.warning(f"  ⚠️ {symbol}: 解析entry_time失败: {e}")
+
+                    # 🔥 检查最小盈利要求（避免小幅波动就卖出）
+                    if action in ["TAKE_PROFIT_NOW", "TAKE_PROFIT_EARLY"]:
+                        min_profit_pct = 3.0  # 最小3%盈利
+                        if profit_pct < min_profit_pct:
+                            logger.debug(
+                                f"  ⏭️ {symbol}: 跳过智能止盈 - 盈利不足\n"
+                                f"     当前盈利: {profit_pct:.2f}% < {min_profit_pct:.1f}%"
+                            )
+                            continue  # 跳过这个标的
+
                     # 根据动作决定是否生成信号
                     if action == "TAKE_PROFIT_NOW":
                         # 立即止盈（忽略固定止盈位）
@@ -1772,6 +1828,11 @@ class SignalGenerator:
                             'score': 95,
                             'timestamp': datetime.now(self.beijing_tz).isoformat(),
                             'priority': 95,
+                            # 🔥 增强数据：供Slack通知使用
+                            'cost_price': cost_price,
+                            'entry_time': position.get('entry_time'),
+                            'indicators': indicators,  # 完整的技术指标
+                            'exit_score_details': reasons,  # 卖出评分详情
                         })
 
                     elif action == "TAKE_PROFIT_EARLY":
@@ -1791,6 +1852,11 @@ class SignalGenerator:
                             'score': 85,
                             'timestamp': datetime.now(self.beijing_tz).isoformat(),
                             'priority': 85,
+                            # 🔥 增强数据：供Slack通知使用
+                            'cost_price': cost_price,
+                            'entry_time': position.get('entry_time'),
+                            'indicators': indicators,  # 完整的技术指标
+                            'exit_score_details': reasons,  # 卖出评分详情
                         })
 
                     elif action in ["STRONG_HOLD", "DELAY_TAKE_PROFIT"]:
@@ -1828,6 +1894,10 @@ class SignalGenerator:
                         'score': 100,
                         'timestamp': datetime.now(self.beijing_tz).isoformat(),
                         'priority': 100,
+                        # 🔥 增强数据：供Slack通知使用
+                        'cost_price': cost_price,
+                        'entry_time': position.get('entry_time'),
+                        'indicators': indicators if indicators else {},
                     })
 
                 # 检查固定止盈（仅在没有智能决策或决策为STANDARD时）
@@ -1855,6 +1925,10 @@ class SignalGenerator:
                         'score': 90,
                         'timestamp': datetime.now(self.beijing_tz).isoformat(),
                         'priority': 90,
+                        # 🔥 增强数据：供Slack通知使用
+                        'cost_price': cost_price,
+                        'entry_time': position.get('entry_time'),
+                        'indicators': indicators if indicators else {},
                     })
 
         except Exception as e:
