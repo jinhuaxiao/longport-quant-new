@@ -913,11 +913,15 @@ class OrderExecutor:
         else:
             # 普通账户，不能超过可用现金
             if dynamic_budget > available_cash:
+                # 🔥 关键修复：可用资金不足时，按评分比例基于可用资金重新计算
+                # 而不是直接用全部可用资金（这样会导致低分信号用过大仓位）
+                adjusted_budget = available_cash * budget_pct
                 logger.warning(
-                    f"  ⚠️ 动态预算${dynamic_budget:,.2f}超出{currency}可用资金${available_cash:,.2f}，"
-                    f"调整为可用金额"
+                    f"  ⚠️ 动态预算${dynamic_budget:,.2f}超出{currency}可用资金${available_cash:,.2f}\n"
+                    f"     按评分比例({budget_pct:.1%})重新计算: ${adjusted_budget:,.2f} "
+                    f"(而非使用全部可用资金)"
                 )
-                dynamic_budget = available_cash
+                dynamic_budget = adjusted_budget
 
         logger.debug(
             f"  动态预算计算: 评分={score}, 预算比例={budget_pct:.2%}, "
@@ -1085,23 +1089,94 @@ class OrderExecutor:
         quantity: int,
         order_price: float
     ):
-        """发送卖出通知到Slack"""
+        """发送卖出通知到Slack（增强版：包含盈亏、持仓时长、技术指标）"""
         try:
             signal_type = signal.get('type', 'SELL')
             reason = signal.get('reason', '平仓')
+            score = signal.get('score', 0)
 
             emoji = "🛑" if "止损" in reason else ("🎯" if "止盈" in reason else "💵")
 
+            # 基础信息
             message = (
                 f"{emoji} *平仓订单已提交*\n\n"
                 f"📋 订单ID: `{order.get('order_id', 'N/A')}`\n"
                 f"📊 标的: *{symbol}*\n"
-                f"💡 原因: {reason}\n\n"
+                f"💡 原因: {reason}\n"
+                f"⭐ 评分: {score}/100\n\n"
+            )
+
+            # 交易信息（包含成本价）
+            cost_price = signal.get('cost_price', 0)
+            message += (
                 f"💰 *交易信息*:\n"
                 f"   • 数量: {quantity}股\n"
-                f"   • 价格: ${order_price:.2f}\n"
-                f"   • 总额: ${order_price * quantity:.2f}\n"
+                f"   • 卖出价: ${order_price:.2f}\n"
             )
+
+            if cost_price > 0:
+                message += f"   • 成本价: ${cost_price:.2f}\n"
+
+            message += f"   • 总额: ${order_price * quantity:.2f}\n"
+
+            # 🔥 盈亏分析（如果有成本价）
+            if cost_price > 0:
+                profit_amount = (order_price - cost_price) * quantity
+                profit_pct = (order_price - cost_price) / cost_price * 100
+                profit_emoji = "📈" if profit_pct > 0 else ("📉" if profit_pct < 0 else "➖")
+
+                message += (
+                    f"\n{profit_emoji} *盈亏分析*:\n"
+                    f"   • 收益率: {profit_pct:+.2f}%\n"
+                    f"   • 盈亏金额: ${profit_amount:+,.2f}\n"
+                )
+
+            # 🔥 持仓时长（如果有买入时间）
+            entry_time_str = signal.get('entry_time')
+            if entry_time_str:
+                try:
+                    from datetime import datetime
+                    entry_time = datetime.fromisoformat(entry_time_str)
+                    holding_duration = datetime.now() - entry_time
+
+                    hours = holding_duration.total_seconds() / 3600
+                    if hours < 1:
+                        holding_text = f"{hours * 60:.0f}分钟"
+                    elif hours < 24:
+                        holding_text = f"{hours:.1f}小时"
+                    else:
+                        holding_text = f"{hours / 24:.1f}天"
+
+                    message += f"   • 持仓时长: {holding_text}\n"
+                except Exception as e:
+                    logger.warning(f"解析持仓时长失败: {e}")
+
+            # 🔥 技术指标（如果是智能止盈）
+            if signal_type in ['SMART_TAKE_PROFIT', 'EARLY_TAKE_PROFIT', 'STRONG_SELL', 'SELL']:
+                indicators = signal.get('indicators', {})
+                if indicators:
+                    rsi = indicators.get('rsi')
+                    macd = indicators.get('macd')
+                    macd_signal = indicators.get('macd_signal')
+
+                    message += f"\n📊 *技术指标*:\n"
+
+                    if rsi is not None:
+                        rsi_status = "超买" if rsi > 70 else ("超卖" if rsi < 30 else "正常")
+                        message += f"   • RSI: {rsi:.1f} ({rsi_status})\n"
+
+                    if macd is not None and macd_signal is not None:
+                        macd_diff = macd - macd_signal
+                        macd_status = "金叉" if macd_diff > 0 else "死叉"
+                        message += f"   • MACD: {macd:.3f} | Signal: {macd_signal:.3f}\n"
+                        message += f"   • MACD差值: {macd_diff:+.3f} ({macd_status})\n"
+
+            # 🔥 卖出评分详情（如果有）
+            exit_reasons = signal.get('exit_score_details', [])
+            if exit_reasons and isinstance(exit_reasons, list):
+                message += f"\n💡 *卖出依据*:\n"
+                for idx, reason_item in enumerate(exit_reasons[:5], 1):  # 最多显示5条
+                    message += f"   {idx}. {reason_item}\n"
 
             await self.slack.send(message)
 
