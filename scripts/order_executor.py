@@ -80,9 +80,13 @@ class OrderExecutor:
             'SZ': 2,   # A股深交所最多2个
         }
         self.min_position_size_pct = 0.05  # 最小仓位5%
-        self.max_position_size_pct = 0.30  # 最大仓位30%
+        self.max_position_size_pct = 0.40  # 最大仓位40%（极强信号专用，80-100分）
         self.min_cash_reserve = 1000  # 最低现金储备
         self.use_adaptive_budget = True  # 启用自适应预算
+
+        # 分批建仓配置
+        self.enable_staged_entry = False  # 是否启用分批建仓（默认关闭，一次性建仓）
+        self.stage_interval_minutes = 15  # 批次间隔（分钟）
 
         # 组件（延迟初始化）
         self.trade_client = None
@@ -162,8 +166,10 @@ class OrderExecutor:
                         batch = await self._consume_batch()
 
                         if not batch:
-                            # 批次为空，短暂等待
-                            await asyncio.sleep(1)
+                            # 🔥 批次为空，使用配置的休眠时间避免CPU空转
+                            sleep_time = self.settings.empty_queue_sleep
+                            logger.debug(f"  💤 队列为空或只有延迟信号，休眠{sleep_time}秒...")
+                            await asyncio.sleep(sleep_time)
                             continue
 
                         logger.info(f"\n{'='*70}")
@@ -437,51 +443,87 @@ class OrderExecutor:
             symbol=symbol
         )
 
-        # 10. 提交订单（使用SmartOrderRouter的TWAP策略）
+        # 10. 提交订单（分批建仓 或 TWAP策略）
         try:
-            # 创建订单请求
-            order_request = OrderRequest(
-                symbol=symbol,
-                side="BUY",
-                quantity=quantity,
-                order_type="LIMIT",
-                limit_price=order_price,
-                strategy=ExecutionStrategy.TWAP,  # 使用TWAP策略
-                urgency=5,  # 中等紧急度
-                max_slippage=0.01,  # 允许1%滑点
-                signal=signal,
-                metadata={
-                    "signal_type": signal_type,
-                    "score": score,
-                    "stop_loss": signal.get('stop_loss'),
-                    "take_profit": signal.get('take_profit')
-                }
-            )
+            # 🔥 根据配置选择建仓策略
+            if self.enable_staged_entry and score < 80:
+                # 启用分批建仓（仅对非极强信号）
+                logger.info(f"📊 使用分批建仓策略（信号评分{score}分）...")
 
-            # 🔒 标记TWAP执行状态（防止重复信号，持续1小时）
-            await self._mark_twap_execution(symbol, duration_seconds=3600)
+                # 🔒 标记执行状态（防止重复信号）
+                await self._mark_twap_execution(symbol, duration_seconds=3600)
 
-            # 执行TWAP订单
-            logger.info(f"📊 使用TWAP策略执行订单（将在30分钟内分批下单）...")
-            try:
-                execution_result = await self.smart_router.execute_order(order_request)
+                try:
+                    final_quantity, final_price = await self._execute_staged_buy(
+                        signal=signal,
+                        total_budget=dynamic_budget,
+                        current_price=order_price
+                    )
 
-                if not execution_result.success:
-                    raise Exception(f"订单执行失败: {execution_result.error_message}")
-            finally:
-                # 🔓 执行完成后移除标记（无论成功或失败）
-                await self._unmark_twap_execution(symbol)
+                    if final_quantity == 0:
+                        raise Exception("分批建仓未成交")
+                finally:
+                    # 🔓 执行完成后移除标记
+                    await self._unmark_twap_execution(symbol)
 
-            # 使用平均价格和填充数量
-            final_price = execution_result.average_price if execution_result.average_price > 0 else order_price
-            final_quantity = execution_result.filled_quantity if execution_result.filled_quantity > 0 else quantity
+            else:
+                # 使用传统TWAP策略（一次性建仓，分批执行降低冲击）
+                order_request = OrderRequest(
+                    symbol=symbol,
+                    side="BUY",
+                    quantity=quantity,
+                    order_type="LIMIT",
+                    limit_price=order_price,
+                    strategy=ExecutionStrategy.TWAP,  # 使用TWAP策略
+                    urgency=5,  # 中等紧急度
+                    max_slippage=0.01,  # 允许1%滑点
+                    signal=signal,
+                    metadata={
+                        "signal_type": signal_type,
+                        "score": score,
+                        "stop_loss": signal.get('stop_loss'),
+                        "take_profit": signal.get('take_profit')
+                    }
+                )
+
+                # 🔒 标记TWAP执行状态（防止重复信号，持续1小时）
+                await self._mark_twap_execution(symbol, duration_seconds=3600)
+
+                # 执行TWAP订单
+                logger.info(f"📊 使用TWAP策略执行订单（将在30分钟内分批下单）...")
+                try:
+                    execution_result = await self.smart_router.execute_order(order_request)
+
+                    if not execution_result.success:
+                        raise Exception(f"订单执行失败: {execution_result.error_message}")
+                finally:
+                    # 🔓 执行完成后移除标记（无论成功或失败）
+                    await self._unmark_twap_execution(symbol)
+
+                # 使用实际成交的数量和价格（不使用默认值）
+                final_price = execution_result.average_price
+                final_quantity = execution_result.filled_quantity
+
+            # 🔥 检查是否有实际成交
+            if final_quantity == 0:
+                logger.error(
+                    f"\n❌ TWAP订单未成交: {execution_result.order_id}\n"
+                    f"   标的: {symbol}\n"
+                    f"   类型: {signal_type}\n"
+                    f"   评分: {score}/100\n"
+                    f"   请求数量: {quantity}股\n"
+                    f"   实际成交: 0股\n"
+                    f"   原因: {execution_result.error_message or '未知'}"
+                )
+                # 不更新持仓，直接返回（在外层会抛出异常）
+                raise Exception(f"订单未成交: {execution_result.error_message or '订单被拒绝'}")
 
             logger.success(
                 f"\n✅ TWAP开仓订单已完成: {execution_result.order_id}\n"
                 f"   标的: {symbol}\n"
                 f"   类型: {signal_type}\n"
                 f"   评分: {score}/100\n"
-                f"   数量: {final_quantity}股 ({num_lots}手 × {lot_size}股/手)\n"
+                f"   数量: {final_quantity}股 ({final_quantity//lot_size}手 × {lot_size}股/手)\n"
                 f"   平均价: ${final_price:.2f}\n"
                 f"   总额: ${final_price * final_quantity:.2f}\n"
                 f"   滑点: {execution_result.slippage*100:.2f}%\n"
@@ -497,6 +539,7 @@ class OrderExecutor:
             }
 
             # 🔥 【关键修复】立即更新Redis持仓（防止重复开仓）
+            # 只有实际成交时才更新持仓
             try:
                 await self.position_manager.add_position(
                     symbol=symbol,
@@ -828,16 +871,19 @@ class OrderExecutor:
         # 基础预算（总资产的百分比）
         base_budget = net_assets * self.min_position_size_pct
 
-        # 根据评分调整预算
-        if score >= 60:
-            # 强买入信号：分配更多（20-30%）
-            budget_pct = 0.20 + (score - 60) / 400  # 60分=20%, 100分=30%
+        # 根据评分调整预算（更激进的高分信号仓位）
+        if score >= 80:
+            # 极强买入信号：重仓（30-40%）
+            budget_pct = 0.30 + (score - 80) / 200  # 80分=30%, 100分=40%
+        elif score >= 60:
+            # 强买入信号：标准仓（20-30%）
+            budget_pct = 0.20 + (score - 60) / 200  # 60分=20%, 80分=30%
         elif score >= 45:
-            # 买入信号：中等（10-20%）
-            budget_pct = 0.10 + (score - 45) / 150  # 45分=10%, 60分=20%
+            # 买入信号：试探性小仓位（5-12%）
+            budget_pct = 0.05 + (score - 45) / 200  # 45分=5%, 59分=12%
         else:
-            # 弱买入信号：较少（5-10%）
-            budget_pct = 0.05 + (score - 30) / 300  # 30分=5%, 45分=10%
+            # 低于45分：不应该生成信号（WEAK_BUY已禁用）
+            budget_pct = 0.05  # 兜底最小值
 
         # 限制在合理范围内
         budget_pct = max(self.min_position_size_pct, min(budget_pct, self.max_position_size_pct))
@@ -1179,15 +1225,20 @@ class OrderExecutor:
 
     async def _consume_batch(self) -> list[Dict]:
         """
-        收集一批信号（批量决策窗口）
+        收集一批信号（动态批量决策窗口）
 
-        策略：等待signal_batch_window秒，收集最多signal_batch_size个信号
-        止损/止盈信号（priority >= stop_loss_priority）立即返回，不等待
+        策略：
+        - 如果队列<=2个信号：快速通道，立即处理（0延迟）
+        - 如果队列>2个信号：批次收集，等待signal_batch_window秒优化顺序
+        - 止损/止盈信号（priority >= stop_loss_priority）始终立即执行
 
         Returns:
             list[Dict]: 信号列表，按score降序排列
         """
         import time
+
+        # 🔥 动态决策：检查队列大小决定是否使用批次模式
+        queue_size = await self.signal_queue.get_queue_size()
 
         batch = []
         batch_start = time.time()
@@ -1195,7 +1246,19 @@ class OrderExecutor:
         batch_size = self.settings.signal_batch_size
         stop_loss_priority = self.settings.stop_loss_priority
 
-        logger.debug(f"📦 开始收集信号批次（窗口={batch_window}秒，最多{batch_size}个）")
+        # 🔥 传递TTL配置
+        signal_ttl = self.settings.signal_ttl_seconds
+        max_delay = self.settings.max_delay_seconds
+
+        # 🔥 快速通道：信号稀少时立即处理，不等待
+        if queue_size <= 2:
+            logger.debug(f"⚡ 快速通道: 队列仅{queue_size}个信号，立即处理（跳过批次等待）")
+            batch_window = 0  # 不等待，立即收集
+        else:
+            logger.debug(f"📦 批次模式: 队列有{queue_size}个信号，使用批次收集（窗口={batch_window}秒）")
+
+        consecutive_empty_attempts = 0  # 🔥 连续空尝试计数
+        max_empty_attempts = 3  # 🔥 最多3次连续空尝试
 
         while len(batch) < batch_size:
             # 计算剩余等待时间
@@ -1203,18 +1266,29 @@ class OrderExecutor:
             remaining_time = batch_window - elapsed
 
             if remaining_time <= 0:
-                # 时间窗口已满
-                logger.debug(f"  ⏰ 批次收集窗口已满（{batch_window}秒）")
+                # 时间窗口已满（快速通道时batch_window=0，立即触发）
+                if batch_window == 0:
+                    logger.debug(f"  ⚡ 快速通道：已收集{len(batch)}个信号，立即返回")
+                else:
+                    logger.debug(f"  ⏰ 批次收集窗口已满（{batch_window}秒）")
                 break
 
             try:
-                # 尝试消费信号（带超时）
+                # 🔥 传递TTL参数给consume_signal
+                # 🔥 快速通道时使用更短的超时时间（0.1秒）
+                timeout = 0.1 if batch_window == 0 else min(remaining_time, 1.0)
+
                 signal = await asyncio.wait_for(
-                    self.signal_queue.consume_signal(),
-                    timeout=min(remaining_time, 1.0)  # 最多等待1秒
+                    self.signal_queue.consume_signal(
+                        signal_ttl_seconds=signal_ttl,
+                        max_delay_seconds=max_delay
+                    ),
+                    timeout=timeout
                 )
 
                 if signal:
+                    consecutive_empty_attempts = 0  # 🔥 重置计数器
+
                     priority = signal.get('score', 0)
                     symbol = signal.get('symbol', 'N/A')
                     signal_type = signal.get('type', 'UNKNOWN')
@@ -1228,14 +1302,42 @@ class OrderExecutor:
                         break
 
                     batch.append(signal)
+                else:
+                    # 🔥 队列为空，增加计数
+                    consecutive_empty_attempts += 1
+
+                    # 🔥 快速通道：第一次为空就立即退出
+                    if batch_window == 0 and len(batch) == 0:
+                        logger.debug(f"  ⚡ 快速通道：队列为空，立即返回")
+                        break
+
+                    if consecutive_empty_attempts >= max_empty_attempts:
+                        # 🔥 连续多次为空，退出循环
+                        logger.debug(
+                            f"  💤 连续{consecutive_empty_attempts}次队列为空，"
+                            f"可能只有延迟信号，结束批次收集"
+                        )
+                        break
 
             except asyncio.TimeoutError:
-                # 超时，继续等待或结束
+                # 超时，也算作空尝试
+                # 🔥 快速通道：超时立即退出
+                if batch_window == 0:
+                    logger.debug(f"  ⚡ 快速通道：超时，已收集{len(batch)}个信号，立即返回")
+                    break
+
                 if len(batch) > 0:
                     # 已有信号，继续等待看是否有更多信号
                     continue
                 else:
-                    # 无信号且时间未到，继续等待
+                    # 无信号且时间未到
+                    consecutive_empty_attempts += 1
+                    if consecutive_empty_attempts >= max_empty_attempts:
+                        logger.debug(
+                            f"  💤 连续{consecutive_empty_attempts}次超时，"
+                            f"结束批次收集"
+                        )
+                        break
                     continue
             except Exception as e:
                 logger.warning(f"  ⚠️ 消费信号时出错: {e}")
@@ -1280,8 +1382,7 @@ class OrderExecutor:
             return 0
 
         logger.info(
-            f"♻️ 重新入队{len(remaining_signals)}个信号（{reason}），"
-            f"{self.settings.funds_retry_delay}分钟后重试"
+            f"♻️ 重新入队{len(remaining_signals)}个信号（{reason}）"
         )
 
         requeued_count = 0
@@ -1303,10 +1404,17 @@ class OrderExecutor:
             # 增加重试计数
             signal['retry_count'] = retry_count + 1
 
+            # 🔥 智能退避：延迟时间随重试次数增加
+            # 第1次: 5分钟，第2次: 10分钟，第3次: 15分钟...
+            delay_minutes = self.settings.funds_retry_delay * signal['retry_count']
+
+            # 🔥 限制最大延迟不超过30分钟
+            delay_minutes = min(delay_minutes, 30)
+
             # 延迟重新入队
             success = await self.signal_queue.requeue_with_delay(
                 signal,
-                delay_minutes=self.settings.funds_retry_delay,
+                delay_minutes=delay_minutes,
                 priority_penalty=20  # 每次重试降低20分
             )
 
@@ -1314,12 +1422,150 @@ class OrderExecutor:
                 requeued_count += 1
                 logger.info(
                     f"  ✅ {symbol} 已重新入队（第{signal['retry_count']}次重试，"
-                    f"分数{score}→{score-20}）"
+                    f"{delay_minutes}分钟后重试，分数{score}→{score-20}）"
                 )
             else:
                 logger.error(f"  ❌ {symbol} 重新入队失败")
 
         return requeued_count
+
+    async def _execute_staged_buy(
+        self,
+        signal: Dict,
+        total_budget: float,
+        current_price: float
+    ) -> tuple[int, float]:
+        """
+        分批建仓策略（根据信号强度决定分批数量）
+
+        Args:
+            signal: 信号数据
+            total_budget: 总预算
+            current_price: 当前价格
+
+        Returns:
+            (总成交数量, 平均价格)
+        """
+        score = signal.get('score', 0)
+        symbol = signal['symbol']
+
+        # 根据信号强度决定建仓策略
+        if score >= 80:
+            # 极强信号：一次性建仓（信号强，仓位重）
+            stages = [(1.0, "全仓")]
+            logger.info(f"  📊 建仓策略: 极强信号({score}分)，一次性全仓建仓")
+        elif score >= 60:
+            # 强信号：分两批（60% + 40%）
+            stages = [(0.6, "首批"), (0.4, "加仓")]
+            logger.info(f"  📊 建仓策略: 强信号({score}分)，分2批建仓（60%+40%）")
+        else:
+            # BUY信号（45-59分）：一次性建仓（仓位本就很小5-12%，无需分批）
+            stages = [(1.0, "试探仓")]
+            logger.info(f"  📊 建仓策略: 一般信号({score}分)，一次性试探建仓（仓位小）")
+
+        total_filled = 0
+        total_value = 0.0
+
+        for idx, (stage_pct, stage_name) in enumerate(stages):
+            stage_budget = total_budget * stage_pct
+
+            # 计算本批次数量
+            lot_size = await self.lot_size_helper.get_lot_size(symbol, self.quote_client)
+            quantity = self.lot_size_helper.calculate_order_quantity(
+                symbol, stage_budget, current_price, lot_size
+            )
+
+            if quantity <= 0:
+                logger.warning(f"  ⚠️ {stage_name}阶段预算不足，跳过")
+                continue
+
+            logger.info(
+                f"  📈 {stage_name}阶段: 预算=${stage_budget:,.2f}, "
+                f"数量={quantity}股 ({quantity//lot_size}手)"
+            )
+
+            # 执行订单（使用TWAP策略）
+            order_request = OrderRequest(
+                symbol=symbol,
+                side="BUY",
+                quantity=quantity,
+                order_type="LIMIT",
+                limit_price=current_price,
+                strategy=ExecutionStrategy.TWAP,
+                urgency=5,
+                max_slippage=0.01,
+                signal=signal,
+                metadata={"stage": stage_name, "stage_pct": stage_pct, "stage_num": idx + 1}
+            )
+
+            try:
+                result = await self.smart_router.execute_order(order_request)
+
+                if result.success and result.filled_quantity > 0:
+                    total_filled += result.filled_quantity
+                    total_value += result.filled_quantity * result.average_price
+
+                    logger.success(
+                        f"  ✅ {stage_name}阶段成交: {result.filled_quantity}股 @ "
+                        f"${result.average_price:.2f}"
+                    )
+
+                    # 如果不是最后一批，等待一段时间观察行情
+                    if idx < len(stages) - 1:
+                        wait_minutes = self.stage_interval_minutes
+                        logger.info(f"  ⏳ 等待{wait_minutes}分钟后评估是否继续加仓...")
+                        await asyncio.sleep(wait_minutes * 60)
+
+                        # 重新获取当前价格
+                        try:
+                            quote = await self.quote_client.get_realtime_quote([symbol])
+                            if quote and len(quote) > 0:
+                                new_price = float(quote[0].last_done)
+                                price_change_pct = (new_price - current_price) / current_price * 100
+
+                                logger.info(
+                                    f"  📊 价格变化: ${current_price:.2f} → ${new_price:.2f} "
+                                    f"({price_change_pct:+.2f}%)"
+                                )
+
+                                # 如果价格涨幅过大（>3%），可能不适合继续加仓
+                                if price_change_pct > 3:
+                                    logger.warning(
+                                        f"  ⚠️ 价格涨幅较大({price_change_pct:+.2f}%)，"
+                                        f"取消后续加仓"
+                                    )
+                                    break
+
+                                # 更新当前价格
+                                current_price = new_price
+                        except Exception as e:
+                            logger.error(f"  ❌ 获取最新价格失败: {e}，继续使用原价格")
+                else:
+                    logger.error(f"  ❌ {stage_name}阶段失败: {result.error_message}")
+                    # 如果第一批就失败，直接退出
+                    if idx == 0:
+                        break
+                    # 非第一批失败，尝试继续
+                    continue
+
+            except Exception as e:
+                logger.error(f"  ❌ {stage_name}阶段异常: {e}")
+                if idx == 0:
+                    break
+                continue
+
+        # 计算平均价格
+        avg_price = total_value / total_filled if total_filled > 0 else 0
+
+        if total_filled > 0:
+            logger.success(
+                f"  🎯 分批建仓完成: 总计成交{total_filled}股, "
+                f"平均价格${avg_price:.2f}"
+            )
+        else:
+            logger.error(f"  ❌ 分批建仓失败: 所有批次均未成交")
+
+        return total_filled, avg_price
 
 
 async def main(account_id: str | None = None):

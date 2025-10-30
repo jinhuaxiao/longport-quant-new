@@ -145,7 +145,7 @@ class SmartPositionRotator:
                 symbol=symbol,
                 period=openapi.Period.Day,
                 adjust_type=openapi.AdjustType.NoAdjust,
-                offset=0,
+                forward=False,  # False表示向后查询历史数据
                 count=60
             )
 

@@ -57,6 +57,9 @@ class SignalQueue:
         # 连接会在第一次使用时创建
         self._redis = None
 
+        # 日志限流：记录上次输出空队列日志的时间
+        self._last_empty_log_time = 0
+
     async def _get_redis(self):
         """获取Redis连接（懒加载）"""
         if self._redis is None:
@@ -208,7 +211,9 @@ class SignalQueue:
     async def consume_signal(
         self,
         timeout: Optional[float] = None,
-        auto_recover: bool = True
+        auto_recover: bool = True,
+        signal_ttl_seconds: int = 3600,
+        max_delay_seconds: int = 1800
     ) -> Optional[Dict]:
         """
         从队列消费一个信号（优先级最高的）
@@ -216,6 +221,8 @@ class SignalQueue:
         Args:
             timeout: 超时时间（秒），None表示立即返回
             auto_recover: 是否自动恢复僵尸信号
+            signal_ttl_seconds: 信号过期时间（秒），超过此时间的信号将被丢弃
+            max_delay_seconds: 延迟信号最大等待时间（秒），超过此时间的延迟信号将被丢弃
 
         Returns:
             Dict: 信号数据，如果队列为空返回None
@@ -227,45 +234,108 @@ class SignalQueue:
             if auto_recover:
                 await self.recover_zombie_signals(timeout_seconds=300)
 
-            # 使用ZPOPMIN获取最高优先级（最低负分）的信号
-            # 因为score是负数，最小的score（如-65）对应最高的优先级（65）
-            result = await redis.zpopmin(self.queue_key, count=1)
+            # 🔥 尝试多次获取可用信号（避免单个信号的无限循环）
+            max_attempts = 10  # 最多尝试10次
+            skipped_signals = []  # 记录被跳过的信号
 
-            if not result:
-                return None
+            for attempt in range(max_attempts):
+                # 使用ZPOPMIN获取最高优先级（最低负分）的信号
+                # 因为score是负数，最小的score（如-65）对应最高的优先级（65）
+                result = await redis.zpopmin(self.queue_key, count=1)
 
-            signal_json, score = result[0]
-            signal = self._deserialize_signal(signal_json)
+                if not result:
+                    # 队列为空，将之前跳过的信号放回
+                    for sig_json, sig_score in skipped_signals:
+                        await redis.zadd(self.queue_key, {sig_json: sig_score})
+                    return None
 
-            # 检查是否需要延迟处理
-            if 'retry_after' in signal:
-                if time.time() < signal['retry_after']:
-                    # 未到重试时间，放回队列
-                    await redis.zadd(self.queue_key, {signal_json: score})
-                    logger.debug(f"⏰ 信号未到重试时间，跳过: {signal.get('symbol')}")
-                    return None  # 继续取下一个
+                signal_json, score = result[0]
+                signal = self._deserialize_signal(signal_json)
 
-            # 保存原始JSON（用于后续删除）
-            # ⚠️ 重要：必须使用原始JSON，因为signal对象会被修改
-            signal['_original_json'] = signal_json
+                # 🔥 检查信号是否已过期（基于queued_at时间）
+                queued_at_str = signal.get('queued_at')
+                if queued_at_str:
+                    try:
+                        queued_at = datetime.fromisoformat(queued_at_str)
+                        signal_age = (datetime.now() - queued_at).total_seconds()
 
-            # 添加处理时间戳
-            signal['processing_started_at'] = datetime.now().isoformat()
+                        if signal_age > signal_ttl_seconds:
+                            logger.warning(
+                                f"⏰ 信号已过期（{signal_age/60:.1f}分钟 > {signal_ttl_seconds/60:.1f}分钟）: "
+                                f"{signal.get('symbol')}，直接丢弃"
+                            )
+                            # 不放回队列，直接丢弃，继续获取下一个
+                            continue
+                    except Exception as e:
+                        logger.warning(f"⚠️ 解析信号时间失败: {e}，跳过此信号")
+                        continue
 
-            # 移到处理中队列（用于监控和恢复）
-            # ⚠️ 使用原始JSON，而非修改后的signal
-            await redis.zadd(
-                self.processing_key,
-                {signal_json: time.time()}
-            )
+                # 检查是否需要延迟处理
+                if 'retry_after' in signal:
+                    if time.time() < signal['retry_after']:
+                        # 🔥 检查延迟时间是否超过最大等待时间
+                        delay_duration = signal['retry_after'] - time.time()
 
-            logger.debug(
-                f"📥 从队列消费信号: {signal['symbol']}, "
-                f"优先级={-score:.0f}, "
-                f"剩余队列长度={await self.get_queue_size()}"
-            )
+                        if delay_duration > max_delay_seconds:
+                            logger.warning(
+                                f"⏰ 延迟信号超过最大等待时间（{delay_duration/60:.1f}分钟 > {max_delay_seconds/60:.1f}分钟），直接丢弃: "
+                                f"{signal.get('symbol')}"
+                            )
+                            # 不放回队列，直接丢弃
+                            continue
 
-            return signal
+                        # 未到重试时间，记录并继续尝试下一个
+                        skipped_signals.append((signal_json, score))
+
+                        # 只在第一次遇到时记录日志（避免刷屏）
+                        if len(skipped_signals) == 1:
+                            retry_in = signal['retry_after'] - time.time()
+                            logger.debug(
+                                f"⏰ 信号未到重试时间，尝试获取其他信号: {signal.get('symbol')} "
+                                f"(还需等待{retry_in:.0f}秒)"
+                            )
+                        continue
+
+                # 找到可用信号，将之前跳过的信号放回队列
+                for sig_json, sig_score in skipped_signals:
+                    await redis.zadd(self.queue_key, {sig_json: sig_score})
+
+                # 保存原始JSON（用于后续删除）
+                # ⚠️ 重要：必须使用原始JSON，因为signal对象会被修改
+                signal['_original_json'] = signal_json
+
+                # 添加处理时间戳
+                signal['processing_started_at'] = datetime.now().isoformat()
+
+                # 移到处理中队列（用于监控和恢复）
+                # ⚠️ 使用原始JSON，而非修改后的signal
+                await redis.zadd(
+                    self.processing_key,
+                    {signal_json: time.time()}
+                )
+
+                logger.debug(
+                    f"📥 从队列消费信号: {signal['symbol']}, "
+                    f"优先级={-score:.0f}, "
+                    f"剩余队列长度={await self.get_queue_size()}"
+                )
+
+                return signal
+
+            # 🔥 所有信号都未到重试时间，将它们放回队列
+            for sig_json, sig_score in skipped_signals:
+                await redis.zadd(self.queue_key, {sig_json: sig_score})
+
+            if skipped_signals:
+                # 日志限流：最多每30秒记录一次，避免刷屏
+                current_time = time.time()
+                if current_time - self._last_empty_log_time >= 30:
+                    logger.debug(
+                        f"⏰ 队列中所有信号({len(skipped_signals)}个)都未到重试时间，暂无可处理信号"
+                    )
+                    self._last_empty_log_time = current_time
+
+            return None
 
         except Exception as e:
             logger.error(f"❌ 消费信号失败: {e}")

@@ -18,8 +18,8 @@ def test_account_config(account_id: str | None = None):
         print(f"\n✅ 配置加载成功!")
         print(f"\n账号信息:")
         print(f"  • Account ID: {settings.account_id}")
-        print(f"  • APP KEY: {settings.longport_credentials.app_key[:20]}...")
-        print(f"  • Region: {settings.longport_credentials.region}")
+        print(f"  • APP KEY: {settings.longport_app_key[:20]}...")
+        print(f"  • Region: {settings.longport_region}")
 
         print(f"\n队列配置:")
         print(f"  • Signal Queue: {settings.signal_queue_key}")

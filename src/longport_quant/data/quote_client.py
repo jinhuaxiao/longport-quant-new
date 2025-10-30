@@ -157,16 +157,29 @@ class QuoteDataClient:
         symbol: str,
         period: openapi.Period,
         adjust_type: openapi.AdjustType,
-        offset: int,
+        forward: bool,
         count: int,
     ) -> List[openapi.Candlestick]:
+        """
+        获取历史K线数据（通过偏移量）
+
+        Args:
+            symbol: 标的代码
+            period: 周期
+            adjust_type: 复权类型
+            forward: 是否向前查询（True=向前，False=向后查询历史数据）
+            count: K线数量
+
+        Returns:
+            K线列表
+        """
         ctx = await self._ensure_context()
         return await asyncio.to_thread(
             ctx.history_candlesticks_by_offset,
             symbol,
             period,
             adjust_type,
-            offset,
+            forward,
             count,
         )
 

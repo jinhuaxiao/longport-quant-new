@@ -16,15 +16,6 @@ from pydantic_settings.sources import (
 )
 
 
-class LongportCredentials(BaseSettings):
-    app_key: str = Field(..., alias="LONGPORT_APP_KEY")
-    app_secret: str = Field(..., alias="LONGPORT_APP_SECRET")
-    access_token: str | None = Field(None, alias="LONGPORT_ACCESS_TOKEN")
-    region: str = Field("hk", alias="LONGPORT_REGION")
-
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
-
 class BackupOrderConfig(BaseSettings):
     """备份条件单智能决策配置"""
 
@@ -78,6 +69,7 @@ class Settings(BaseSettings):
     environment: str = Field("development", alias="ENVIRONMENT")
     timezone: str = Field("Asia/Hong_Kong", alias="TRADING_TIMEZONE")
 
+    # Longport API 配置
     longport_api_base: AnyHttpUrl = Field(
         "https://openapi.longportapp.com", alias="LONGPORT_API_BASE"
     )
@@ -87,7 +79,12 @@ class Settings(BaseSettings):
     longport_trade_ws_url: AnyUrl = Field(
         "wss://openapi-trade.longportapp.com/v1/trade", alias="LONGPORT_TRADE_WS_URL"
     )
-    longport_credentials: LongportCredentials = Field(default_factory=LongportCredentials)
+
+    # Longport API 凭证（直接在 Settings 类中，支持账号特定配置）
+    longport_app_key: str = Field(..., alias="LONGPORT_APP_KEY")
+    longport_app_secret: str = Field(..., alias="LONGPORT_APP_SECRET")
+    longport_access_token: str | None = Field(None, alias="LONGPORT_ACCESS_TOKEN")
+    longport_region: str = Field("hk", alias="LONGPORT_REGION")
 
     database_dsn: str = Field(
         "postgresql+asyncpg://user:password@localhost:5432/longport",
@@ -108,8 +105,13 @@ class Settings(BaseSettings):
     signal_batch_size: int = Field(5, alias="SIGNAL_BATCH_SIZE")  # 每批最多5个信号
     stop_loss_priority: int = Field(999, alias="STOP_LOSS_PRIORITY")  # 止损止盈优先级（立即执行）
     min_signal_score: int = Field(40, alias="MIN_SIGNAL_SCORE")  # 最低分数阈值
-    funds_retry_max: int = Field(3, alias="FUNDS_RETRY_MAX")  # 资金不足最大重试次数
-    funds_retry_delay: int = Field(30, alias="FUNDS_RETRY_DELAY")  # 资金不足重试延迟（分钟）
+    funds_retry_max: int = Field(5, alias="FUNDS_RETRY_MAX")  # 资金不足最大重试次数
+    funds_retry_delay: int = Field(5, alias="FUNDS_RETRY_DELAY")  # 资金不足重试延迟（分钟）
+
+    # 信号过期和队列优化配置
+    signal_ttl_seconds: int = Field(3600, alias="SIGNAL_TTL_SECONDS")  # 信号过期时间（秒，默认1小时）
+    max_delay_seconds: int = Field(1800, alias="MAX_DELAY_SECONDS")  # 延迟信号最大等待时间（秒，默认30分钟）
+    empty_queue_sleep: float = Field(10.0, alias="EMPTY_QUEUE_SLEEP")  # 队列为空时休眠时间（秒）
 
     watchlist_path: Path = Field(Path("configs/watchlist.yml"), alias="WATCHLIST_PATH")
     strategy_modules: List[str] = Field(default_factory=list, alias="STRATEGY_MODULES")
@@ -232,4 +234,4 @@ def get_settings(account_id: str | None = None) -> Settings:
     return Settings(account_id=account_id)  # type: ignore[call-arg]
 
 
-__all__ = ["Settings", "get_settings", "LongportCredentials", "BackupOrderConfig"]
+__all__ = ["Settings", "get_settings", "BackupOrderConfig"]

@@ -1,5 +1,6 @@
 """Logging configuration utilities."""
 
+import sys
 from pathlib import Path
 
 from loguru import logger
@@ -12,12 +13,15 @@ def configure_logging(settings: Settings) -> None:
 
     logger.remove()
     level = settings.log_level.upper()
+
+    # 配置控制台输出，使用 sys.stdout 确保正确的 UTF-8 编码
     logger.add(
-        sink=lambda msg: print(msg, end=""),
+        sink=sys.stdout,
         level=level,
         backtrace=True,
         diagnose=False,
         enqueue=True,
+        colorize=True,  # 启用彩色输出
     )
 
     log_path = Path(settings.log_path)

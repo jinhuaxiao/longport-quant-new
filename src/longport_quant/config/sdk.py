@@ -13,12 +13,10 @@ from longport_quant.config.settings import Settings
 def build_sdk_config(settings: Settings) -> openapi.Config:
     """Create a reusable SDK Config from application settings via SDK helpers."""
 
-    credentials = settings.longport_credentials
-
     overrides = {
-        "LONGPORT_APP_KEY": credentials.app_key,
-        "LONGPORT_APP_SECRET": credentials.app_secret,
-        "LONGPORT_ACCESS_TOKEN": credentials.access_token or "",
+        "LONGPORT_APP_KEY": settings.longport_app_key,
+        "LONGPORT_APP_SECRET": settings.longport_app_secret,
+        "LONGPORT_ACCESS_TOKEN": settings.longport_access_token or "",
     }
 
     for env_key, value in overrides.items():
@@ -31,7 +29,7 @@ def build_sdk_config(settings: Settings) -> openapi.Config:
         logger.error("Failed to construct SDK config: {}", exc)
         raise
 
-    if not credentials.access_token:
+    if not settings.longport_access_token:
         try:
             logger.info("Refreshing Longport access token via SDK")
             config.refresh_access_token()

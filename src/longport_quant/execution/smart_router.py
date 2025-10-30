@@ -560,12 +560,18 @@ class SmartOrderRouter:
             if filled_qty < request.quantity:
                 logger.warning(f"Partial fill: {filled_qty}/{request.quantity}")
 
+            # 🔥 判断订单是否成功：至少有部分成交
+            success = filled_qty > 0
+            if not success:
+                logger.error(f"  ❌ 订单未成交（filled_qty=0），标记为失败")
+
             return ExecutionResult(
-                success=True,
+                success=success,
                 order_id=resp.order_id,
                 filled_quantity=filled_qty,
                 average_price=avg_price,
-                execution_time=datetime.now()
+                execution_time=datetime.now(),
+                error_message="订单被拒绝或未成交" if not success else None
             )
 
         except Exception as e:
@@ -1020,63 +1026,69 @@ class SmartOrderRouter:
             try:
                 poll_count += 1
 
-                # Check order status (wrap synchronous call)
-                orders = await asyncio.to_thread(self.trade_context.today_orders)
+                # 🔥 直接通过 order_id 查询订单（精确查询，避免多账号混淆）
+                # 使用 order_detail 而不是 today_orders，确保查询的是当前账号的订单
+                order = await asyncio.to_thread(self.trade_context.order_detail, order_id)
 
-                order_found = False
-                for order in orders:
-                    if order.order_id == order_id:
-                        order_found = True
+                # 🔥 记录订单状态（每5秒记录一次）
+                # Use correct attribute names: executed_quantity, executed_price
+                if poll_count % 5 == 1 or poll_count == 1:
+                    logger.debug(
+                        f"  📊 订单状态检查 (#{poll_count}): "
+                        f"status={order.status}, "
+                        f"executed={order.executed_quantity}/{order.quantity}, "
+                        f"price=${order.price}"
+                    )
 
-                        # 🔥 记录订单状态（每5秒记录一次）
-                        # Use correct attribute names: executed_quantity, executed_price
-                        if poll_count % 5 == 1 or poll_count == 1:
-                            logger.debug(
-                                f"  📊 订单状态检查 (#{poll_count}): "
-                                f"status={order.status}, "
-                                f"executed={order.executed_quantity}/{order.quantity}, "
-                                f"price=${order.price}"
-                            )
+                # Convert status to string for comparison
+                status_str = str(order.status)
 
-                        # Convert status to string for comparison
-                        status_str = str(order.status)
+                if "Filled" in status_str and "Partially" not in status_str:
+                    # Fully filled
+                    # 转换为 int 避免 Decimal 类型错误
+                    filled_quantity = int(order.executed_quantity)
+                    if order.executed_quantity > 0:
+                        # Use executed_price directly from order
+                        avg_price = float(order.executed_price)
+                        logger.info(f"  ✅ 订单已完全成交: {filled_quantity}股 @ ${avg_price:.2f}")
+                        return filled_quantity, avg_price
 
-                        if "Filled" in status_str and "Partially" not in status_str:
-                            # Fully filled
-                            # 转换为 int 避免 Decimal 类型错误
-                            filled_quantity = int(order.executed_quantity)
-                            if order.executed_quantity > 0:
-                                # Use executed_price directly from order
-                                avg_price = float(order.executed_price)
-                                logger.info(f"  ✅ 订单已完全成交: {filled_quantity}股 @ ${avg_price:.2f}")
-                                return filled_quantity, avg_price
+                elif "PartiallyFilled" in status_str or "Partially" in status_str:
+                    # Partially filled - continue waiting
+                    # 转换为 int 避免 Decimal 类型错误
+                    filled_quantity = int(order.executed_quantity)
+                    if poll_count % 5 == 0:
+                        logger.info(f"  ⏳ 订单部分成交: {filled_quantity}股，继续等待...")
 
-                        elif "PartiallyFilled" in status_str or "Partially" in status_str:
-                            # Partially filled - continue waiting
-                            # 转换为 int 避免 Decimal 类型错误
-                            filled_quantity = int(order.executed_quantity)
-                            if poll_count % 5 == 0:
-                                logger.info(f"  ⏳ 订单部分成交: {filled_quantity}股，继续等待...")
+                elif any(x in status_str for x in ["Rejected", "Cancelled", "Expired"]):
+                    logger.warning(f"  ❌ 订单异常状态: {status_str}")
+                    # Log the rejection reason if available
+                    if hasattr(order, 'msg') and order.msg:
+                        logger.warning(f"  ❌ 拒绝原因: {order.msg}")
+                    # 打印更多订单详细信息以便调试
+                    logger.warning(f"  📋 订单详情: symbol={order.symbol}, side={order.side}, "
+                                 f"quantity={order.quantity}, price={order.price}, "
+                                 f"type={order.order_type}")
+                    # 尝试打印所有可用属性
+                    try:
+                        order_attrs = {k: v for k, v in vars(order).items()
+                                     if not k.startswith('_') and v is not None}
+                        logger.debug(f"  📊 订单所有属性: {order_attrs}")
+                    except Exception as e:
+                        logger.debug(f"  ⚠️ 无法获取订单属性: {e}")
+                    return 0, 0.0
 
-                        elif any(x in status_str for x in ["Rejected", "Cancelled", "Expired"]):
-                            logger.warning(f"  ❌ 订单异常状态: {status_str}")
-                            # Log the rejection reason if available
-                            if hasattr(order, 'msg') and order.msg:
-                                logger.warning(f"  ❌ 拒绝原因: {order.msg}")
-                            return 0, 0.0
-
-                        elif "NewStatus" in status_str or "Pending" in status_str:
-                            # Order is pending, continue waiting
-                            if poll_count % 10 == 1:
-                                logger.debug(f"  ⏳ 订单等待成交中: {status_str}")
-
-                        break
-
-                if not order_found and poll_count <= 3:
-                    logger.warning(f"  ⚠️ 订单{order_id}在today_orders中未找到 (尝试{poll_count}/3)")
+                elif "NewStatus" in status_str or "Pending" in status_str:
+                    # Order is pending, continue waiting
+                    if poll_count % 10 == 1:
+                        logger.debug(f"  ⏳ 订单等待成交中: {status_str}")
 
             except Exception as e:
-                logger.error(f"  ❌ 检查订单状态时出错: {e}")
+                # 可能是订单刚提交，还未同步到系统，或者是其他错误
+                if poll_count <= 3:
+                    logger.warning(f"  ⚠️ 查询订单{order_id}失败 (尝试{poll_count}/3): {e}")
+                else:
+                    logger.error(f"  ❌ 检查订单状态时出错: {e}")
 
             await asyncio.sleep(1)
 

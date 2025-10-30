@@ -92,7 +92,7 @@ class SignalGenerator:
             "3988.HK": {"name": "中国银行", "sector": "银行"},
             "2318.HK": {"name": "中国平安", "sector": "保险"},
             "1299.HK": {"name": "友邦保险", "sector": "保险"},
-
+            "02378.HK": {"name": "保诚", "sector": "保险"},
             # === 通信（1个）===
             "0941.HK": {"name": "中国移动", "sector": "通信"},
 
@@ -1401,13 +1401,27 @@ class SignalGenerator:
                 logger.info(f"  ⏭️  不生成WEAK_BUY信号 (已禁用，得分={score})")
                 return None
 
-            # 计算止损止盈
+            # 计算止损止盈（根据信号强度动态调整止损距离）
             atr = ind.get('atr', 0)
             if atr and atr > 0:
-                stop_loss = current_price - (2.5 * atr)
+                # 根据信号强度调整止损距离倍数
+                if score >= 80:
+                    stop_multiplier = 2.0  # 极强信号：更紧止损
+                elif score >= 60:
+                    stop_multiplier = 2.5  # 强信号：标准止损
+                else:
+                    stop_multiplier = 3.0  # 一般信号：宽松止损
+
+                stop_loss = current_price - (stop_multiplier * atr)
                 take_profit = current_price + (3.5 * atr)
             else:
-                stop_loss = current_price * 0.95
+                # 无ATR时使用固定百分比
+                if score >= 80:
+                    stop_loss = current_price * 0.96  # -4%
+                elif score >= 60:
+                    stop_loss = current_price * 0.95  # -5%
+                else:
+                    stop_loss = current_price * 0.93  # -7%
                 take_profit = current_price * 1.10
 
             logger.success(
