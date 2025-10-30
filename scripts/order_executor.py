@@ -372,14 +372,35 @@ class OrderExecutor:
 
             # 尝试智能持仓轮换释放资金
             needed_amount = required_cash - available_cash
-            logger.info(
-                f"  🔄 尝试智能持仓轮换释放 ${needed_amount:,.2f}...\n"
-                f"     策略: 卖出评分较低的持仓，为评分{score}分的新信号腾出空间"
-            )
 
-            rotation_success, freed_amount = await self._try_smart_rotation(
-                signal, needed_amount
-            )
+            # 🔥 关键修复：只在确实需要资金且信号质量足够高时才触发轮换
+            if needed_amount > 0 and score >= 60:
+                logger.info(
+                    f"  🔄 尝试智能持仓轮换释放 ${needed_amount:,.2f}...\n"
+                    f"     策略: 卖出评分较低的持仓，为评分{score}分的新信号腾出空间"
+                )
+
+                rotation_success, freed_amount = await self._try_smart_rotation(
+                    signal, needed_amount
+                )
+            elif needed_amount <= 0:
+                # 资金已经足够，不应该到这里
+                logger.warning(
+                    f"  ⚠️ 预算计算异常: needed_amount=${needed_amount:.2f}（资金已充足但quantity=0）\n"
+                    f"     说明: 动态预算${dynamic_budget:.2f}不足以购买1手（需${required_cash:.2f}），"
+                    f"但可用资金${available_cash:.2f}充足"
+                )
+                raise InsufficientFundsError(
+                    f"动态预算不足（预算${dynamic_budget:.2f} < 1手${required_cash:.2f}）"
+                )
+            else:
+                # 低分信号（<60分）不触发轮换，避免为低质量信号卖出好持仓
+                logger.warning(
+                    f"  ⚠️ {symbol}: 信号评分{score}分 < 60分，不触发持仓轮换\n"
+                    f"     说明: 低分信号不应卖出现有持仓，建议等待更高质量的交易机会"
+                )
+                rotation_success = False
+                freed_amount = 0
 
             if rotation_success:
                 logger.success(f"  ✅ 智能轮换成功，已释放 ${freed_amount:,.2f}")
@@ -393,8 +414,7 @@ class OrderExecutor:
                         logger.success(f"  💰 轮换后可用资金: ${available_cash:,.2f}，继续执行订单")
 
                         # 重新计算动态预算和购买数量
-                        net_assets = account.get("net_assets", {}).get(currency, 0)
-                        dynamic_budget = self._calculate_dynamic_budget(score, net_assets, currency, account)
+                        dynamic_budget = self._calculate_dynamic_budget(account, signal)
 
                         quantity = self.lot_size_helper.calculate_order_quantity(
                             symbol, dynamic_budget, current_price, lot_size
@@ -596,84 +616,94 @@ class OrderExecutor:
 
                 # 根据评估结果决定是否提交备份条件单
                 if risk_assessment['should_backup']:
-                    try:
-                        stop_loss = signal.get('stop_loss')
-                        take_profit = signal.get('take_profit')
+                    # 🔥 低分信号保护：分数<60的信号不提交备份条件单（降低探索性仓位风险）
+                    signal_score = signal.get('score', 0)
+                    if signal_score < 60:
+                        logger.info(
+                            f"  ⏭️ 跳过备份条件单: 信号分数较低({signal_score}分 < 60分)，"
+                            f"仅依赖客户端监控止损/止盈（降低误触风险）"
+                        )
+                    else:
+                        try:
+                            stop_loss = signal.get('stop_loss')
+                            take_profit = signal.get('take_profit')
 
-                        if stop_loss and stop_loss > 0:
-                            # 🔥 智能选择：跟踪止损 vs 固定止损
-                            if self.settings.backup_orders.use_trailing_stop:
-                                # 使用跟踪止损（TSLPPCT）- 自动跟随价格上涨锁定利润
-                                stop_result = await self.trade_client.submit_trailing_stop(
-                                    symbol=symbol,
-                                    side="SELL",
-                                    quantity=final_quantity,
-                                    trailing_percent=self.settings.backup_orders.trailing_stop_percent,
-                                    limit_offset=self.settings.backup_orders.trailing_stop_limit_offset,
-                                    expire_days=self.settings.backup_orders.trailing_stop_expire_days,
-                                    remark=f"Trailing Stop {self.settings.backup_orders.trailing_stop_percent*100:.1f}%"
-                                )
-                                backup_stop_order_id = stop_result.get('order_id')
-                                logger.success(
-                                    f"  ✅ 跟踪止损备份单已提交: {backup_stop_order_id} "
-                                    f"(跟踪{self.settings.backup_orders.trailing_stop_percent*100:.1f}%)"
-                                )
-                            else:
-                                # 使用固定止损（LIT）- 传统到价止损
-                                stop_loss_float = float(stop_loss)
-                                stop_result = await self.trade_client.submit_conditional_order(
-                                    symbol=symbol,
-                                    side="SELL",
-                                    quantity=final_quantity,
-                                    trigger_price=stop_loss_float,
-                                    limit_price=stop_loss_float * 0.995,  # 触发后以略低价格限价卖出，确保成交
-                                    remark=f"Backup Stop Loss @ ${stop_loss_float:.2f}"
-                                )
-                                backup_stop_order_id = stop_result.get('order_id')
-                                logger.success(f"  ✅ 固定止损备份条件单已提交: {backup_stop_order_id}")
+                            if stop_loss and stop_loss > 0:
+                                # 🔥 智能选择：跟踪止损 vs 固定止损
+                                if self.settings.backup_orders.use_trailing_stop:
+                                    # 使用跟踪止损（TSLPPCT）- 自动跟随价格上涨锁定利润
+                                    # 🔥 修复：side应该是"BUY"表示保护多头仓位，而非"SELL"
+                                    stop_result = await self.trade_client.submit_trailing_stop(
+                                        symbol=symbol,
+                                        side="BUY",  # 修复：保护多头仓位（买入后持有）
+                                        quantity=final_quantity,
+                                        trailing_percent=self.settings.backup_orders.trailing_stop_percent,
+                                        limit_offset=self.settings.backup_orders.trailing_stop_limit_offset,
+                                        expire_days=self.settings.backup_orders.trailing_stop_expire_days,
+                                        remark=f"Trailing Stop {self.settings.backup_orders.trailing_stop_percent*100:.1f}%"
+                                    )
+                                    backup_stop_order_id = stop_result.get('order_id')
+                                    logger.success(
+                                        f"  ✅ 跟踪止损备份单已提交: {backup_stop_order_id} "
+                                        f"(跟踪{self.settings.backup_orders.trailing_stop_percent*100:.1f}%)"
+                                    )
+                                else:
+                                    # 使用固定止损（LIT）- 传统到价止损
+                                    stop_loss_float = float(stop_loss)
+                                    stop_result = await self.trade_client.submit_conditional_order(
+                                        symbol=symbol,
+                                        side="SELL",
+                                        quantity=final_quantity,
+                                        trigger_price=stop_loss_float,
+                                        limit_price=stop_loss_float * 0.995,  # 触发后以略低价格限价卖出，确保成交
+                                        remark=f"Backup Stop Loss @ ${stop_loss_float:.2f}"
+                                    )
+                                    backup_stop_order_id = stop_result.get('order_id')
+                                    logger.success(f"  ✅ 固定止损备份条件单已提交: {backup_stop_order_id}")
 
-                        if take_profit and take_profit > 0:
-                            # 🔥 智能选择：跟踪止盈 vs 固定止盈（实现"让利润奔跑"）
-                            if self.settings.backup_orders.use_trailing_profit:
-                                # 使用跟踪止盈（TSMPCT）- 不限制上涨空间，仅在回撤时退出
-                                profit_result = await self.trade_client.submit_trailing_profit(
-                                    symbol=symbol,
-                                    side="SELL",
-                                    quantity=final_quantity,
-                                    trailing_percent=self.settings.backup_orders.trailing_profit_percent,
-                                    limit_offset=self.settings.backup_orders.trailing_profit_limit_offset,
-                                    expire_days=self.settings.backup_orders.trailing_profit_expire_days,
-                                    remark=f"Trailing Profit {self.settings.backup_orders.trailing_profit_percent*100:.1f}%"
-                                )
-                                backup_profit_order_id = profit_result.get('order_id')
-                                logger.success(
-                                    f"  ✅ 跟踪止盈备份单已提交: {backup_profit_order_id} "
-                                    f"(跟踪{self.settings.backup_orders.trailing_profit_percent*100:.1f}%)"
-                                )
-                            else:
-                                # 使用固定止盈（LIT）- 传统到价止盈
-                                take_profit_float = float(take_profit)
-                                profit_result = await self.trade_client.submit_conditional_order(
-                                    symbol=symbol,
-                                    side="SELL",
-                                    quantity=final_quantity,
-                                    trigger_price=take_profit_float,
-                                    limit_price=take_profit_float,  # 止盈使用触发价本身
-                                    remark=f"Backup Take Profit @ ${take_profit_float:.2f}"
-                                )
-                                backup_profit_order_id = profit_result.get('order_id')
-                                logger.success(f"  ✅ 固定止盈备份条件单已提交: {backup_profit_order_id}")
+                            if take_profit and take_profit > 0:
+                                # 🔥 智能选择：跟踪止盈 vs 固定止盈（实现"让利润奔跑"）
+                                if self.settings.backup_orders.use_trailing_profit:
+                                    # 使用跟踪止盈（TSMPCT）- 不限制上涨空间，仅在回撤时退出
+                                    # 🔥 修复：side应该是"BUY"表示保护多头仓位，而非"SELL"
+                                    profit_result = await self.trade_client.submit_trailing_profit(
+                                        symbol=symbol,
+                                        side="BUY",  # 修复：保护多头仓位（买入后持有）
+                                        quantity=final_quantity,
+                                        trailing_percent=self.settings.backup_orders.trailing_profit_percent,
+                                        limit_offset=self.settings.backup_orders.trailing_profit_limit_offset,
+                                        expire_days=self.settings.backup_orders.trailing_profit_expire_days,
+                                        remark=f"Trailing Profit {self.settings.backup_orders.trailing_profit_percent*100:.1f}%"
+                                    )
+                                    backup_profit_order_id = profit_result.get('order_id')
+                                    logger.success(
+                                        f"  ✅ 跟踪止盈备份单已提交: {backup_profit_order_id} "
+                                        f"(跟踪{self.settings.backup_orders.trailing_profit_percent*100:.1f}%)"
+                                    )
+                                else:
+                                    # 使用固定止盈（LIT）- 传统到价止盈
+                                    take_profit_float = float(take_profit)
+                                    profit_result = await self.trade_client.submit_conditional_order(
+                                        symbol=symbol,
+                                        side="SELL",
+                                        quantity=final_quantity,
+                                        trigger_price=take_profit_float,
+                                        limit_price=take_profit_float,  # 止盈使用触发价本身
+                                        remark=f"Backup Take Profit @ ${take_profit_float:.2f}"
+                                    )
+                                    backup_profit_order_id = profit_result.get('order_id')
+                                    logger.success(f"  ✅ 固定止盈备份条件单已提交: {backup_profit_order_id}")
 
-                        # 打印策略说明
-                        stop_type = "跟踪止损(TSLPPCT)" if self.settings.backup_orders.use_trailing_stop else "固定止损(LIT)"
-                        profit_type = "跟踪止盈(TSMPCT)" if self.settings.backup_orders.use_trailing_profit else "固定止盈(LIT)"
-                        logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所{stop_type}+{profit_type}（备份）")
+                            # 打印策略说明
+                            stop_type = "跟踪止损(TSLPPCT)" if self.settings.backup_orders.use_trailing_stop else "固定止损(LIT)"
+                            profit_type = "跟踪止盈(TSMPCT)" if self.settings.backup_orders.use_trailing_profit else "固定止盈(LIT)"
+                            logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所{stop_type}+{profit_type}（备份）")
 
-                    except Exception as e:
-                        logger.warning(f"⚠️ 提交备份条件单失败（不影响主流程）: {e}")
-                        import traceback
-                        logger.debug(f"  详细错误: {traceback.format_exc()}")
-                        # 即使备份条件单失败，也继续保存止损设置（客户端监控仍然工作）
+                        except Exception as e:
+                            logger.warning(f"⚠️ 提交备份条件单失败（不影响主流程）: {e}")
+                            import traceback
+                            logger.debug(f"  详细错误: {traceback.format_exc()}")
+                            # 即使备份条件单失败，也继续保存止损设置（客户端监控仍然工作）
                 else:
                     logger.info(f"  ℹ️ 低风险交易，依赖客户端监控（节省成本）")
             else:
@@ -1245,7 +1275,7 @@ class OrderExecutor:
                 new_signal=signal,
                 trade_client=self.trade_client,
                 quote_client=self.quote_client,
-                score_threshold=5  # 新信号需高出5分才替换（降低阈值，更容易轮换）
+                score_threshold=15  # 🔥 提高到15分，避免频繁买卖浪费手续费
             )
 
             if success:
