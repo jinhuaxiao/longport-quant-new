@@ -786,10 +786,18 @@ class OrderExecutor:
         interval = max(3, int(getattr(self.settings, 'regime_update_interval_minutes', 10))) * 60
         while True:
             try:
-                res = await self.regime_classifier.classify(self.quote_client)
+                # 获取市场状态（根据交易时段自动过滤指数）
+                res = await self.regime_classifier.classify(self.quote_client, filter_by_market=True)
+
+                # 如果非交易时段，跳过通知
+                if res.active_market == "NONE":
+                    logger.debug(f"⏰ 非交易时段，跳过Regime检查")
+                    await asyncio.sleep(interval)
+                    continue
+
                 if res.regime != self.current_regime:
                     logger.info(f"📈 Regime变更: {self.current_regime} → {res.regime} | {res.details}")
-                    # 发送Slack通知
+                    # 发送通知
                     if self.slack:
                         try:
                             await self._send_regime_notification(res)
