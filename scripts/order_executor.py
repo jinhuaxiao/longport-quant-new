@@ -29,18 +29,22 @@ from typing import Dict, Optional
 # 添加项目根目录到路径
 sys.path.append(str(Path(__file__).parent.parent))
 
+from longport import openapi
 from longport_quant.config import get_settings
 from longport_quant.execution.client import LongportTradingClient
 from longport_quant.execution.smart_router import SmartOrderRouter, OrderRequest, ExecutionStrategy
 from longport_quant.execution.risk_assessor import RiskAssessor
+from longport_quant.risk.regime import RegimeClassifier
+from longport_quant.risk.rebalancer import RegimeRebalancer
 from longport_quant.data.quote_client import QuoteDataClient
 from longport_quant.messaging import SignalQueue
-from longport_quant.notifications.slack import SlackNotifier
+from longport_quant.notifications import MultiChannelNotifier
 from longport_quant.utils import LotSizeHelper
 from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.stop_manager import StopLossManager
 from longport_quant.persistence.position_manager import RedisPositionManager
 from longport_quant.persistence.db import DatabaseSessionManager
+from datetime import datetime
 
 
 class InsufficientFundsError(Exception):
@@ -109,6 +113,20 @@ class OrderExecutor:
         # 持仓追踪
         self.positions_with_stops = {}  # {symbol: {entry_price, stop_loss, take_profit}}
 
+        # 【新增】市场状态（Regime）管理
+        self.current_regime = "RANGE"
+        self._regime_task = None
+        self.regime_classifier = RegimeClassifier(self.settings)
+        self._last_regime_notified: str | None = None
+        self._last_regime_summary_day: str | None = None
+        # 日内风格
+        self.current_intraday_style = "RANGE"  # 'TREND' | 'RANGE'
+        self._intraday_task = None
+        self._last_intraday_notified: str | None = None
+        # 去杠杆调仓
+        self._rebalancer_task = None
+        self.rebalancer = RegimeRebalancer(account_id=self.account_id)
+
     async def run(self):
         """主循环：消费信号并执行订单"""
         logger.info("=" * 70)
@@ -124,12 +142,10 @@ class OrderExecutor:
                 self.quote_client = quote_client
                 self.trade_client = trade_client
 
-                # 初始化Slack（可选）
-                if self.settings.slack_webhook_url:
-                    self.slack = SlackNotifier(str(self.settings.slack_webhook_url))
-                    logger.info(f"✅ Slack通知已初始化: {str(self.settings.slack_webhook_url)[:50]}...")
-                else:
-                    logger.warning("⚠️ 未配置SLACK_WEBHOOK_URL，Slack通知已禁用")
+                # 初始化通知（支持Slack和Discord）
+                slack_url = str(self.settings.slack_webhook_url) if self.settings.slack_webhook_url else None
+                discord_url = str(self.settings.discord_webhook_url) if self.settings.discord_webhook_url else None
+                self.slack = MultiChannelNotifier(slack_webhook_url=slack_url, discord_webhook_url=discord_url)
 
                 # 🔥 连接Redis持仓管理器
                 await self.position_manager.connect()
@@ -140,6 +156,26 @@ class OrderExecutor:
                 trade_ctx = await trade_client.get_trade_context()
                 self.smart_router = SmartOrderRouter(trade_ctx, db_manager)
                 logger.info("✅ SmartOrderRouter已初始化（支持TWAP/VWAP算法订单）")
+
+                # 🔥 启动Regime状态更新任务（可选）
+                if getattr(self.settings, 'regime_enabled', False):
+                    try:
+                        self._regime_task = asyncio.create_task(self._regime_updater())
+                        logger.info("✅ Regime状态机已启动")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 启动Regime任务失败: {e}")
+                if getattr(self.settings, 'intraday_style_enabled', False):
+                    try:
+                        self._intraday_task = asyncio.create_task(self._intraday_style_updater())
+                        logger.info("✅ 日内风格检测已启动")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 启动日内风格任务失败: {e}")
+                if getattr(self.settings, 'rebalancer_enabled', False):
+                    try:
+                        self._rebalancer_task = asyncio.create_task(self._rebalancer_updater())
+                        logger.info("✅ 去杠杆调仓器已启动")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 启动去杠杆任务失败: {e}")
 
                 logger.info("✅ 订单执行器初始化完成")
 
@@ -380,7 +416,7 @@ class OrderExecutor:
                     f"     策略: 卖出评分较低的持仓，为评分{score}分的新信号腾出空间"
                 )
 
-                rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
+                rotation_success, freed_amount = await self._try_smart_rotation(
                     signal, needed_amount
                 )
             elif needed_amount <= 0:
@@ -401,16 +437,6 @@ class OrderExecutor:
                 )
                 rotation_success = False
                 freed_amount = 0
-                rotation_details = []
-
-            if rotation_details:
-                await self._notify_rotation_result(
-                    new_signal=signal,
-                    needed_amount=needed_amount,
-                    freed_amount=freed_amount,
-                    sold_positions=rotation_details,
-                    success=rotation_success
-                )
 
             if rotation_success:
                 logger.success(f"  ✅ 智能轮换成功，已释放 ${freed_amount:,.2f}")
@@ -755,6 +781,700 @@ class OrderExecutor:
 
             raise
 
+    async def _regime_updater(self):
+        """周期性更新市场状态（牛/熊/震荡）。"""
+        interval = max(3, int(getattr(self.settings, 'regime_update_interval_minutes', 10))) * 60
+        while True:
+            try:
+                res = await self.regime_classifier.classify(self.quote_client)
+                if res.regime != self.current_regime:
+                    logger.info(f"📈 Regime变更: {self.current_regime} → {res.regime} | {res.details}")
+                    # 发送Slack通知
+                    if self.slack:
+                        try:
+                            await self._send_regime_notification(res)
+                        except Exception as e:
+                            logger.debug(f"发送Regime通知失败: {e}")
+                else:
+                    logger.debug(f"Regime维持: {res.regime} | {res.details}")
+                self.current_regime = res.regime
+
+                # 每日汇总或变更时发送当日仓位/预留预算汇总
+                try:
+                    now_day = datetime.now(self.beijing_tz).strftime('%Y-%m-%d')
+                    need_summary = (self._last_regime_summary_day != now_day) or (self._last_regime_notified != res.regime)
+                    if self.slack and need_summary:
+                        await self._send_regime_daily_summary(res)
+                        self._last_regime_summary_day = now_day
+                        self._last_regime_notified = res.regime
+                except Exception as e:
+                    logger.debug(f"发送Regime汇总失败: {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ 更新Regime失败: {e}")
+            await asyncio.sleep(interval)
+
+    async def _intraday_style_updater(self):
+        """周期性评估当日风格（趋势/震荡），快速微调仓位与预留。"""
+        interval = max(1, int(getattr(self.settings, 'intraday_update_interval_minutes', 3))) * 60
+        while True:
+            try:
+                style, details = await self.regime_classifier.classify_intraday_style(self.quote_client)
+                if style != self.current_intraday_style:
+                    logger.info(f"📊 日内风格变更: {self.current_intraday_style} → {style} | {details}")
+                    if self.slack:
+                        try:
+                            await self._send_intraday_style_notification(style, details)
+                        except Exception as e:
+                            logger.debug(f"发送日内风格通知失败: {e}")
+                else:
+                    logger.debug(f"日内风格维持: {style} | {details}")
+                self.current_intraday_style = style
+            except Exception as e:
+                logger.warning(f"⚠️ 更新日内风格失败: {e}")
+            await asyncio.sleep(interval)
+
+    async def _rebalancer_updater(self):
+        """周期性触发基于Regime的去杠杆，发布减仓信号。"""
+        interval = max(5, int(getattr(self.settings, 'rebalancer_min_interval_minutes', 30))) * 60
+        while True:
+            try:
+                regime, plan = await self.rebalancer.run_once()
+                if plan:
+                    total_qty = sum(p.sell_qty for p in plan)
+                    total_value = sum(p.sell_qty * p.price for p in plan)
+                    msg = (
+                        f"🧯 *Regime去杠杆执行*\n\n"
+                        f"状态: {regime}\n"
+                        f"标的数: {len(plan)}\n"
+                        f"数量合计: {total_qty} 股\n"
+                        f"估算成交额: ${total_value:,.0f}\n"
+                    )
+                    logger.info(msg.replace('*',''))
+                    if self.slack:
+                        try:
+                            await self.slack.send(msg)
+                        except Exception as e:
+                            logger.debug(f"发送去杠杆通知失败: {e}")
+                else:
+                    logger.debug("去杠杆检查：当前无需减仓")
+            except Exception as e:
+                logger.warning(f"⚠️ 去杠杆任务失败: {e}")
+            await asyncio.sleep(interval)
+
+    async def _send_regime_notification(self, res):
+        emoji = {'BULL': '🟢', 'RANGE': '🟡', 'BEAR': '🔴'}.get(res.regime, '🔘')
+        reserve_map = {
+            "BULL": float(getattr(self.settings, 'regime_reserve_pct_bull', 0.15) or 0.15),
+            "RANGE": float(getattr(self.settings, 'regime_reserve_pct_range', 0.30) or 0.30),
+            "BEAR": float(getattr(self.settings, 'regime_reserve_pct_bear', 0.50) or 0.50),
+        }
+        scale_map = {
+            "BULL": float(getattr(self.settings, 'regime_position_scale_bull', 1.0) or 1.0),
+            "RANGE": float(getattr(self.settings, 'regime_position_scale_range', 0.70) or 0.70),
+            "BEAR": float(getattr(self.settings, 'regime_position_scale_bear', 0.40) or 0.40),
+        }
+        reserve = reserve_map.get(res.regime, 0.30)
+        scale = scale_map.get(res.regime, 0.70)
+        message = (
+            f"{emoji} *市场状态变更*\n\n"
+            f"状态: {res.regime}\n"
+            f"依据: {res.details}\n\n"
+            f"📋 策略参数:\n"
+            f"  • 预留购买力: {reserve*100:.0f}%\n"
+            f"  • 仓位缩放: ×{scale:.2f}\n"
+        )
+        await self.slack.send(message)
+
+    async def _send_regime_daily_summary(self, res):
+        try:
+            account = await self.trade_client.get_account()
+        except Exception as e:
+            logger.debug(f"获取账户失败，无法发送汇总: {e}")
+            return
+
+        reserve_map = {
+            "BULL": float(getattr(self.settings, 'regime_reserve_pct_bull', 0.15) or 0.15),
+            "RANGE": float(getattr(self.settings, 'regime_reserve_pct_range', 0.30) or 0.30),
+            "BEAR": float(getattr(self.settings, 'regime_reserve_pct_bear', 0.50) or 0.50),
+        }
+        scale_map = {
+            "BULL": float(getattr(self.settings, 'regime_position_scale_bull', 1.0) or 1.0),
+            "RANGE": float(getattr(self.settings, 'regime_position_scale_range', 0.70) or 0.70),
+            "BEAR": float(getattr(self.settings, 'regime_position_scale_bear', 0.40) or 0.40),
+        }
+        reserve = reserve_map.get(res.regime, 0.30)
+        scale = scale_map.get(res.regime, 0.70)
+
+        lines = []
+        for ccy in sorted(set(list(account.get('cash', {}).keys()) + list(account.get('buy_power', {}).keys()))):
+            cash = float(account.get('cash', {}).get(ccy, 0) or 0)
+            bp = float(account.get('buy_power', {}).get(ccy, 0) or 0)
+            rem_fin = float(account.get('remaining_finance', {}).get(ccy, 0) or 0)
+            cap = max(bp, max(0.0, cash) + max(0.0, rem_fin))
+            cap_after = cap * (1 - reserve)
+            lines.append(
+                f"{ccy}: 上限${cap:,.0f} → 预留后${cap_after:,.0f} (预留{reserve*100:.0f}%)"
+            )
+
+        message = (
+            "📊 *今日仓位/购买力预算*\n\n"
+            f"状态: {res.regime} | {res.details}\n"
+            f"仓位缩放: ×{scale:.2f}\n"
+            "可动用资金上限(预估):\n"
+            + "\n".join([f"  • {ln}" for ln in lines])
+        )
+        await self.slack.send(message)
+
+        # 2. 弱买入信号过滤
+        if signal_type == "WEAK_BUY" and score < 35:
+            logger.info(f"  ⏭️ 跳过弱买入信号 (评分: {score})")
+            return  # 直接返回，信号会被标记为完成
+
+        # 3. 资金检查
+        currency = "HKD" if ".HK" in symbol else "USD"
+        available_cash = account["cash"].get(currency, 0)
+        buy_power = account.get("buy_power", {}).get(currency, 0)
+        remaining_finance = account.get("remaining_finance", {}).get(currency, 0)
+
+        # 显示购买力和融资额度信息
+        logger.debug(
+            f"  💰 {currency} 资金状态 - 可用: ${available_cash:,.2f}, "
+            f"购买力: ${buy_power:,.2f}, 剩余融资额度: ${remaining_finance:,.2f}"
+        )
+
+        if available_cash < 0:
+            logger.error(
+                f"  ❌ {symbol}: 资金异常（显示为负数: ${available_cash:.2f}）\n"
+                f"     可能原因：融资账户或数据错误"
+            )
+            if account.get('buy_power', {}).get(currency, 0) > 1000:
+                logger.info(f"  💳 使用购买力进行交易")
+            else:
+                logger.warning(f"  ⏭️ 账户资金异常，跳过交易")
+                raise InsufficientFundsError(f"账户资金异常（显示为负数: ${available_cash:.2f}）")
+
+        # 4. 计算动态预算（支持信号内指定预算覆盖）
+        dynamic_budget = self._calculate_dynamic_budget(account, signal)
+        try:
+            # 优先使用信号指定的名义额预算（单位：币种金额）
+            budget_notional = signal.get('budget_notional')
+            if isinstance(budget_notional, (int, float)) and budget_notional > 0:
+                dynamic_budget = float(budget_notional)
+            else:
+                # 次优先：基于账户净资产的百分比预算
+                budget_pct = signal.get('budget_pct')
+                if isinstance(budget_pct, (int, float)) and budget_pct > 0:
+                    net_assets = account.get("net_assets", {}).get(
+                        "HKD" if ".HK" in symbol else "USD", 0
+                    )
+                    if net_assets > 0:
+                        dynamic_budget = max(0.0, float(net_assets) * float(budget_pct))
+        except Exception as e:
+            logger.debug(f"应用策略预算失败（忽略继续）: {e}")
+
+        # 5. 获取手数
+        lot_size = await self.lot_size_helper.get_lot_size(symbol, self.quote_client)
+
+        # 6. 计算购买数量
+        quantity = self.lot_size_helper.calculate_order_quantity(
+            symbol, dynamic_budget, current_price, lot_size
+        )
+
+        # 7. 计算所需资金和手数
+        num_lots = quantity // lot_size if quantity > 0 else 0
+        required_cash = current_price * quantity if quantity > 0 else lot_size * current_price
+
+        # 8. 资金不足检查（统一处理，触发智能轮换）
+        min_required_cash = lot_size * current_price
+
+        # 8.1 小额订单过滤（最小下单金额），仅对BUY生效
+        try:
+            if symbol.endswith('.HK'):
+                min_notional = float(getattr(self.settings, 'min_order_notional_hkd', 0.0) or 0.0)
+            else:
+                min_notional = float(getattr(self.settings, 'min_order_notional_usd', 0.0) or 0.0)
+
+            if min_notional > 0 and required_cash < min_notional:
+                logger.info(
+                    f"  ⏭️ 小额订单过滤: 预计成交额 ${required_cash:.2f} < 最小金额 ${min_notional:.2f}，跳过以节省手续费"
+                )
+                return
+        except Exception as e:
+            logger.debug(f"小额订单过滤检查失败（忽略继续）: {e}")
+
+        if quantity <= 0 or dynamic_budget < min_required_cash:
+            # 尝试使用交易端预估接口获取可买数量（考虑融资/购买力）
+            estimated_quantity = await self._estimate_available_quantity(
+                symbol=symbol,
+                price=current_price,
+                lot_size=lot_size,
+                currency=currency
+            )
+
+            if estimated_quantity > 0:
+                quantity = estimated_quantity
+                num_lots = quantity // lot_size
+                required_cash = current_price * quantity
+                dynamic_budget = required_cash
+
+                logger.info(
+                    f"  ✅ 通过交易接口预估可买数量: {quantity}股 "
+                    f"({num_lots}手)，估算资金需求=${required_cash:.2f}"
+                )
+
+                if dynamic_budget >= min_required_cash:
+                    logger.debug("  🔄 预估结果满足最小手数，跳过持仓轮换")
+            else:
+                logger.warning(
+                    f"  ⚠️ {symbol}: 预估最大可买数量为0，跳过下单以避免被券商拒绝"
+                )
+                if self.slack:
+                    await self._send_capacity_notification(
+                        symbol=symbol,
+                        signal=signal,
+                        price=current_price,
+                        available_cash=available_cash,
+                        buy_power=account.get('buy_power', {}).get(currency, 0),
+                        reason="预估最大可买数量为0"
+                    )
+                return
+            if not (quantity > 0 and dynamic_budget >= min_required_cash):
+                logger.warning(
+                    f"  ⚠️ {symbol}: 动态预算不足 "
+                    f"(需要至少1手: ${required_cash:.2f}, 可用: ${available_cash:.2f})"
+                )
+                logger.info(
+                    f"  📊 当前状态: 币种={currency}, 手数={lot_size}, "
+                    f"价格=${current_price:.2f}, 信号评分={score}"
+                )
+                logger.warning(
+                    f"  ⚠️ {symbol}: 资金不足 "
+                    f"(需要 ${required_cash:.2f}, 可用 ${available_cash:.2f})"
+                )
+                logger.info(
+                    f"  📊 当前状态: 币种={currency}, 数量={quantity}股, "
+                    f"价格=${current_price:.2f}, 信号评分={score}"
+                )
+
+                # 尝试智能持仓轮换释放资金
+                needed_amount = required_cash - available_cash
+
+                # 🔥 关键修复：只在确实需要资金且信号质量足够高时才触发轮换
+                if needed_amount > 0 and score >= 60:
+                    logger.info(
+                        f"  🔄 尝试智能持仓轮换释放 ${needed_amount:,.2f}...\n"
+                        f"     策略: 卖出评分较低的持仓，为评分{score}分的新信号腾出空间"
+                    )
+
+                    rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
+                        signal, needed_amount
+                    )
+                elif needed_amount <= 0:
+                    # 资金已经足够，不应该到这里
+                    logger.warning(
+                        f"  ⚠️ 预算计算异常: needed_amount=${needed_amount:.2f}（资金已充足但quantity=0）\n"
+                        f"     说明: 动态预算${dynamic_budget:.2f}不足以购买1手（需${required_cash:.2f}），"
+                        f"但可用资金${available_cash:.2f}充足"
+                    )
+                    raise InsufficientFundsError(
+                        f"动态预算不足（预算${dynamic_budget:.2f} < 1手${required_cash:.2f}）"
+                    )
+                else:
+                    # 低分信号（<60分）不触发轮换，避免为低质量信号卖出好持仓
+                    logger.warning(
+                        f"  ⚠️ {symbol}: 信号评分{score}分 < 60分，不触发持仓轮换\n"
+                        f"     说明: 低分信号不应卖出现有持仓，建议等待更高质量的交易机会"
+                    )
+                    rotation_success = False
+                    freed_amount = 0
+                    rotation_details = []
+
+                if rotation_details:
+                    await self._notify_rotation_result(
+                        new_signal=signal,
+                        needed_amount=needed_amount,
+                        freed_amount=freed_amount,
+                        sold_positions=rotation_details,
+                        success=rotation_success
+                    )
+
+                if rotation_success:
+                    logger.success(f"  ✅ 智能轮换成功，已释放 ${freed_amount:,.2f}")
+
+                    # 重新获取账户信息
+                    try:
+                        account = await self.trade_client.get_account()
+                        available_cash = account["cash"].get(currency, 0)
+
+                        if available_cash >= required_cash:
+                            logger.success(f"  💰 轮换后可用资金: ${available_cash:,.2f}，继续执行订单")
+
+                            # 重新计算动态预算和购买数量
+                            dynamic_budget = self._calculate_dynamic_budget(account, signal)
+
+                            quantity = self.lot_size_helper.calculate_order_quantity(
+                                symbol, dynamic_budget, current_price, lot_size
+                            )
+
+                            if quantity <= 0:
+                                raise InsufficientFundsError(
+                                    f"轮换后预算仍不足以购买1手（预算${dynamic_budget:.2f}）"
+                                )
+
+                            # 更新 num_lots 和 required_cash
+                            num_lots = quantity // lot_size
+                            required_cash = current_price * quantity
+
+                            logger.info(
+                                f"  📊 轮换后重新计算: 预算=${dynamic_budget:.2f}, "
+                                f"数量={quantity}股 ({num_lots}手), 需要${required_cash:.2f}"
+                            )
+                        else:
+                            logger.warning(
+                                f"  ⚠️ 轮换后资金仍不足 "
+                                f"(需要 ${required_cash:.2f}, 可用 ${available_cash:.2f})"
+                            )
+                            raise InsufficientFundsError(
+                                f"轮换后资金仍不足（需要${required_cash:.2f}，可用${available_cash:.2f}）"
+                            )
+                    except Exception as e:
+                        logger.error(f"  ❌ 重新获取账户信息失败: {e}")
+                        raise
+                else:
+                    logger.warning(f"  ⚠️ 智能轮换未能释放足够资金")
+                    raise InsufficientFundsError(
+                        f"资金不足且无法通过轮换释放（需要${required_cash:.2f}，可用${available_cash:.2f}）"
+                    )
+
+        # 8. 获取买卖盘价格
+        bid_price, ask_price = await self._get_bid_ask(symbol)
+
+        # 9. 计算下单价格
+        order_price = self._calculate_order_price(
+            "BUY",
+            current_price,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            atr=signal.get('indicators', {}).get('atr'),
+            symbol=symbol
+        )
+
+        # 10. 提交订单（分批建仓 或 TWAP策略）
+        try:
+            # 🔥 根据配置选择建仓策略
+            if self.enable_staged_entry and score < 80:
+                # 启用分批建仓（仅对非极强信号）
+                logger.info(f"📊 使用分批建仓策略（信号评分{score}分）...")
+
+                # 🔒 标记执行状态（防止重复信号）
+                await self._mark_twap_execution(symbol, duration_seconds=3600)
+
+                try:
+                    final_quantity, final_price = await self._execute_staged_buy(
+                        signal=signal,
+                        total_budget=dynamic_budget,
+                        current_price=order_price
+                    )
+
+                    if final_quantity == 0:
+                        raise Exception("分批建仓未成交")
+                finally:
+                    # 🔓 执行完成后移除标记
+                    await self._unmark_twap_execution(symbol)
+
+            else:
+                # 使用传统TWAP策略（一次性建仓，分批执行降低冲击）
+                order_request = OrderRequest(
+                    symbol=symbol,
+                    side="BUY",
+                    quantity=quantity,
+                    order_type="LIMIT",
+                    limit_price=order_price,
+                    strategy=ExecutionStrategy.TWAP,  # 使用TWAP策略
+                    urgency=5,  # 中等紧急度
+                    max_slippage=0.01,  # 允许1%滑点
+                    signal=signal,
+                    metadata={
+                        "signal_type": signal_type,
+                        "score": score,
+                        "stop_loss": signal.get('stop_loss'),
+                        "take_profit": signal.get('take_profit')
+                    }
+                )
+
+                # 🔒 标记TWAP执行状态（防止重复信号，持续1小时）
+                await self._mark_twap_execution(symbol, duration_seconds=3600)
+
+                # 执行TWAP订单
+                logger.info(f"📊 使用TWAP策略执行订单（将在30分钟内分批下单）...")
+                try:
+                    execution_result = await self.smart_router.execute_order(order_request)
+
+                    # 如果券商估算可买数量为0，则不视为失败：不下单，仅发送信号/容量提示
+                    if not execution_result.success:
+                        err = (execution_result.error_message or "").strip()
+                        if "可买数量为0" in err:
+                            logger.warning("  ⏸️ 券商可买数量为0，跳过下单，仅发送信号通知")
+                            if self.slack:
+                                await self._send_capacity_notification(
+                                    symbol=symbol,
+                                    signal=signal,
+                                    price=current_price,
+                                    available_cash=available_cash,
+                                    buy_power=account.get('buy_power', {}).get(currency, 0),
+                                    reason="券商估算可买数量为0（仅发送信号）"
+                                )
+                            return
+                        # 其他错误按原逻辑处理为失败
+                        raise Exception(f"订单执行失败: {execution_result.error_message}")
+                finally:
+                    # 🔓 执行完成后移除标记（无论成功或失败）
+                    await self._unmark_twap_execution(symbol)
+
+                # 使用实际成交的数量和价格（不使用默认值）
+                final_price = execution_result.average_price
+                final_quantity = execution_result.filled_quantity
+
+            # 🔥 检查是否有实际成交
+            if final_quantity == 0:
+                logger.error(
+                    f"\n❌ TWAP订单未成交: {execution_result.order_id}\n"
+                    f"   标的: {symbol}\n"
+                    f"   类型: {signal_type}\n"
+                    f"   评分: {score}/100\n"
+                    f"   请求数量: {quantity}股\n"
+                    f"   实际成交: 0股\n"
+                    f"   原因: {execution_result.error_message or '未知'}"
+                )
+                # 不更新持仓，直接返回（在外层会抛出异常）
+                raise Exception(f"订单未成交: {execution_result.error_message or '订单被拒绝'}")
+
+            logger.success(
+                f"\n✅ TWAP开仓订单已完成: {execution_result.order_id}\n"
+                f"   标的: {symbol}\n"
+                f"   类型: {signal_type}\n"
+                f"   评分: {score}/100\n"
+                f"   数量: {final_quantity}股 ({final_quantity//lot_size}手 × {lot_size}股/手)\n"
+                f"   平均价: ${final_price:.2f}\n"
+                f"   总额: ${final_price * final_quantity:.2f}\n"
+                f"   滑点: {execution_result.slippage*100:.2f}%\n"
+                f"   子订单: {len(execution_result.child_orders)}个\n"
+                f"   止损位: ${signal.get('stop_loss', 0):.2f}\n"
+                f"   止盈位: ${signal.get('take_profit', 0):.2f}"
+            )
+
+            # 用于后续逻辑的订单信息（保持兼容性）
+            order = {
+                'order_id': execution_result.order_id,
+                'child_orders': execution_result.child_orders
+            }
+
+            # 🔥 【关键修复】立即更新Redis持仓（防止重复开仓）
+            # 只有实际成交时才更新持仓
+            try:
+                await self.position_manager.add_position(
+                    symbol=symbol,
+                    quantity=final_quantity,  # 使用实际成交数量
+                    cost_price=final_price,   # 使用TWAP平均价
+                    order_id=order.get('order_id', ''),
+                    notify=True  # 发布Pub/Sub通知
+                )
+                logger.info(f"  ✅ Redis持仓已更新: {symbol} (TWAP平均价: ${final_price:.2f})")
+            except Exception as e:
+                logger.error(f"  ❌ Redis持仓更新失败: {e}")
+                # 不影响订单执行，继续
+
+            # 🔥 【关键修复】保存订单记录到数据库（防止重复买入）
+            # 保存所有子订单记录
+            try:
+                # 保存父订单（主订单）
+                await self.order_manager.save_order(
+                    order_id=order.get('order_id', ''),
+                    symbol=symbol,
+                    side="BUY",
+                    quantity=final_quantity,  # 使用实际成交数量
+                    price=final_price,        # 使用TWAP平均价
+                    status="Filled" if execution_result.filled_quantity == quantity else "Partial"
+                )
+                logger.info(f"  ✅ 订单记录已保存: {order.get('order_id', '')} ({len(execution_result.child_orders)}个子订单)")
+            except Exception as e:
+                logger.error(f"  ❌ 订单记录保存失败: {e}")
+                # 不影响订单执行，继续
+
+            # 11. 记录止损止盈
+            self.positions_with_stops[symbol] = {
+                "entry_price": current_price,
+                "stop_loss": signal.get('stop_loss'),
+                "take_profit": signal.get('take_profit'),
+                "atr": signal.get('indicators', {}).get('atr'),
+            }
+
+            # 🔥 智能评估是否提交备份条件单（LIT）- 混合止损策略
+            backup_stop_order_id = None
+            backup_profit_order_id = None
+
+            if self.settings.backup_orders.enabled:
+                # 执行风险评估
+                risk_assessment = self.risk_assessor.assess(
+                    symbol=symbol,
+                    signal=signal,
+                    quantity=final_quantity,
+                    price=final_price
+                )
+
+                # 打印风险评估结果
+                logger.info(self.risk_assessor.format_assessment_log(risk_assessment))
+
+                # 根据评估结果决定是否提交备份条件单
+                if risk_assessment['should_backup']:
+                    # 🔥 低分信号保护：分数<60的信号不提交备份条件单（降低探索性仓位风险）
+                    signal_score = signal.get('score', 0)
+                    if signal_score < 60:
+                        logger.info(
+                            f"  ⏭️ 跳过备份条件单: 信号分数较低({signal_score}分 < 60分)，"
+                            f"仅依赖客户端监控止损/止盈（降低误触风险）"
+                        )
+                    else:
+                        try:
+                            stop_loss = signal.get('stop_loss')
+                            take_profit = signal.get('take_profit')
+
+                            # === 动态计算TSL百分比（Chandelier 近似） ===
+                            indicators = signal.get('indicators', {}) or {}
+                            atr_val = None
+                            try:
+                                atr_val = float(indicators.get('atr')) if indicators.get('atr') else None
+                            except Exception:
+                                atr_val = None
+
+                            trailing_pct_dyn = None
+                            if atr_val and final_price > 0:
+                                k = float(getattr(self.settings, 'soft_exit_chandelier_k', 3.0) or 3.0)
+                                trailing_pct_dyn = max(0.01, min(0.20, (k * float(atr_val)) / float(final_price)))
+                                logger.info(
+                                    f"  🧮 动态TSL百分比: ATR={atr_val:.4f}, 价=${final_price:.2f}, k={k} → {trailing_pct_dyn*100:.2f}%"
+                                )
+
+                            if stop_loss and stop_loss > 0:
+                                # 🔥 智能选择：跟踪止损 vs 固定止损
+                                if self.settings.backup_orders.use_trailing_stop:
+                                    # 使用跟踪止损（TSLPPCT）- 自动跟随价格上涨锁定利润
+                                    # 🔥 修复：side应该是"BUY"表示保护多头仓位，而非"SELL"
+                                    stop_result = await self.trade_client.submit_trailing_stop(
+                                        symbol=symbol,
+                                        side="BUY",  # 修复：保护多头仓位（买入后持有）
+                                        quantity=final_quantity,
+                                        trailing_percent=(trailing_pct_dyn if trailing_pct_dyn is not None else self.settings.backup_orders.trailing_stop_percent),
+                                        limit_offset=self.settings.backup_orders.trailing_stop_limit_offset,
+                                        expire_days=self.settings.backup_orders.trailing_stop_expire_days,
+                                        remark=(
+                                            f"Trailing Stop {trailing_pct_dyn*100:.1f}% (ATR)" if trailing_pct_dyn is not None
+                                            else f"Trailing Stop {self.settings.backup_orders.trailing_stop_percent*100:.1f}%"
+                                        )
+                                    )
+                                    backup_stop_order_id = stop_result.get('order_id')
+                                    logger.success(
+                                        f"  ✅ 跟踪止损备份单已提交: {backup_stop_order_id} "
+                                        f"(跟踪{(trailing_pct_dyn if trailing_pct_dyn is not None else self.settings.backup_orders.trailing_stop_percent)*100:.1f}%)"
+                                    )
+                                else:
+                                    # 使用固定止损（LIT）- 传统到价止损
+                                    stop_loss_float = float(stop_loss)
+                                    stop_result = await self.trade_client.submit_conditional_order(
+                                        symbol=symbol,
+                                        side="SELL",
+                                        quantity=final_quantity,
+                                        trigger_price=stop_loss_float,
+                                        limit_price=stop_loss_float * 0.995,  # 触发后以略低价格限价卖出，确保成交
+                                        remark=f"Backup Stop Loss @ ${stop_loss_float:.2f}"
+                                    )
+                                    backup_stop_order_id = stop_result.get('order_id')
+                                    logger.success(f"  ✅ 固定止损备份条件单已提交: {backup_stop_order_id}")
+
+                            if take_profit and take_profit > 0:
+                                # 🔥 智能选择：跟踪止盈 vs 固定止盈（实现"让利润奔跑"）
+                                if self.settings.backup_orders.use_trailing_profit:
+                                    # 使用跟踪止盈（TSMPCT）- 不限制上涨空间，仅在回撤时退出
+                                    # 🔥 修复：side应该是"BUY"表示保护多头仓位，而非"SELL"
+                                    profit_result = await self.trade_client.submit_trailing_profit(
+                                        symbol=symbol,
+                                        side="BUY",  # 修复：保护多头仓位（买入后持有）
+                                        quantity=final_quantity,
+                                        trailing_percent=self.settings.backup_orders.trailing_profit_percent,
+                                        limit_offset=self.settings.backup_orders.trailing_profit_limit_offset,
+                                        expire_days=self.settings.backup_orders.trailing_profit_expire_days,
+                                        remark=f"Trailing Profit {self.settings.backup_orders.trailing_profit_percent*100:.1f}%"
+                                    )
+                                    backup_profit_order_id = profit_result.get('order_id')
+                                    logger.success(
+                                        f"  ✅ 跟踪止盈备份单已提交: {backup_profit_order_id} "
+                                        f"(跟踪{self.settings.backup_orders.trailing_profit_percent*100:.1f}%)"
+                                    )
+                                else:
+                                    # 使用固定止盈（LIT）- 传统到价止盈
+                                    take_profit_float = float(take_profit)
+                                    profit_result = await self.trade_client.submit_conditional_order(
+                                        symbol=symbol,
+                                        side="SELL",
+                                        quantity=final_quantity,
+                                        trigger_price=take_profit_float,
+                                        limit_price=take_profit_float,  # 止盈使用触发价本身
+                                        remark=f"Backup Take Profit @ ${take_profit_float:.2f}"
+                                    )
+                                    backup_profit_order_id = profit_result.get('order_id')
+                                    logger.success(f"  ✅ 固定止盈备份条件单已提交: {backup_profit_order_id}")
+
+                            # 打印策略说明
+                            stop_type = "跟踪止损(TSLPPCT)" if self.settings.backup_orders.use_trailing_stop else "固定止损(LIT)"
+                            profit_type = "跟踪止盈(TSMPCT)" if self.settings.backup_orders.use_trailing_profit else "固定止盈(LIT)"
+                            logger.info(f"  📋 备份条件单策略: 客户端监控（主） + 交易所{stop_type}+{profit_type}（备份）")
+
+                        except Exception as e:
+                            logger.warning(f"⚠️ 提交备份条件单失败（不影响主流程）: {e}")
+                            import traceback
+                            logger.debug(f"  详细错误: {traceback.format_exc()}")
+                            # 即使备份条件单失败，也继续保存止损设置（客户端监控仍然工作）
+                else:
+                    logger.info(f"  ℹ️ 低风险交易，依赖客户端监控（节省成本）")
+            else:
+                logger.info(f"  ⚙️ 备份条件单功能已禁用")
+
+            # 保存到数据库（包括备份条件单ID）
+            try:
+                # 统一转换为 float 避免类型错误
+                await self.stop_manager.save_stop(
+                    symbol=symbol,
+                    entry_price=float(final_price),  # 使用实际成交均价
+                    stop_loss=float(signal.get('stop_loss')) if signal.get('stop_loss') else None,
+                    take_profit=float(signal.get('take_profit')) if signal.get('take_profit') else None,
+                    atr=float(signal.get('indicators', {}).get('atr')) if signal.get('indicators', {}).get('atr') else None,
+                    quantity=int(final_quantity),  # 转换为 int
+                    strategy='advanced_technical',
+                    backup_stop_loss_order_id=backup_stop_order_id,
+                    backup_take_profit_order_id=backup_profit_order_id
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ 保存止损止盈失败: {e}")
+                import traceback
+                logger.debug(f"  详细错误: {traceback.format_exc()}")
+
+            # 12. 发送Slack通知
+            if self.slack:
+                await self._send_buy_notification(symbol, signal, order, quantity, order_price, required_cash)
+
+        except Exception as e:
+            logger.error(f"❌ 提交订单失败: {e}")
+
+            # 发送失败通知到 Slack
+            if self.slack:
+                await self._send_failure_notification(
+                    symbol=symbol,
+                    signal=signal,
+                    error=str(e)
+                )
+
+            raise
+
     async def _execute_sell_order(self, signal: Dict):
         """执行卖出订单（止损/止盈）"""
         symbol = signal['symbol']
@@ -933,35 +1653,94 @@ class OrderExecutor:
         # 🔥 不能超过该币种的实际购买力和融资额度
         available_cash = account.get("cash", {}).get(currency, 0)
         remaining_finance = account.get("remaining_finance", {}).get(currency, 0)
+        buy_power = account.get("buy_power", {}).get(currency, 0)
 
-        # 如果账户使用融资（available_cash为负），检查剩余融资额度
-        if available_cash < 0:
-            # 使用融资账户，限制不超过剩余融资额度
-            if remaining_finance > 0 and dynamic_budget > remaining_finance:
-                logger.warning(
-                    f"  ⚠️ 动态预算${dynamic_budget:,.2f}超出剩余融资额度${remaining_finance:,.2f}，"
-                    f"调整为剩余额度"
-                )
-                dynamic_budget = remaining_finance
-            elif remaining_finance <= 1000:
-                # 融资额度不足，严重警告
-                logger.error(
-                    f"  ❌ 剩余融资额度不足: ${remaining_finance:,.2f}，"
-                    f"无法下单（需要${dynamic_budget:,.2f}）"
-                )
-                raise InsufficientFundsError(f"融资额度不足: 剩余${remaining_finance:,.2f}")
+        # 计算可支配上限：优先使用购买力，其次可用资金，最后剩余融资额度
+        if buy_power and buy_power > 0:
+            effective_cap = buy_power
+            cap_source = f"{currency}购买力"
+            # 购买力通常已考虑融资额度，但仍确保不超过可用资金+融资额度
+            if remaining_finance > 0:
+                max_finance_cap = max(0.0, available_cash + remaining_finance)
+                if effective_cap > max_finance_cap > 0:
+                    effective_cap = max_finance_cap
+                    cap_source = f"{currency}可用资金+融资额度"
         else:
-            # 普通账户，不能超过可用现金
-            if dynamic_budget > available_cash:
-                # 🔥 关键修复：可用资金不足时，按评分比例基于可用资金重新计算
-                # 而不是直接用全部可用资金（这样会导致低分信号用过大仓位）
-                adjusted_budget = available_cash * budget_pct
-                logger.warning(
-                    f"  ⚠️ 动态预算${dynamic_budget:,.2f}超出{currency}可用资金${available_cash:,.2f}\n"
-                    f"     按评分比例({budget_pct:.1%})重新计算: ${adjusted_budget:,.2f} "
-                    f"(而非使用全部可用资金)"
+            effective_cap = max(available_cash, 0.0)
+            cap_source = f"{currency}可用资金"
+            if effective_cap <= 0 and remaining_finance > 0:
+                effective_cap = remaining_finance
+                cap_source = f"{currency}剩余融资额度"
+
+        if effective_cap <= 0:
+            logger.error(
+                f"  ❌ {currency} 账户可支配资金不足（可用={available_cash:,.2f}, "
+                f"购买力={buy_power:,.2f}, 融资额度={remaining_finance:,.2f}）"
+            )
+            raise InsufficientFundsError(f"{currency}可支配资金不足")
+
+        # 根据Regime预留购买力（在cap层面扣除）和仓位缩放（在budget层面缩放）
+        try:
+            regime = self.current_regime or "RANGE"
+            reserve_map = {
+                "BULL": float(getattr(self.settings, 'regime_reserve_pct_bull', 0.15) or 0.15),
+                "RANGE": float(getattr(self.settings, 'regime_reserve_pct_range', 0.30) or 0.30),
+                "BEAR": float(getattr(self.settings, 'regime_reserve_pct_bear', 0.50) or 0.50),
+            }
+            scale_map = {
+                "BULL": float(getattr(self.settings, 'regime_position_scale_bull', 1.0) or 1.0),
+                "RANGE": float(getattr(self.settings, 'regime_position_scale_range', 0.70) or 0.70),
+                "BEAR": float(getattr(self.settings, 'regime_position_scale_bear', 0.40) or 0.40),
+            }
+            reserve = min(max(reserve_map.get(regime, 0.30), 0.0), 0.9)
+            scale = min(max(scale_map.get(regime, 0.70), 0.1), 1.5)
+
+            # 注入日内风格微调
+            try:
+                style = self.current_intraday_style or "RANGE"
+                style_scale_map = {
+                    "TREND": float(getattr(self.settings, 'intraday_scale_trend', 1.10) or 1.10),
+                    "RANGE": float(getattr(self.settings, 'intraday_scale_range', 0.85) or 0.85),
+                }
+                style_reserve_delta_map = {
+                    "TREND": float(getattr(self.settings, 'intraday_reserve_delta_trend', -0.05) or -0.05),
+                    "RANGE": float(getattr(self.settings, 'intraday_reserve_delta_range', 0.05) or 0.05),
+                }
+                style_scale = style_scale_map.get(style, 1.0)
+                style_reserve_delta = style_reserve_delta_map.get(style, 0.0)
+                # 先调整reserve，再调整scale
+                reserve = min(max(reserve + style_reserve_delta, 0.0), 0.9)
+                scale = min(max(scale * style_scale, 0.1), 1.5)
+                logger.debug(
+                    f"  ⛳ 日内微调: style={style}, reserveΔ={style_reserve_delta:+.2f}, scale×={style_scale:.2f}"
                 )
-                dynamic_budget = adjusted_budget
+            except Exception as e:
+                logger.debug(f"日内微调失败（忽略）: {e}")
+
+            # 先在cap层面保留现金
+            effective_cap_after_reserve = max(0.0, effective_cap * (1.0 - reserve))
+            if effective_cap_after_reserve < effective_cap:
+                logger.debug(
+                    f"  🧯 Regime预留购买力: {regime} 预留{reserve*100:.0f}% → 上限${effective_cap:,.2f}→${effective_cap_after_reserve:,.2f}"
+                )
+            effective_cap = effective_cap_after_reserve
+
+            # 再对预算做仓位缩放
+            dynamic_budget_pre = dynamic_budget
+            dynamic_budget = dynamic_budget * scale
+            if abs(dynamic_budget - dynamic_budget_pre) / (dynamic_budget_pre or 1) > 0.01:
+                logger.debug(
+                    f"  🎚️ Regime仓位缩放: {regime} ×{scale:.2f} → 预算${dynamic_budget_pre:,.2f}→${dynamic_budget:,.2f}"
+                )
+        except Exception as e:
+            logger.debug(f"Regime预算调整失败（忽略）: {e}")
+
+        if dynamic_budget > effective_cap:
+            logger.warning(
+                f"  ⚠️ 动态预算${dynamic_budget:,.2f}超出{cap_source}${effective_cap:,.2f}，"
+                f"调整为${effective_cap:,.2f}"
+            )
+            dynamic_budget = effective_cap
 
         logger.debug(
             f"  动态预算计算: 评分={score}, 预算比例={budget_pct:.2%}, "
@@ -969,6 +1748,72 @@ class OrderExecutor:
         )
 
         return dynamic_budget
+
+    async def _send_intraday_style_notification(self, style: str, details: str):
+        emoji = {'TREND': '📈', 'RANGE': '〰️'}.get(style, '📊')
+        # 读取调整参数
+        style_scale = (
+            float(getattr(self.settings, 'intraday_scale_trend', 1.10)) if style == 'TREND'
+            else float(getattr(self.settings, 'intraday_scale_range', 0.85))
+        )
+        style_reserve_delta = (
+            float(getattr(self.settings, 'intraday_reserve_delta_trend', -0.05)) if style == 'TREND'
+            else float(getattr(self.settings, 'intraday_reserve_delta_range', 0.05))
+        )
+        message = (
+            f"{emoji} *日内风格更新*\n\n"
+            f"风格: {style}\n"
+            f"依据: {details}\n\n"
+            f"📋 微调参数:\n"
+            f"  • 预留购买力Δ: {style_reserve_delta*100:+.0f}%\n"
+            f"  • 仓位缩放×: {style_scale:.2f}\n"
+        )
+        await self.slack.send(message)
+
+    async def _estimate_available_quantity(
+        self,
+        symbol: str,
+        price: float,
+        lot_size: int,
+        currency: str
+    ) -> int:
+        """
+        调用交易端口预估最大可买数量（含融资），并按手数取整。
+
+        Returns:
+            int: 按手数取整后的最大可买数量，若不可用返回0
+        """
+        try:
+            estimate = await self.trade_client.estimate_max_purchase_quantity(
+                symbol=symbol,
+                order_type=openapi.OrderType.Limit,
+                side=openapi.OrderSide.Buy,
+                price=price,
+                currency=currency
+            )
+
+            candidates = []
+            if getattr(estimate, "margin_max_qty", None):
+                candidates.append(float(estimate.margin_max_qty))
+            if getattr(estimate, "cash_max_qty", None):
+                candidates.append(float(estimate.cash_max_qty))
+
+            if not candidates:
+                return 0
+
+            max_qty = max(candidates)
+            if max_qty <= 0:
+                return 0
+
+            lots = int(max_qty // lot_size)
+            if lots <= 0:
+                return 0
+
+            return lots * lot_size
+
+        except Exception as e:
+            logger.debug(f"  ⚠️ 预估最大可买数量失败: {e}")
+            return 0
 
     async def _get_bid_ask(self, symbol: str):
         """获取买卖盘价格"""
@@ -1054,6 +1899,7 @@ class OrderExecutor:
             score = signal.get('score', 0)
             indicators = signal.get('indicators', {})
             reasons = signal.get('reasons', [])
+            strategy_name = signal.get('strategy', 'GENERAL')
 
             emoji_map = {
                 'STRONG_BUY': '🚀',
@@ -1101,6 +1947,7 @@ class OrderExecutor:
                 f"{emoji} *开仓订单已提交*\n\n"
                 f"📋 订单ID: `{order.get('order_id', 'N/A')}`\n"
                 f"📊 标的: *{symbol}*\n"
+                f"📘 策略: `{strategy_name}`\n"
                 f"💯 信号类型: {signal_type}\n"
                 f"⭐ 综合评分: *{score}/100*\n\n"
                 f"💰 *交易信息*:\n"
@@ -1121,6 +1968,35 @@ class OrderExecutor:
         except Exception as e:
             logger.warning(f"⚠️ 发送Slack通知失败: {e}")
 
+    async def _send_capacity_notification(
+        self,
+        symbol: str,
+        signal: Dict,
+        price: float,
+        available_cash: float,
+        buy_power: float,
+        reason: str
+    ):
+        """发送因资金/额度不足跳过下单的提示"""
+        try:
+            signal_type = signal.get('type', 'BUY')
+            score = signal.get('score', 0)
+            strategy_name = signal.get('strategy', 'GENERAL')
+            message = (
+                "⏸️ *买单跳过*\n\n"
+                f"📊 标的: *{symbol}*\n"
+                f"📘 策略: `{strategy_name}`\n"
+                f"💡 信号类型: {signal_type} ({score}分)\n"
+                f"💰 价格: ${price:.2f}\n"
+                f"⚠️ 原因: {reason}\n\n"
+                "📉 资金状态:\n"
+                f"   • 可用资金: ${available_cash:,.2f}\n"
+                f"   • 购买力: ${buy_power:,.2f}\n"
+            )
+            await self.slack.send(message)
+        except Exception as e:
+            logger.warning(f"⚠️ 发送额度不足通知失败: {e}")
+
     async def _send_sell_notification(
         self,
         symbol: str,
@@ -1134,6 +2010,7 @@ class OrderExecutor:
             signal_type = signal.get('type', 'SELL')
             reason = signal.get('reason', '平仓')
             score = signal.get('score', 0)
+            strategy_name = signal.get('strategy', 'GENERAL')
 
             emoji = "🛑" if "止损" in reason else ("🎯" if "止盈" in reason else "💵")
 
@@ -1142,6 +2019,7 @@ class OrderExecutor:
                 f"{emoji} *平仓订单已提交*\n\n"
                 f"📋 订单ID: `{order.get('order_id', 'N/A')}`\n"
                 f"📊 标的: *{symbol}*\n"
+                f"📘 策略: `{strategy_name}`\n"
                 f"💡 原因: {reason}\n"
                 f"⭐ 评分: {score}/100\n\n"
             )
@@ -1461,21 +2339,44 @@ class OrderExecutor:
 
                     batch.append(signal)
                 else:
-                    # 🔥 队列为空，增加计数
+                    # 🔥 队列暂无可用信号（可能为空或都在延迟状态）
                     consecutive_empty_attempts += 1
+                    delay_hint = getattr(self.signal_queue, "_last_delay_hint", None)
 
                     # 🔥 快速通道：第一次为空就立即退出
                     if batch_window == 0 and len(batch) == 0:
-                        logger.debug(f"  ⚡ 快速通道：队列为空，立即返回")
+                        if delay_hint:
+                            logger.debug(
+                                f"  ⚡ 快速通道：队列信号均在延迟，"
+                                f"最短还需等待{delay_hint:.0f}秒，立即返回"
+                            )
+                        else:
+                            logger.debug(f"  ⚡ 快速通道：队列为空，立即返回")
                         break
 
                     if consecutive_empty_attempts >= max_empty_attempts:
                         # 🔥 连续多次为空，退出循环
-                        logger.debug(
-                            f"  💤 连续{consecutive_empty_attempts}次队列为空，"
-                            f"可能只有延迟信号，结束批次收集"
-                        )
+                        if delay_hint:
+                            logger.debug(
+                                f"  💤 连续{consecutive_empty_attempts}次队列仅包含延迟信号，"
+                                f"最短还需等待{delay_hint:.0f}秒，结束批次收集"
+                            )
+                        else:
+                            logger.debug(
+                                f"  💤 连续{consecutive_empty_attempts}次队列为空，"
+                                f"结束批次收集"
+                            )
                         break
+                    else:
+                        if delay_hint:
+                            logger.debug(
+                                f"  ⏳ 队列信号均未到重试时间，"
+                                f"最短还需等待{delay_hint:.0f}秒（尝试{consecutive_empty_attempts}/{max_empty_attempts}）"
+                            )
+                        else:
+                            logger.debug(
+                                f"  ⏳ 队列暂为空（尝试{consecutive_empty_attempts}/{max_empty_attempts}）"
+                            )
 
             except asyncio.TimeoutError:
                 # 超时，也算作空尝试
@@ -1490,12 +2391,30 @@ class OrderExecutor:
                 else:
                     # 无信号且时间未到
                     consecutive_empty_attempts += 1
+                    delay_hint = getattr(self.signal_queue, "_last_delay_hint", None)
                     if consecutive_empty_attempts >= max_empty_attempts:
-                        logger.debug(
-                            f"  💤 连续{consecutive_empty_attempts}次超时，"
-                            f"结束批次收集"
-                        )
+                        if delay_hint:
+                            logger.debug(
+                                f"  💤 连续{consecutive_empty_attempts}次超时且仅有延迟信号，"
+                                f"最短还需等待{delay_hint:.0f}秒，结束批次收集"
+                            )
+                        else:
+                            logger.debug(
+                                f"  💤 连续{consecutive_empty_attempts}次超时，"
+                                f"结束批次收集"
+                            )
                         break
+                    else:
+                        if delay_hint:
+                            logger.debug(
+                                f"  ⏳ 超时未取到信号，队列最短等待{delay_hint:.0f}秒 "
+                                f"（尝试{consecutive_empty_attempts}/{max_empty_attempts}）"
+                            )
+                        else:
+                            logger.debug(
+                                f"  ⏳ 超时未取到信号 "
+                                f"（尝试{consecutive_empty_attempts}/{max_empty_attempts}）"
+                            )
                     continue
             except Exception as e:
                 logger.warning(f"  ⚠️ 消费信号时出错: {e}")
@@ -1517,7 +2436,15 @@ class OrderExecutor:
                     f"{sig.get('type', 'UNKNOWN')} ({sig.get('score', 0)}分)"
                 )
         else:
-            logger.debug("  📦 批次为空，未收集到信号")
+            delay_hint = getattr(self.signal_queue, "_last_delay_hint", None)
+            current_queue = await self.signal_queue.get_queue_size()
+            if delay_hint and current_queue > 0:
+                logger.debug(
+                    f"  ⏳ 批次为空，队列中{current_queue}个信号尚未到重试时间，"
+                    f"最短还需等待{delay_hint:.0f}秒"
+                )
+            else:
+                logger.debug("  📦 批次为空，未收集到信号")
 
         return batch
 

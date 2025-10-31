@@ -11,7 +11,7 @@ from longport_quant.config import get_settings
 from longport_quant.config.sdk import build_sdk_config
 from longport_quant.core.logging import configure_logging
 from longport_quant.data.enhanced_market_data import EnhancedMarketDataService
-from longport_quant.notifications import SlackNotifier
+from longport_quant.notifications import MultiChannelNotifier
 from longport_quant.execution.order_router import OrderRouter
 from longport_quant.persistence.db import DatabaseSessionManager
 from longport_quant.portfolio.state import PortfolioService
@@ -30,7 +30,9 @@ async def application_lifespan() -> AsyncIterator[None]:
         await stack.enter_async_context(db_manager)
 
         sdk_config = build_sdk_config(settings)
-        slack = SlackNotifier(settings.slack_webhook_url)
+        slack_url = str(settings.slack_webhook_url) if settings.slack_webhook_url else None
+        discord_url = str(settings.discord_webhook_url) if settings.discord_webhook_url else None
+        slack = MultiChannelNotifier(slack_webhook_url=slack_url, discord_webhook_url=discord_url)
 
         order_router = OrderRouter(settings, sdk_config)
         await stack.enter_async_context(order_router)

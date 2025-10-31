@@ -122,6 +122,7 @@ class Settings(BaseSettings):
 
     health_port: int = Field(8080, alias="HEALTHCHECK_PORT")
     slack_webhook_url: HttpUrl | None = Field(None, alias="SLACK_WEBHOOK_URL")
+    discord_webhook_url: HttpUrl | None = Field(None, alias="DISCORD_WEBHOOK_URL")
 
     # 备份条件单配置
     backup_orders: BackupOrderConfig = Field(default_factory=BackupOrderConfig)
@@ -135,6 +136,60 @@ class Settings(BaseSettings):
     signal_confirmation_count: int = Field(2, alias="SIGNAL_CONFIRMATION_COUNT")  # 信号确认次数
     enable_transaction_cost_penalty: bool = Field(True, alias="ENABLE_TRANSACTION_COST_PENALTY")  # 启用交易成本惩罚
     transaction_cost_pct: float = Field(0.002, alias="TRANSACTION_COST_PCT")  # 交易成本比例（0.2%）
+
+    # 信号冷却期（秒）：同一标的在该时间窗口内不重复生成新信号
+    signal_cooldown_seconds: int = Field(900, alias="SIGNAL_COOLDOWN_SECONDS")
+
+    # 每日交易次数上限（可选开关）
+    enable_daily_trade_cap: bool = Field(False, alias="ENABLE_DAILY_TRADE_CAP")
+    daily_max_buy_orders: int = Field(8, alias="DAILY_MAX_BUY_ORDERS")
+    daily_max_sell_orders: int = Field(8, alias="DAILY_MAX_SELL_ORDERS")
+
+    # 单标的每日买入上限（可选，默认1次）；仅对普通BUY生效，强制止损/止盈不受限
+    enable_per_symbol_daily_cap: bool = Field(False, alias="ENABLE_PER_SYMBOL_DAILY_CAP")
+    per_symbol_daily_max_buys: int = Field(1, alias="PER_SYMBOL_DAILY_MAX_BUYS")
+
+    # 最小下单金额（小额订单过滤，单位：各币种）
+    min_order_notional_hkd: float = Field(0.0, alias="MIN_ORDER_NOTIONAL_HKD")
+    min_order_notional_usd: float = Field(0.0, alias="MIN_ORDER_NOTIONAL_USD")
+
+    # 软退出引擎配置（Chandelier/Donchian）
+    soft_exit_enabled: bool = Field(False, alias="SOFT_EXIT_ENABLED")
+    soft_exit_period: str = Field("Min_5", alias="SOFT_EXIT_PERIOD")  # 分时周期：Min_1/Min_5/Day 等
+    soft_exit_atr_period: int = Field(22, alias="SOFT_EXIT_ATR_PERIOD")
+    soft_exit_chandelier_k: float = Field(3.0, alias="SOFT_EXIT_CHANDELIER_K")
+    soft_exit_donchian_n: int = Field(20, alias="SOFT_EXIT_DONCHIAN_N")
+    soft_exit_poll_interval: int = Field(30, alias="SOFT_EXIT_POLL_INTERVAL")  # 秒
+    soft_exit_signal_cooldown: int = Field(600, alias="SOFT_EXIT_SIGNAL_COOLDOWN")  # 同一标的冷却（秒）
+
+    # 市场状态与仓位/购买力调度（Regime Engine）
+    regime_enabled: bool = Field(False, alias="REGIME_ENABLED")
+    regime_index_symbols: str = Field("HSI.HK", alias="REGIME_INDEX_SYMBOLS")  # 逗号分隔，如 "HSI.HK,SPY.US"
+    regime_ma_period: int = Field(200, alias="REGIME_MA_PERIOD")
+    regime_update_interval_minutes: int = Field(10, alias="REGIME_UPDATE_INTERVAL_MINUTES")
+    # 各状态购买力保留比例（预留不出手的现金）
+    regime_reserve_pct_bull: float = Field(0.15, alias="REGIME_RESERVE_PCT_BULL")
+    regime_reserve_pct_range: float = Field(0.30, alias="REGIME_RESERVE_PCT_RANGE")
+    regime_reserve_pct_bear: float = Field(0.50, alias="REGIME_RESERVE_PCT_BEAR")
+    # 各状态仓位缩放（对动态预算的乘数，控制进攻/防守）
+    regime_position_scale_bull: float = Field(1.0, alias="REGIME_POSITION_SCALE_BULL")
+    regime_position_scale_range: float = Field(0.70, alias="REGIME_POSITION_SCALE_RANGE")
+    regime_position_scale_bear: float = Field(0.40, alias="REGIME_POSITION_SCALE_BEAR")
+
+    # 日内风格（当日：趋势/震荡）
+    intraday_style_enabled: bool = Field(False, alias="INTRADAY_STYLE_ENABLED")
+    intraday_update_interval_minutes: int = Field(3, alias="INTRADAY_UPDATE_INTERVAL_MINUTES")
+    intraday_open_minutes: int = Field(30, alias="INTRADAY_OPEN_MINUTES")
+    intraday_trend_expand_threshold: float = Field(2.0, alias="INTRADAY_TREND_EXPAND_THRESHOLD")  # 当日范围/开盘区间
+    intraday_breakout_buffer_pct: float = Field(0.002, alias="INTRADAY_BREAKOUT_BUFFER_PCT")  # 0.2%
+    intraday_scale_trend: float = Field(1.10, alias="INTRADAY_SCALE_TREND")
+    intraday_scale_range: float = Field(0.85, alias="INTRADAY_SCALE_RANGE")
+    intraday_reserve_delta_trend: float = Field(-0.05, alias="INTRADAY_RESERVE_DELTA_TREND")
+    intraday_reserve_delta_range: float = Field(0.05, alias="INTRADAY_RESERVE_DELTA_RANGE")
+
+    # 去杠杆调仓（Regime Rebalancer）
+    rebalancer_enabled: bool = Field(False, alias="REBALANCER_ENABLED")
+    rebalancer_min_interval_minutes: int = Field(30, alias="REBALANCER_MIN_INTERVAL_MINUTES")
 
     model_config = SettingsConfigDict(
         env_file=".env",
