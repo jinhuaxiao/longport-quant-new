@@ -119,24 +119,16 @@ class SignalGenerator:
             "9988.HK": {"name": "阿里巴巴-SW", "sector": "平台互联网"},
             "3690.HK": {"name": "美团-W", "sector": "平台互联网"},
             "1810.HK": {"name": "小米集团-W", "sector": "平台互联网"},
-            "9618.HK": {"name": "京东集团-SW", "sector": "平台互联网"},
-            "9888.HK": {"name": "百度集团-SW", "sector": "平台互联网"},
             "1024.HK": {"name": "快手-W", "sector": "平台互联网"},
-            "9999.HK": {"name": "网易-S", "sector": "平台互联网"},
 
             # === 半导体/光学（6个）===
             "0981.HK": {"name": "中芯国际", "sector": "半导体"},
             "1347.HK": {"name": "华虹半导体", "sector": "半导体"},
             "2382.HK": {"name": "舜宇光学科技", "sector": "光学"},
             "3888.HK": {"name": "金山软件", "sector": "软件"},
-            "0268.HK": {"name": "金蝶国际", "sector": "软件"},
-            "0992.HK": {"name": "联想集团", "sector": "硬件"},
 
             # === 新能源智能车（4个）===
             "1211.HK": {"name": "比亚迪股份", "sector": "新能源汽车"},
-            "2015.HK": {"name": "理想汽车-W", "sector": "新能源汽车"},
-            "9868.HK": {"name": "小鹏汽车-W", "sector": "新能源汽车"},
-            "9866.HK": {"name": "蔚来-SW", "sector": "新能源汽车"},
         }
 
         # 美股监控列表
@@ -164,6 +156,7 @@ class SignalGenerator:
             "NVDU.US": {"name": "英伟达二倍做多ETF", "sector": "ETF"},
             # 其他
             "RKLB.US": {"name": "火箭实验室", "sector": "航天"},
+            "RDDT.US": {"name": "reddit", "sector": "reddit"},
             "HOOD.US": {"name": "Robinhood", "sector": "金融科技"},
         }
 
@@ -212,7 +205,8 @@ class SignalGenerator:
 
         # 信号生成历史（防止重复信号）
         self.signal_history = {}  # {symbol: last_signal_time}
-        self.signal_cooldown = 900  # 信号冷却期（秒），15分钟内不重复生成同一标的的信号（修复：从5分钟延长到15分钟）
+        # 从配置读取冷却时间，默认900秒（15分钟）
+        self.signal_cooldown = int(getattr(self.settings, 'signal_cooldown_seconds', 900))
 
         # 🚫 防止频繁交易的历史记录（通过Redis共享）
         self.sell_history = {}  # {symbol: last_sell_time} - 用于卖出后再买入冷却期
@@ -470,8 +464,28 @@ class SignalGenerator:
         if await self.signal_queue.has_pending_signal(symbol, signal_type):
             return False, "队列中已有该标的的待处理信号"
 
-        # === BUY信号的去重检查 ===
+        # === BUY信号的去重与频控检查 ===
         if signal_type in ["BUY", "STRONG_BUY", "WEAK_BUY"]:
+            # 全局日度买单上限（可选）
+            if getattr(self.settings, 'enable_daily_trade_cap', False):
+                try:
+                    if len(self.traded_today) >= int(getattr(self.settings, 'daily_max_buy_orders', 9999)):
+                        return False, "已达今日买入上限"
+                except Exception:
+                    pass
+
+            # 单标的日度买单上限（可选，默认1次）
+            if getattr(self.settings, 'enable_per_symbol_daily_cap', False):
+                try:
+                    max_buys = int(getattr(self.settings, 'per_symbol_daily_max_buys', 1))
+                    # 使用OrderManager统计该标的今日买单次数（包括待成交）
+                    # 为降低DB压力，先用集合快速判断是否已买过一次
+                    if max_buys <= 0:
+                        return False, "单标的买入次数上限为0"
+                    if max_buys == 1 and symbol in self.traded_today:
+                        return False, "该标的今日已下过买单"
+                except Exception:
+                    pass
             # 🔥 修改：移除持仓去重检查，允许对已持仓标的加仓
             # 原因：如果某标的再次出现强买入信号，应该允许加仓（分批建仓策略）
 
@@ -509,8 +523,15 @@ class SignalGenerator:
             else:
                 logger.debug(f"  ℹ️  {symbol}: 今日未买过，允许买入")
 
-        # === SELL信号的去重检查 ===
+        # === SELL信号的去重与频控检查 ===
         elif signal_type in ["SELL", "STOP_LOSS", "TAKE_PROFIT", "SMART_TAKE_PROFIT", "EARLY_TAKE_PROFIT"]:
+            # 全局日度卖单上限（止损止盈不受限）
+            if signal_type not in ["STOP_LOSS", "TAKE_PROFIT"] and getattr(self.settings, 'enable_daily_trade_cap', False):
+                try:
+                    if len(self.sold_today) >= int(getattr(self.settings, 'daily_max_sell_orders', 9999)):
+                        return False, "已达今日卖出上限"
+                except Exception:
+                    pass
             # 第2层：检查是否还有持仓（已卖完则不再生成SELL信号）
             if symbol not in self.current_positions:
                 return False, "该标的已无持仓"
@@ -761,6 +782,7 @@ class SignalGenerator:
                     'score': 100,  # 止损最高优先级
                     'timestamp': datetime.now(self.beijing_tz).isoformat(),
                     'priority': 100,
+                    'strategy': 'HYBRID',
                     # 🔥 增强数据：供Slack通知使用
                     'cost_price': cost_price,
                     'entry_time': entry_time,
@@ -804,6 +826,7 @@ class SignalGenerator:
                     'score': 95,
                     'timestamp': datetime.now(self.beijing_tz).isoformat(),
                     'priority': 95,
+                    'strategy': 'HYBRID',
                     # 🔥 增强数据：供Slack通知使用
                     'cost_price': cost_price,
                     'entry_time': entry_time,
@@ -1464,6 +1487,7 @@ class SignalGenerator:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'reasons': reasons,
+                'strategy': 'HYBRID',
                 'indicators': {
                     'rsi': float(ind['rsi']),
                     'bb_upper': float(ind['bb_upper']),

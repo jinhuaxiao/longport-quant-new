@@ -46,6 +46,43 @@ class OrderRouter(AbstractAsyncContextManager):
         if self._risk_engine and not self._risk_engine.validate_order(order):
             logger.warning("Order blocked by risk engine: {}", order)
             raise ValueError("Order did not pass risk checks")
+
+        # Pre-check using broker estimate for BUY limit orders
+        try:
+            side = (order.get("side") or "").upper()
+            price = order.get("price")
+            if side in {"BUY", "B"} and price is not None:
+                symbol = order["symbol"]
+                qty = int(order.get("quantity", 0) or 0)
+                if qty <= 0:
+                    raise ValueError("Invalid order quantity")
+
+                resp = await self._client.estimate_max_purchase_quantity(
+                    symbol=symbol,
+                    order_type=openapi.OrderType.LO,
+                    side=openapi.OrderSide.Buy,
+                    price=float(price),
+                )
+
+                cash_max = int(getattr(resp, "cash_max_qty", 0) or 0)
+                margin_max = int(getattr(resp, "margin_max_qty", 0) or 0)
+                allow_max = max(cash_max, margin_max)
+
+                logger.debug(
+                    "Estimate buy limit for {} @ {}: cash={}, margin={}, max={}",
+                    symbol,
+                    price,
+                    cash_max,
+                    margin_max,
+                    allow_max,
+                )
+
+                if allow_max <= 0 or qty > allow_max:
+                    raise ValueError(f"Buy quantity {qty} exceeds limit {allow_max}")
+        except Exception as e:
+            # If estimate fails, continue submission but warn
+            logger.warning("Pre-check estimate failed, continue to submit: {}", e)
+
         return await self._client.submit_order(order)
 
     async def cancel(self, order_id: str) -> dict:

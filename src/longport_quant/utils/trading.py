@@ -35,11 +35,17 @@ class LotSizeHelper:
             # Fetch static info from API
             static_info = await quote_client.get_static_info([symbol])
             if static_info and len(static_info) > 0:
-                lot_size = getattr(static_info[0], 'lot_size', None)
-                if lot_size and lot_size > 0:
-                    self._lot_size_cache[symbol] = lot_size
-                    logger.debug(f"获取 {symbol} 手数: {lot_size}")
-                    return lot_size
+                info = static_info[0]
+                # 优先使用 board_lot，其次兼容旧字段 lot_size
+                lot_fields = [
+                    getattr(info, 'board_lot', None),
+                    getattr(info, 'lot_size', None)
+                ]
+                for lot_size in lot_fields:
+                    if lot_size and lot_size > 0:
+                        self._lot_size_cache[symbol] = lot_size
+                        logger.debug(f"获取 {symbol} 手数: {lot_size}")
+                        return lot_size
 
             # Default lot sizes based on market
             default_lot_size = 1 if ".US" in symbol else 100

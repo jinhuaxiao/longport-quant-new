@@ -129,13 +129,52 @@ start_account() {
     echo -e "${GREEN}🚀 启动账号:${NC} $account_id"
     echo
 
+    # 读取账号配置（用于策略开关等）
+    local config_file="$ACCOUNT_CONFIG_DIR/${account_id}.env"
+    if [ -f "$config_file" ]; then
+        # shellcheck disable=SC1090
+        source "$config_file"
+    fi
+
+    # 策略开关（默认启用=1，禁用=0）
+    # 默认仅启动综合（Signal Generator），其他策略需账号配置显式开启
+    ENABLE_STRATEGY_HYBRID=${ENABLE_STRATEGY_HYBRID:-1}
+    ENABLE_STRATEGY_ORB=${ENABLE_STRATEGY_ORB:-0}
+    ENABLE_STRATEGY_VWAP=${ENABLE_STRATEGY_VWAP:-0}
+    ENABLE_STRATEGY_DONCHIAN=${ENABLE_STRATEGY_DONCHIAN:-0}
+    ENABLE_STRATEGY_TD9=${ENABLE_STRATEGY_TD9:-0}
+    ENABLE_STRATEGY_GAP=${ENABLE_STRATEGY_GAP:-0}
+    ENABLE_STRATEGY_EMA_PB=${ENABLE_STRATEGY_EMA_PB:-0}
+
+    # 策略参数（可在账号env中覆盖）
+    ORB_WINDOW=${ORB_WINDOW:-5}
+    ORB_BUDGET_PCT=${ORB_BUDGET_PCT:-}
+    VWAP_DEV_PCT=${VWAP_DEV_PCT:-0.002}
+    VWAP_INTERVAL=${VWAP_INTERVAL:-10}
+    VWAP_BUDGET_PCT=${VWAP_BUDGET_PCT:-}
+    EMA_PB_NO_RSI=${EMA_PB_NO_RSI:-1}
+    EMA_PB_TOL=${EMA_PB_TOL:-0.01}
+    EMA_PB_INTERVAL=${EMA_PB_INTERVAL:-10}
+    EMA_PB_BUDGET_PCT=${EMA_PB_BUDGET_PCT:-}
+
     # 检查进程是否已经在运行
     local signal_pid=$(pgrep -f "signal_generator.py.*$account_id" || true)
+    local orb_pid=$(pgrep -f "strategy_orb.py.*$account_id" || true)
+    local vwap_pid=$(pgrep -f "strategy_vwap.py.*$account_id" || true)
+    local donchian_pid=$(pgrep -f "strategy_donchian.py.*$account_id" || true)
+    local td9_pid=$(pgrep -f "strategy_td9.py.*$account_id" || true)
+    local gap_pid=$(pgrep -f "strategy_gap.py.*$account_id" || true)
+    local ema_pb_pid=$(pgrep -f "strategy_ema_pullback.py.*$account_id" || true)
     local executor_pid=$(pgrep -f "order_executor.py.*$account_id" || true)
 
-    if [ -n "$signal_pid" ] || [ -n "$executor_pid" ]; then
+    if [ -n "$signal_pid" ] || [ -n "$executor_pid" ] || [ -n "$orb_pid" ] || [ -n "$vwap_pid" ] || [ -n "$donchian_pid" ]; then
         print_warning "账号 $account_id 的部分或全部进程已在运行:"
         [ -n "$signal_pid" ] && echo "  Signal Generator PID: $signal_pid"
+        [ -n "$orb_pid" ] && echo "  ORB Strategy PID: $orb_pid"
+        [ -n "$vwap_pid" ] && echo "  VWAP Strategy PID: $vwap_pid"
+        [ -n "$donchian_pid" ] && echo "  Donchian Strategy PID: $donchian_pid"
+        [ -n "$td9_pid" ] && echo "  TD9 Strategy PID: $td9_pid"
+        [ -n "$gap_pid" ] && echo "  GAP-Go Strategy PID: $gap_pid"
         [ -n "$executor_pid" ] && echo "  Order Executor PID: $executor_pid"
         echo
         read -p "是否要重启进程? (y/n) " -n 1 -r
@@ -148,19 +187,123 @@ start_account() {
         fi
     fi
 
-    # 启动signal_generator
-    print_info "启动 Signal Generator..."
-    nohup python3 scripts/signal_generator.py --account-id "$account_id" \
-        > "$LOG_DIR/signal_generator_${account_id}.log" 2>&1 &
-    local sg_pid=$!
-    sleep 1
-
-    if ps -p $sg_pid > /dev/null; then
-        print_success "Signal Generator 已启动 (PID: $sg_pid)"
+    # 启动 Hybrid（综合）
+    if [ "$ENABLE_STRATEGY_HYBRID" = "1" ]; then
+        print_info "启动 Signal Generator..."
+        nohup python3 scripts/signal_generator.py --account-id "$account_id" \
+            > "$LOG_DIR/signal_generator_${account_id}.log" 2>&1 &
+        local sg_pid=$!
+        sleep 1
+        if ps -p $sg_pid > /dev/null; then
+            print_success "Signal Generator 已启动 (PID: $sg_pid)"
+        else
+            print_warning "Signal Generator 启动未确认（请检查日志）"
+        fi
     else
-        print_error "Signal Generator 启动失败"
-        print_info "查看日志: tail -f $LOG_DIR/signal_generator_${account_id}.log"
-        return 1
+        print_warning "跳过启动 Signal Generator（已禁用）"
+    fi
+
+    # 启动 ORB 策略
+    if [ "$ENABLE_STRATEGY_ORB" = "1" ]; then
+        print_info "启动 ORB 策略..."
+        orb_args=(--account-id "$account_id" --window "$ORB_WINDOW")
+        if [ -n "$ORB_BUDGET_PCT" ]; then orb_args+=(--budget-pct "$ORB_BUDGET_PCT"); fi
+        nohup python3 scripts/strategy_orb.py "${orb_args[@]}" \
+            > "$LOG_DIR/strategy_orb_${account_id}.log" 2>&1 &
+        local orb_p=$!
+        sleep 1
+        if ps -p $orb_p > /dev/null; then
+            print_success "ORB 已启动 (PID: $orb_p)"
+        else
+            print_warning "ORB 启动未确认（请检查日志）"
+        fi
+    else
+        print_warning "跳过启动 ORB（已禁用）"
+    fi
+
+    # 启动 VWAP 策略
+    if [ "$ENABLE_STRATEGY_VWAP" = "1" ]; then
+        print_info "启动 VWAP 策略..."
+        vwap_args=(--account-id "$account_id" --dev-pct "$VWAP_DEV_PCT" --interval "$VWAP_INTERVAL")
+        if [ -n "$VWAP_BUDGET_PCT" ]; then vwap_args+=(--budget-pct "$VWAP_BUDGET_PCT"); fi
+        nohup python3 scripts/strategy_vwap.py "${vwap_args[@]}" \
+            > "$LOG_DIR/strategy_vwap_${account_id}.log" 2>&1 &
+        local vwap_p=$!
+        sleep 1
+        if ps -p $vwap_p > /dev/null; then
+            print_success "VWAP 已启动 (PID: $vwap_p)"
+        else
+            print_warning "VWAP 启动未确认（请检查日志）"
+        fi
+    else
+        print_warning "跳过启动 VWAP（已禁用）"
+    fi
+
+    # 启动 Donchian 策略
+    if [ "$ENABLE_STRATEGY_DONCHIAN" = "1" ]; then
+        print_info "启动 Donchian 策略..."
+        nohup python3 scripts/strategy_donchian.py --account-id "$account_id" \
+            > "$LOG_DIR/strategy_donchian_${account_id}.log" 2>&1 &
+        local donch_p=$!
+        sleep 1
+        if ps -p $donch_p > /dev/null; then
+            print_success "Donchian 已启动 (PID: $donch_p)"
+        else
+            print_warning "Donchian 启动未确认（请检查日志）"
+        fi
+    else
+        print_warning "跳过启动 Donchian（已禁用）"
+    fi
+
+    # 启动 TD9 策略
+    if [ "$ENABLE_STRATEGY_TD9" = "1" ]; then
+        print_info "启动 TD9 策略..."
+        nohup python3 scripts/strategy_td9.py --account-id "$account_id" \
+            > "$LOG_DIR/strategy_td9_${account_id}.log" 2>&1 &
+        local td9_p=$!
+        sleep 1
+        if ps -p $td9_p > /dev/null; then
+            print_success "TD9 已启动 (PID: $td9_p)"
+        else
+            print_warning "TD9 启动未确认（请检查日志）"
+        fi
+    else
+        print_warning "跳过启动 TD9（已禁用）"
+    fi
+
+    # 启动 GAP-Go 策略
+    if [ "$ENABLE_STRATEGY_GAP" = "1" ]; then
+        print_info "启动 GAP-Go 策略..."
+        nohup python3 scripts/strategy_gap.py --account-id "$account_id" \
+            > "$LOG_DIR/strategy_gap_${account_id}.log" 2>&1 &
+        local gap_p=$!
+        sleep 1
+        if ps -p $gap_p > /dev/null; then
+            print_success "GAP-Go 已启动 (PID: $gap_p)"
+        else
+            print_warning "GAP-Go 启动未确认（请检查日志）"
+        fi
+    else
+        print_warning "跳过启动 GAP-Go（已禁用）"
+    fi
+
+    # 启动 EMA Pullback 策略
+    if [ "$ENABLE_STRATEGY_EMA_PB" = "1" ]; then
+        print_info "启动 EMA Pullback 策略..."
+        ema_args=(--account-id "$account_id" --tol-percent "$EMA_PB_TOL" --interval-min "$EMA_PB_INTERVAL")
+        if [ "$EMA_PB_NO_RSI" = "1" ]; then ema_args+=(--no-rsi); fi
+        if [ -n "$EMA_PB_BUDGET_PCT" ]; then ema_args+=(--budget-pct "$EMA_PB_BUDGET_PCT"); fi
+        nohup python3 scripts/strategy_ema_pullback.py "${ema_args[@]}" \
+            > "$LOG_DIR/strategy_ema_pb_${account_id}.log" 2>&1 &
+        local ema_pb_p=$!
+        sleep 1
+        if ps -p $ema_pb_p > /dev/null; then
+            print_success "EMA Pullback 已启动 (PID: $ema_pb_p)"
+        else
+            print_warning "EMA Pullback 启动未确认（请检查日志）"
+        fi
+    else
+        print_warning "跳过启动 EMA Pullback（已禁用）"
     fi
 
     # 启动order_executor
@@ -184,6 +327,11 @@ start_account() {
     print_success "账号 $account_id 启动完成!"
     print_info "查看日志:"
     echo "  • Signal Generator: tail -f $LOG_DIR/signal_generator_${account_id}.log"
+    echo "  • ORB Strategy:     tail -f $LOG_DIR/strategy_orb_${account_id}.log"
+    echo "  • VWAP Strategy:    tail -f $LOG_DIR/strategy_vwap_${account_id}.log"
+    echo "  • Donchian:         tail -f $LOG_DIR/strategy_donchian_${account_id}.log"
+    echo "  • TD9:              tail -f $LOG_DIR/strategy_td9_${account_id}.log"
+    echo "  • GAP-Go:           tail -f $LOG_DIR/strategy_gap_${account_id}.log"
     echo "  • Order Executor:   tail -f $LOG_DIR/order_executor_${account_id}.log"
 }
 
@@ -205,9 +353,15 @@ stop_account() {
 
     # 查找进程
     local signal_pids=$(pgrep -f "signal_generator.py.*$account_id" || true)
+    local orb_pids=$(pgrep -f "strategy_orb.py.*$account_id" || true)
+    local vwap_pids=$(pgrep -f "strategy_vwap.py.*$account_id" || true)
+    local donchian_pids=$(pgrep -f "strategy_donchian.py.*$account_id" || true)
+    local td9_pids=$(pgrep -f "strategy_td9.py.*$account_id" || true)
+    local gap_pids=$(pgrep -f "strategy_gap.py.*$account_id" || true)
+    local ema_pb_pids=$(pgrep -f "strategy_ema_pullback.py.*$account_id" || true)
     local executor_pids=$(pgrep -f "order_executor.py.*$account_id" || true)
 
-    if [ -z "$signal_pids" ] && [ -z "$executor_pids" ]; then
+    if [ -z "$signal_pids" ] && [ -z "$executor_pids" ] && [ -z "$orb_pids" ] && [ -z "$vwap_pids" ] && [ -z "$donchian_pids" ] && [ -z "$td9_pids" ] && [ -z "$gap_pids" ] && [ -z "$ema_pb_pids" ]; then
         print_warning "没有找到账号 $account_id 的运行进程"
         return 0
     fi
@@ -216,6 +370,60 @@ stop_account() {
     if [ -n "$signal_pids" ]; then
         print_info "停止 Signal Generator..."
         echo "$signal_pids" | while read pid; do
+            kill -TERM "$pid" 2>/dev/null || true
+            print_success "已发送停止信号到 PID: $pid"
+        done
+    fi
+
+    # 停止 ORB
+    if [ -n "$orb_pids" ]; then
+        print_info "停止 ORB 策略..."
+        echo "$orb_pids" | while read pid; do
+            kill -TERM "$pid" 2>/dev/null || true
+            print_success "已发送停止信号到 PID: $pid"
+        done
+    fi
+
+    # 停止 VWAP
+    if [ -n "$vwap_pids" ]; then
+        print_info "停止 VWAP 策略..."
+        echo "$vwap_pids" | while read pid; do
+            kill -TERM "$pid" 2>/dev/null || true
+            print_success "已发送停止信号到 PID: $pid"
+        done
+    fi
+
+    # 停止 Donchian
+    if [ -n "$donchian_pids" ]; then
+        print_info "停止 Donchian 策略..."
+        echo "$donchian_pids" | while read pid; do
+            kill -TERM "$pid" 2>/dev/null || true
+            print_success "已发送停止信号到 PID: $pid"
+        done
+    fi
+
+    # 停止 TD9
+    if [ -n "$td9_pids" ]; then
+        print_info "停止 TD9 策略..."
+        echo "$td9_pids" | while read pid; do
+            kill -TERM "$pid" 2>/dev/null || true
+            print_success "已发送停止信号到 PID: $pid"
+        done
+    fi
+
+    # 停止 GAP-Go
+    if [ -n "$gap_pids" ]; then
+        print_info "停止 GAP-Go 策略..."
+        echo "$gap_pids" | while read pid; do
+            kill -TERM "$pid" 2>/dev/null || true
+            print_success "已发送停止信号到 PID: $pid"
+        done
+    fi
+
+    # 停止 EMA Pullback
+    if [ -n "$ema_pb_pids" ]; then
+        print_info "停止 EMA Pullback 策略..."
+        echo "$ema_pb_pids" | while read pid; do
             kill -TERM "$pid" 2>/dev/null || true
             print_success "已发送停止信号到 PID: $pid"
         done
@@ -236,11 +444,23 @@ stop_account() {
 
     # 检查是否还有进程在运行
     local remaining_signal=$(pgrep -f "signal_generator.py.*$account_id" || true)
+    local remaining_orb=$(pgrep -f "strategy_orb.py.*$account_id" || true)
+    local remaining_vwap=$(pgrep -f "strategy_vwap.py.*$account_id" || true)
+    local remaining_donch=$(pgrep -f "strategy_donchian.py.*$account_id" || true)
+    local remaining_td9=$(pgrep -f "strategy_td9.py.*$account_id" || true)
+    local remaining_gap=$(pgrep -f "strategy_gap.py.*$account_id" || true)
     local remaining_executor=$(pgrep -f "order_executor.py.*$account_id" || true)
+    local remaining_ema_pb=$(pgrep -f "strategy_ema_pullback.py.*$account_id" || true)
 
-    if [ -n "$remaining_signal" ] || [ -n "$remaining_executor" ]; then
+    if [ -n "$remaining_signal" ] || [ -n "$remaining_executor" ] || [ -n "$remaining_orb" ] || [ -n "$remaining_vwap" ] || [ -n "$remaining_donch" ] || [ -n "$remaining_td9" ] || [ -n "$remaining_gap" ] || [ -n "$remaining_ema_pb" ]; then
         print_warning "部分进程未能正常退出，强制终止..."
         [ -n "$remaining_signal" ] && kill -9 $remaining_signal 2>/dev/null || true
+        [ -n "$remaining_orb" ] && kill -9 $remaining_orb 2>/dev/null || true
+        [ -n "$remaining_vwap" ] && kill -9 $remaining_vwap 2>/dev/null || true
+        [ -n "$remaining_donch" ] && kill -9 $remaining_donch 2>/dev/null || true
+        [ -n "$remaining_td9" ] && kill -9 $remaining_td9 2>/dev/null || true
+        [ -n "$remaining_gap" ] && kill -9 $remaining_gap 2>/dev/null || true
+        [ -n "$remaining_ema_pb" ] && kill -9 $remaining_ema_pb 2>/dev/null || true
         [ -n "$remaining_executor" ] && kill -9 $remaining_executor 2>/dev/null || true
     fi
 
@@ -278,9 +498,21 @@ status_account() {
         echo
 
         local signal_pid=$(pgrep -f "signal_generator.py.*$account_id" || true)
+        local orb_pid=$(pgrep -f "strategy_orb.py.*$account_id" || true)
+        local vwap_pid=$(pgrep -f "strategy_vwap.py.*$account_id" || true)
+        local donchian_pid=$(pgrep -f "strategy_donchian.py.*$account_id" || true)
+        local td9_pid=$(pgrep -f "strategy_td9.py.*$account_id" || true)
+        local gap_pid=$(pgrep -f "strategy_gap.py.*$account_id" || true)
+        local ema_pb_pid=$(pgrep -f "strategy_ema_pullback.py.*$account_id" || true)
         local executor_pid=$(pgrep -f "order_executor.py.*$account_id" || true)
 
         echo -e "Signal Generator:  $([ -n "$signal_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $signal_pid)" || echo -e "${RED}未运行${NC}")"
+        echo -e "ORB Strategy:      $([ -n "$orb_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $orb_pid)" || echo -e "${RED}未运行${NC}")"
+        echo -e "VWAP Strategy:     $([ -n "$vwap_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $vwap_pid)" || echo -e "${RED}未运行${NC}")"
+        echo -e "Donchian Strategy: $([ -n "$donchian_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $donchian_pid)" || echo -e "${RED}未运行${NC}")"
+        echo -e "TD9 Strategy:      $([ -n "$td9_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $td9_pid)" || echo -e "${RED}未运行${NC}")"
+        echo -e "GAP-Go Strategy:   $([ -n "$gap_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $gap_pid)" || echo -e "${RED}未运行${NC}")"
+        echo -e "EMA Pullback:      $([ -n "$ema_pb_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $ema_pb_pid)" || echo -e "${RED}未运行${NC}")"
         echo -e "Order Executor:    $([ -n "$executor_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $executor_pid)" || echo -e "${RED}未运行${NC}")"
 
         echo
@@ -305,10 +537,22 @@ status_account() {
             if [ -f "$config_file" ]; then
                 local acc_id=$(basename "$config_file" .env)
                 local signal_pid=$(pgrep -f "signal_generator.py.*$acc_id" || true)
+                local orb_pid=$(pgrep -f "strategy_orb.py.*$acc_id" || true)
+                local vwap_pid=$(pgrep -f "strategy_vwap.py.*$acc_id" || true)
+                local donchian_pid=$(pgrep -f "strategy_donchian.py.*$acc_id" || true)
+                local td9_pid=$(pgrep -f "strategy_td9.py.*$acc_id" || true)
+                local gap_pid=$(pgrep -f "strategy_gap.py.*$acc_id" || true)
+                local ema_pb_pid=$(pgrep -f "strategy_ema_pullback.py.*$acc_id" || true)
                 local executor_pid=$(pgrep -f "order_executor.py.*$acc_id" || true)
 
                 echo -e "${YELLOW}▶${NC} $acc_id"
                 echo -e "  Signal Generator:  $([ -n "$signal_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $signal_pid)" || echo -e "${RED}未运行${NC}")"
+                echo -e "  ORB Strategy:      $([ -n "$orb_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $orb_pid)" || echo -e "${RED}未运行${NC}")"
+                echo -e "  VWAP Strategy:     $([ -n "$vwap_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $vwap_pid)" || echo -e "${RED}未运行${NC}")"
+                echo -e "  Donchian Strategy: $([ -n "$donchian_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $donchian_pid)" || echo -e "${RED}未运行${NC}")"
+                echo -e "  TD9 Strategy:      $([ -n "$td9_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $td9_pid)" || echo -e "${RED}未运行${NC}")"
+                echo -e "  GAP-Go Strategy:   $([ -n "$gap_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $gap_pid)" || echo -e "${RED}未运行${NC}")"
+                echo -e "  EMA Pullback:      $([ -n "$ema_pb_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $ema_pb_pid)" || echo -e "${RED}未运行${NC}")"
                 echo -e "  Order Executor:    $([ -n "$executor_pid" ] && echo -e "${GREEN}运行中${NC} (PID: $executor_pid)" || echo -e "${RED}未运行${NC}")"
                 echo
 
@@ -376,12 +620,30 @@ show_help() {
     echo "示例:"
     echo "  $0 list                    # 列出所有账号"
     echo "  $0 start paper_001         # 启动模拟账号"
+    echo "     (将同时启动: Hybrid, ORB, VWAP, Donchian 策略 + Executor)"
     echo "  $0 start live_001          # 启动真实账号"
     echo "  $0 stop paper_001          # 停止模拟账号"
     echo "  $0 status                  # 查看所有账号状态"
     echo "  $0 status paper_001        # 查看指定账号状态"
     echo "  $0 logs paper_001 signal   # 查看信号生成器日志"
     echo "  $0 logs paper_001 executor # 查看订单执行器日志"
+    echo
+    echo "策略开关（在账号 env 中配置，1=启用 0=禁用）："
+    echo "  ENABLE_STRATEGY_HYBRID=1     # 综合信号 (scripts/signal_generator.py)"
+    echo "  ENABLE_STRATEGY_ORB=1        # 开盘区间突破"
+    echo "  ENABLE_STRATEGY_VWAP=1       # VWAP/AVWAP 日内"
+    echo "  ENABLE_STRATEGY_DONCHIAN=1   # 唐奇安通道（海龟）"
+    echo "  ENABLE_STRATEGY_TD9=1        # TD9（简化 Buy Setup）"
+    echo "  ENABLE_STRATEGY_GAP=1        # 缺口延续（Gap-and-Go）"
+    echo "  ENABLE_STRATEGY_EMA_PB=1     # EMA 回撤上车"
+    echo
+    echo "示例（configs/accounts/paper_001.env）："
+    echo "  ENABLE_STRATEGY_ORB=1"
+    echo "  ENABLE_STRATEGY_VWAP=0"
+    echo "  ENABLE_STRATEGY_DONCHIAN=1"
+    echo "  ENABLE_STRATEGY_TD9=1"
+    echo "  ENABLE_STRATEGY_GAP=0"
+    echo "  ENABLE_STRATEGY_EMA_PB=1"
 }
 
 ###########################################

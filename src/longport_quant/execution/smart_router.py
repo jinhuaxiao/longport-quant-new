@@ -523,6 +523,46 @@ class SmartOrderRouter:
                 logger.error(f"  ❌ 调整后数量为0，无法下单")
                 return ExecutionResult(success=False, error_message="调整后数量为0，无法下单")
 
+            # 🔍 下单前调用券商可买上限估算（仅BUY/限价单）
+            if request.side == "BUY":
+                try:
+                    # 使用已校正的限价作为估算价格（float更兼容该接口）
+                    est_price = float(limit_price)
+                    resp = await asyncio.to_thread(
+                        self.trade_context.estimate_max_purchase_quantity,
+                        request.symbol,
+                        OrderType.LO,
+                        OrderSide.Buy,
+                        est_price,
+                        None,  # currency
+                        None,  # order_id
+                        False  # fractional_shares
+                    )
+
+                    cash_max = int(getattr(resp, "cash_max_qty", 0) or 0)
+                    margin_max = int(getattr(resp, "margin_max_qty", 0) or 0)
+                    allow_max = max(cash_max, margin_max)
+
+                    logger.debug(
+                        f"  🧮 券商可买上限估算: 现金={cash_max}, 融资={margin_max}, 取最大={allow_max}"
+                    )
+
+                    if allow_max <= 0:
+                        logger.error("  ❌ 券商估算可买数量为0，跳过下单")
+                        return ExecutionResult(success=False, error_message="可买数量为0")
+
+                    if request.quantity > allow_max:
+                        logger.error(
+                            f"  ❌ 请求数量{request.quantity}超过券商可买上限{allow_max}，跳过下单"
+                        )
+                        return ExecutionResult(
+                            success=False,
+                            error_message=f"买入数量超过可买上限({allow_max})"
+                        )
+                except Exception as e:
+                    # 估算失败时不中断下单流程，仅警告
+                    logger.warning(f"  ⚠️ 可买上限估算失败，继续下单: {e}")
+
             # Submit limit order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 

@@ -59,6 +59,8 @@ class SignalQueue:
 
         # 日志限流：记录上次输出空队列日志的时间
         self._last_empty_log_time = 0
+        # 最近一次仅遇到延迟信号时的最短等待提示（秒）
+        self._last_delay_hint: Optional[float] = None
 
     async def _get_redis(self):
         """获取Redis连接（懒加载）"""
@@ -238,6 +240,8 @@ class SignalQueue:
             max_attempts = 10  # 最多尝试10次
             skipped_signals = []  # 记录被跳过的信号
 
+            min_wait_seconds: Optional[float] = None
+
             for attempt in range(max_attempts):
                 # 使用ZPOPMIN获取最高优先级（最低负分）的信号
                 # 因为score是负数，最小的score（如-65）对应最高的优先级（65）
@@ -247,6 +251,7 @@ class SignalQueue:
                     # 队列为空，将之前跳过的信号放回
                     for sig_json, sig_score in skipped_signals:
                         await redis.zadd(self.queue_key, {sig_json: sig_score})
+                    self._last_delay_hint = None
                     return None
 
                 signal_json, score = result[0]
@@ -286,6 +291,9 @@ class SignalQueue:
 
                         # 未到重试时间，记录并继续尝试下一个
                         skipped_signals.append((signal_json, score))
+                        wait_seconds = max(0.0, signal['retry_after'] - time.time())
+                        if min_wait_seconds is None or wait_seconds < min_wait_seconds:
+                            min_wait_seconds = wait_seconds
 
                         # 只在第一次遇到时记录日志（避免刷屏）
                         if len(skipped_signals) == 1:
@@ -320,6 +328,7 @@ class SignalQueue:
                     f"剩余队列长度={await self.get_queue_size()}"
                 )
 
+                self._last_delay_hint = None
                 return signal
 
             # 🔥 所有信号都未到重试时间，将它们放回队列
@@ -334,6 +343,13 @@ class SignalQueue:
                         f"⏰ 队列中所有信号({len(skipped_signals)}个)都未到重试时间，暂无可处理信号"
                     )
                     self._last_empty_log_time = current_time
+
+                if min_wait_seconds is not None:
+                    self._last_delay_hint = max(0.0, min_wait_seconds)
+                else:
+                    self._last_delay_hint = None
+            else:
+                self._last_delay_hint = None
 
             return None
 
