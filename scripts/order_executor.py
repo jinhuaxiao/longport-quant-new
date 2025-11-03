@@ -19,6 +19,7 @@
 
 import asyncio
 import sys
+import time
 from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -177,6 +178,13 @@ class OrderExecutor:
                     except Exception as e:
                         logger.warning(f"⚠️ 启动去杠杆任务失败: {e}")
 
+                # 🔥 启动队列状态通知任务（每小时汇报）
+                try:
+                    self._queue_status_task = asyncio.create_task(self._queue_status_notifier())
+                    logger.info("✅ 队列状态通知已启动（每小时汇报）")
+                except Exception as e:
+                    logger.warning(f"⚠️ 启动队列状态通知失败: {e}")
+
                 logger.info("✅ 订单执行器初始化完成")
 
                 # 启动时恢复所有僵尸信号
@@ -248,18 +256,16 @@ class OrderExecutor:
                                 )
 
                             except InsufficientFundsError as e:
-                                # 资金不足：停止处理当前批次，剩余信号延迟重试
+                                # 资金不足：只延迟当前信号，继续处理后续信号（可能需要更少资金）
                                 logger.warning(f"  ⚠️ [{idx}/{len(batch)}] {symbol}: 资金不足")
-                                logger.info(f"  💡 策略：将剩余{len(batch)-idx}个信号延迟重试")
+                                logger.info(f"  💡 策略：仅延迟当前信号，继续处理后续{len(batch)-idx}个信号")
 
-                                # 当前信号也加入待重新入队列表
+                                # 只将当前信号加入待重新入队列表
                                 remaining_signals.append(signal)
 
-                                # 将后续所有信号也加入待重新入队列表
-                                remaining_signals.extend(batch[idx:])
-
+                                # 标记此信号为资金不足（用于统计）
                                 funds_exhausted = True
-                                break  # 跳出循环，不再处理本批次剩余信号
+                                # 不break，继续处理后续信号
 
                             except Exception as e:
                                 error_msg = f"{type(e).__name__}: {str(e)}"
@@ -274,19 +280,20 @@ class OrderExecutor:
 
                         # 批次处理完成后的统计
                         logger.info(f"\n{'='*70}")
-                        if funds_exhausted:
-                            logger.warning(f"⚠️ 批次处理中断: 资金不足")
-                            logger.info(f"  已处理: {idx-1}/{len(batch)}个信号")
-                            logger.info(f"  待重试: {len(remaining_signals)}个信号")
+                        if remaining_signals:
+                            logger.warning(f"⚠️ 批次处理完成: 部分信号资金不足")
+                            logger.info(f"  已处理: {len(batch)}个信号")
+                            logger.info(f"  成功/失败: {len(batch)-len(remaining_signals)}/{len(remaining_signals)}个")
+                            logger.info(f"  待重试: {len(remaining_signals)}个信号（资金不足）")
 
-                            # 重新入队剩余信号
+                            # 重新入队资金不足的信号
                             requeued = await self._requeue_remaining(
                                 remaining_signals,
                                 reason="资金不足"
                             )
                             logger.info(f"  ✅ 已重新入队: {requeued}个信号")
                         else:
-                            logger.success(f"✅ 批次处理完成: {len(batch)}/{len(batch)}个信号")
+                            logger.success(f"✅ 批次处理完成: {len(batch)}/{len(batch)}个信号全部成功")
 
                         logger.info(f"{'='*70}\n")
 
@@ -868,6 +875,80 @@ class OrderExecutor:
             except Exception as e:
                 logger.warning(f"⚠️ 去杠杆任务失败: {e}")
             await asyncio.sleep(interval)
+
+    async def _queue_status_notifier(self):
+        """周期性发送队列状态摘要（每小时）"""
+        interval = 3600  # 1小时
+        last_empty_alert_time = 0
+        consecutive_empty_count = 0
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+
+                # 获取队列状态
+                queue_size = await self.signal_queue.get_queue_size()
+                delayed_count = await self.signal_queue.count_delayed_signals(
+                    account=self.settings.account_id
+                )
+
+                # 获取账户信息
+                try:
+                    account = await self.trade_client.get_account()
+                    hkd_cash = account["cash"].get("HKD", 0)
+                    usd_cash = account["cash"].get("USD", 0)
+                    hkd_power = account.get("buy_power", {}).get("HKD", 0)
+                    usd_power = account.get("buy_power", {}).get("USD", 0)
+                except:
+                    hkd_cash = usd_cash = hkd_power = usd_power = 0
+
+                # 队列长时间为空的警告（连续3小时）
+                if queue_size == 0:
+                    consecutive_empty_count += 1
+                    if consecutive_empty_count >= 3 and (time.time() - last_empty_alert_time) > 10800:
+                        # 3小时警告
+                        message = (
+                            f"⚠️ **队列长时间为空警告**\n\n"
+                            f"📊 队列已连续 {consecutive_empty_count} 小时为空\n\n"
+                            f"可能原因：\n"
+                            f"   • 信号生成器未运行\n"
+                            f"   • 市场无交易机会\n"
+                            f"   • 所有策略已关闭\n\n"
+                            f"💡 建议检查信号生成器和策略配置"
+                        )
+                        if self.slack:
+                            await self.slack.send(message)
+                        last_empty_alert_time = time.time()
+                else:
+                    consecutive_empty_count = 0
+
+                # 正常的每小时摘要（只在队列有信号或有延迟信号时发送）
+                if queue_size > 0 or delayed_count > 0:
+                    status_emoji = "✅" if delayed_count == 0 else "⚠️"
+
+                    message = (
+                        f"{status_emoji} **队列状态摘要**\n\n"
+                        f"📊 **队列统计：**\n"
+                        f"   • 待处理信号: {queue_size}个\n"
+                        f"   • 延迟信号: {delayed_count}个\n\n"
+                        f"💰 **账户状态：**\n"
+                        f"   • HKD现金: ${hkd_cash:,.2f}\n"
+                        f"   • HKD购买力: ${hkd_power:,.2f}\n"
+                        f"   • USD现金: ${usd_cash:,.2f}\n"
+                        f"   • USD购买力: ${usd_power:,.2f}\n\n"
+                        f"🕐 下次汇报: 1小时后"
+                    )
+
+                    if delayed_count > 0:
+                        message += f"\n\n💡 **提示:** 有{delayed_count}个信号因资金不足延迟处理"
+
+                    if self.slack:
+                        await self.slack.send(message)
+
+                logger.debug(f"队列状态摘要已发送: {queue_size}个待处理, {delayed_count}个延迟")
+
+            except Exception as e:
+                logger.warning(f"⚠️ 发送队列状态摘要失败: {e}")
 
     async def _send_regime_notification(self, res):
         emoji = {'BULL': '🟢', 'RANGE': '🟡', 'BEAR': '🔴'}.get(res.regime, '🔘')
@@ -1613,6 +1694,9 @@ class OrderExecutor:
             if self.slack:
                 await self._send_sell_notification(symbol, signal, order, final_quantity, final_price)
 
+            # 🔥 卖出后检查并唤醒延迟信号（资金释放后可能可以处理）
+            await self._check_delayed_signals()
+
         except Exception as e:
             logger.error(f"❌ 提交平仓订单失败: {e}")
             raise
@@ -2135,6 +2219,38 @@ class OrderExecutor:
         except Exception as e:
             logger.warning(f"⚠️ 发送失败通知到Slack时出错: {e}")
 
+    async def _check_delayed_signals(self):
+        """
+        检查并唤醒延迟信号（卖出后资金可能充足）
+
+        应在卖出订单完成后调用，让因资金不足延迟的信号立即可被处理
+        """
+        try:
+            # 统计延迟信号数量
+            delayed_count = await self.signal_queue.count_delayed_signals(
+                account=self.settings.account_id
+            )
+
+            if delayed_count > 0:
+                logger.info(
+                    f"💰 卖出后资金释放，检测到{delayed_count}个延迟信号，尝试唤醒..."
+                )
+
+                # 唤醒延迟信号
+                woken_count = await self.signal_queue.wake_up_delayed_signals(
+                    account=self.settings.account_id
+                )
+
+                if woken_count > 0:
+                    logger.success(
+                        f"✅ 已唤醒{woken_count}个延迟信号，将在下次循环中处理"
+                    )
+            else:
+                logger.debug("  无延迟信号需要唤醒")
+
+        except Exception as e:
+            logger.warning(f"⚠️ 检查延迟信号失败（不影响主流程）: {e}")
+
     async def _try_smart_rotation(
         self,
         signal: Dict,
@@ -2517,8 +2633,108 @@ class OrderExecutor:
                     f"  ✅ {symbol} 已重新入队（第{signal['retry_count']}次重试，"
                     f"{delay_minutes}分钟后重试，分数{score}→{score-20}）"
                 )
+
+                # 🔥 新增：高分信号延迟通知（只在首次延迟时通知）
+                if score >= 60 and signal['retry_count'] == 1 and self.slack and reason == "资金不足":
+                    try:
+                        # 获取账户信息
+                        try:
+                            account = await self.trade_client.get_account()
+                            currency = "HKD" if ".HK" in symbol else "USD"
+                            cash = account["cash"].get(currency, 0)
+                            power = account.get("buy_power", {}).get(currency, 0)
+                        except:
+                            currency = "HKD" if ".HK" in symbol else "USD"
+                            cash = power = 0
+
+                        # 估算所需资金（简单估算）
+                        current_price = signal.get('price', 0)
+                        lot_size = 100 if ".HK" in symbol else 1
+                        estimated_need = current_price * lot_size if current_price > 0 else 0
+
+                        # 获取信号原因
+                        reason_text = signal.get('reason', '无')
+                        if len(reason_text) > 200:
+                            reason_text = reason_text[:200] + "..."
+
+                        high_signal_message = (
+                            f"🎯 **高分信号延迟处理**\n\n"
+                            f"⚠️ 评分{score}分的优质信号因资金不足被延迟\n\n"
+                            f"📊 **信号详情:**\n"
+                            f"   • 标的: {symbol}\n"
+                            f"   • 评分: {score}/100 (高质量信号)\n"
+                            f"   • 类型: {signal.get('type', 'BUY')}\n"
+                            f"   • 价格: ${current_price:.2f}\n"
+                            f"   • 原因: {reason_text}\n\n"
+                            f"⏰ **延迟信息:**\n"
+                            f"   • 原因: 资金不足\n"
+                            f"   • 预计重试: {delay_minutes}分钟后\n"
+                            f"   • 重试次数: 1/{self.settings.funds_retry_max}\n\n"
+                            f"💰 **账户状态 ({currency}):**\n"
+                            f"   • 现金: ${cash:,.2f}\n"
+                            f"   • 购买力: ${power:,.2f}\n"
+                        )
+
+                        if estimated_need > 0:
+                            high_signal_message += f"   • 估算需要: ${estimated_need:,.2f}\n"
+
+                        high_signal_message += (
+                            f"\n💡 **可选操作:**\n"
+                            f"   • 手动下单（如果认为机会重要）\n"
+                            f"   • 卖出部分持仓释放资金\n"
+                            f"   • 等待自动重试（共{self.settings.funds_retry_max}次机会）"
+                        )
+
+                        await self.slack.send(high_signal_message)
+                        logger.info(f"  📨 已发送高分信号延迟通知: {symbol} ({score}分)")
+
+                    except Exception as e:
+                        logger.warning(f"⚠️ 发送高分信号通知失败: {e}")
+
             else:
                 logger.error(f"  ❌ {symbol} 重新入队失败")
+
+        # 🔥 发送Slack通知：资金不足导致信号延迟
+        if requeued_count > 0 and self.slack and reason == "资金不足":
+            try:
+                # 获取账户信息用于通知
+                try:
+                    account = await self.trade_client.get_account()
+                    hkd_cash = account["cash"].get("HKD", 0)
+                    usd_cash = account["cash"].get("USD", 0)
+                    hkd_power = account.get("buy_power", {}).get("HKD", 0)
+                    usd_power = account.get("buy_power", {}).get("USD", 0)
+                except:
+                    hkd_cash = usd_cash = hkd_power = usd_power = 0
+
+                # 构建延迟信号列表
+                signals_list = []
+                for sig in remaining_signals[:5]:  # 最多显示5个
+                    symbol = sig.get('symbol', 'N/A')
+                    score = sig.get('score', 0)
+                    retry_count = sig.get('retry_count', 0)
+                    delay_min = min(self.settings.funds_retry_delay * retry_count, 30)
+                    signals_list.append(f"   • {symbol} (评分{score}, {delay_min}分钟后重试)")
+
+                more_count = len(remaining_signals) - 5
+                if more_count > 0:
+                    signals_list.append(f"   • ... 还有{more_count}个信号")
+
+                message = (
+                    f"⚠️ **资金不足 - {requeued_count}个信号延迟处理**\n\n"
+                    f"📊 **当前账户状态:**\n"
+                    f"   • HKD现金: ${hkd_cash:,.2f}\n"
+                    f"   • HKD购买力: ${hkd_power:,.2f}\n"
+                    f"   • USD现金: ${usd_cash:,.2f}\n"
+                    f"   • USD购买力: ${usd_power:,.2f}\n\n"
+                    f"⏰ **延迟信号列表:**\n"
+                    + "\n".join(signals_list) + "\n\n"
+                    f"💡 **建议:** 卖出部分持仓释放资金，或等待延迟信号自动重试"
+                )
+
+                await self.slack.send(message)
+            except Exception as e:
+                logger.warning(f"⚠️ 发送资金不足通知失败: {e}")
 
         return requeued_count
 

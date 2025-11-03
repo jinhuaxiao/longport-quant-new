@@ -637,14 +637,17 @@ class SignalQueue:
 
     async def has_pending_signal(self, symbol: str, signal_type: str = None) -> bool:
         """
-        检查队列中是否已存在该标的的待处理信号
+        检查队列中是否已存在该标的的待处理信号（排除延迟信号）
+
+        延迟信号（retry_after未到）不应阻止新信号生成。
+        只有真正待处理的信号才应该去重。
 
         Args:
             symbol: 标的代码
             signal_type: 信号类型（可选），如'BUY', 'SELL'
 
         Returns:
-            bool: 是否存在待处理信号
+            bool: 是否存在真正待处理的信号
         """
         try:
             redis = await self._get_redis()
@@ -655,6 +658,15 @@ class SignalQueue:
                 signal = self._deserialize_signal(signal_json)
                 if signal.get('symbol') == symbol:
                     if signal_type is None or signal.get('type') == signal_type:
+                        # 🔥 关键修复：排除延迟信号
+                        retry_after = signal.get('retry_after')
+                        if retry_after and time.time() < retry_after:
+                            # 这是延迟信号，不应阻止新信号生成
+                            logger.debug(
+                                f"  排除延迟信号: {symbol} "
+                                f"(还需等待{int(retry_after - time.time())}秒)"
+                            )
+                            continue
                         return True
 
             # 检查处理中队列
@@ -699,3 +711,91 @@ class SignalQueue:
         except Exception as e:
             logger.error(f"❌ 获取待处理标的失败: {e}")
             return set()
+
+    async def count_delayed_signals(self, account: Optional[str] = None) -> int:
+        """
+        统计队列中延迟重试的信号数量
+
+        Args:
+            account: 账号ID（可选），如果指定则只统计该账号的信号
+
+        Returns:
+            int: 延迟信号数量
+        """
+        try:
+            redis = await self._get_redis()
+            count = 0
+
+            # 遍历主队列中的所有信号
+            signals = await redis.zrange(self.queue_key, 0, -1)
+            for signal_json in signals:
+                signal = self._deserialize_signal(signal_json)
+
+                # 如果指定了账号，则过滤
+                if account and signal.get('account') != account:
+                    continue
+
+                # 检查是否有retry_after字段
+                if 'retry_after' in signal and signal['retry_after'] > time.time():
+                    count += 1
+
+            return count
+
+        except Exception as e:
+            logger.error(f"❌ 统计延迟信号失败: {e}")
+            return 0
+
+    async def wake_up_delayed_signals(self, account: Optional[str] = None) -> int:
+        """
+        唤醒延迟重试的信号（移除retry_after字段）
+
+        当资金充足时调用此方法，让延迟的信号立即可被处理
+
+        Args:
+            account: 账号ID（可选），如果指定则只唤醒该账号的信号
+
+        Returns:
+            int: 被唤醒的信号数量
+        """
+        try:
+            redis = await self._get_redis()
+            woken_count = 0
+
+            # 遍历主队列中的所有信号
+            signals = await redis.zrange(self.queue_key, 0, -1, withscores=True)
+
+            for signal_json, score in signals:
+                signal = self._deserialize_signal(signal_json)
+
+                # 如果指定了账号，则过滤
+                if account and signal.get('account') != account:
+                    continue
+
+                # 检查是否有retry_after字段
+                if 'retry_after' in signal:
+                    # 移除retry_after字段
+                    del signal['retry_after']
+
+                    # 重新序列化并更新Redis
+                    new_signal_json = self._serialize_signal(signal)
+
+                    # 原子操作：删除旧信号，添加新信号
+                    pipe = redis.pipeline()
+                    pipe.zrem(self.queue_key, signal_json)
+                    pipe.zadd(self.queue_key, {new_signal_json: score})
+                    await pipe.execute()
+
+                    woken_count += 1
+                    logger.debug(
+                        f"⏰ 唤醒延迟信号: {signal.get('symbol')} "
+                        f"(账号={signal.get('account', 'N/A')})"
+                    )
+
+            if woken_count > 0:
+                logger.info(f"✅ 已唤醒{woken_count}个延迟信号（账号={account or '全部'}）")
+
+            return woken_count
+
+        except Exception as e:
+            logger.error(f"❌ 唤醒延迟信号失败: {e}")
+            return 0
