@@ -265,3 +265,226 @@ class OrderManager:
 
             if result.rowcount > 0:
                 logger.info(f"清理了 {result.rowcount} 条{days}天前的订单记录")
+
+    async def get_orders_by_date_range(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        symbol: Optional[str] = None,
+        status: Optional[str] = None,
+        side: Optional[str] = None
+    ) -> List[OrderRecord]:
+        """按日期范围查询订单
+
+        Args:
+            start_date: 开始时间（包含），默认为7天前
+            end_date: 结束时间（包含），默认为今天结束
+            symbol: 标的代码（可选）
+            status: 订单状态（可选）
+            side: 买卖方向（可选）
+
+        Returns:
+            订单记录列表
+        """
+        # 设置默认日期范围
+        if start_date is None:
+            start_date = datetime.now() - timedelta(days=7)
+        if end_date is None:
+            end_date = datetime.combine(date.today(), datetime.max.time())
+
+        async with self.session_factory() as session:
+            stmt = select(OrderRecord).where(
+                and_(
+                    OrderRecord.created_at >= start_date,
+                    OrderRecord.created_at <= end_date
+                )
+            )
+
+            if symbol:
+                stmt = stmt.where(OrderRecord.symbol == symbol)
+            if status:
+                stmt = stmt.where(OrderRecord.status == status)
+            if side:
+                stmt = stmt.where(OrderRecord.side == side)
+
+            stmt = stmt.order_by(OrderRecord.created_at.desc())
+
+            result = await session.execute(stmt)
+            orders = result.scalars().all()
+
+            return orders
+
+    async def get_old_orders(
+        self,
+        keep_days: int = 1,
+        symbol: Optional[str] = None
+    ) -> List[OrderRecord]:
+        """获取历史订单（超过keep_days天的订单）
+
+        Args:
+            keep_days: 保留天数，默认1天（只保留今日）
+            symbol: 标的代码（可选）
+
+        Returns:
+            历史订单列表
+        """
+        cutoff_date = datetime.combine(
+            date.today() - timedelta(days=keep_days - 1),
+            datetime.min.time()
+        )
+
+        async with self.session_factory() as session:
+            stmt = select(OrderRecord).where(
+                OrderRecord.created_at < cutoff_date
+            )
+
+            if symbol:
+                stmt = stmt.where(OrderRecord.symbol == symbol)
+
+            stmt = stmt.order_by(OrderRecord.created_at.desc())
+
+            result = await session.execute(stmt)
+            orders = result.scalars().all()
+
+            return orders
+
+    async def cancel_old_orders(
+        self,
+        trade_client,
+        keep_days: int = 1,
+        dry_run: bool = False,
+        cancelable_statuses: Optional[List[str]] = None
+    ) -> Dict[str, any]:
+        """批量取消历史订单（从券商端）
+
+        Args:
+            trade_client: 交易客户端实例
+            keep_days: 保留天数，默认1天（只保留今日）
+            dry_run: 是否只预览不执行（默认False）
+            cancelable_statuses: 可取消的订单状态列表，默认包含：
+                - New: 新订单
+                - PartialFilled: 部分成交
+                - WaitToNew: 等待提交
+                - VarietiesNotReported: 品种未报告（GTC条件单常见状态）
+                - NotReported: 未报告
+
+        Returns:
+            结果字典:
+            {
+                "total_found": 查询到的历史订单总数,
+                "cancelable": 可取消的订单数,
+                "cancelled": 实际取消的订单数,
+                "failed": 取消失败的订单数,
+                "dry_run": 是否为预览模式,
+                "orders": 订单详情列表,
+                "cancel_result": 批量取消结果（如果执行了）
+            }
+        """
+        if cancelable_statuses is None:
+            # 默认包含所有可取消状态，包括 VarietiesNotReported 和 NotReported
+            cancelable_statuses = ["New", "PartialFilled", "WaitToNew", "VarietiesNotReported", "NotReported"]
+
+        # 计算日期范围
+        today = date.today()
+        cutoff_date = datetime.combine(
+            today - timedelta(days=keep_days - 1),
+            datetime.min.time()
+        )
+
+        logger.info(f"查询 {cutoff_date.strftime('%Y-%m-%d')} 之前的订单...")
+
+        all_orders = []
+
+        # 1. 查询今日订单（GTC订单会一直显示在今日订单中）
+        try:
+            today_orders = await trade_client.today_orders()
+            logger.info(f"从券商查询到 {len(today_orders)} 个今日订单")
+
+            # 过滤出创建时间在cutoff_date之前的订单
+            for order in today_orders:
+                # 获取订单创建时间
+                order_time = None
+                if hasattr(order, 'submitted_at') and order.submitted_at:
+                    order_time = order.submitted_at
+                elif hasattr(order, 'created_at') and order.created_at:
+                    order_time = order.created_at
+
+                # 如果订单创建时间早于cutoff_date，加入列表
+                if order_time and order_time.replace(tzinfo=None) < cutoff_date:
+                    all_orders.append(order)
+
+            logger.info(f"今日订单中有 {len(all_orders)} 个创建于 {cutoff_date.strftime('%Y-%m-%d')} 之前")
+
+        except Exception as e:
+            logger.error(f"查询今日订单失败: {e}")
+
+        # 2. 查询历史订单（已结束的订单）
+        try:
+            history_orders = await trade_client.history_orders(
+                start_at=cutoff_date - timedelta(days=30),  # 查询最近30天
+                end_at=cutoff_date - timedelta(seconds=1)  # 不包含cutoff_date当天
+            )
+
+            logger.info(f"从券商查询到 {len(history_orders)} 个历史订单")
+            all_orders.extend(history_orders)
+
+        except Exception as e:
+            logger.error(f"查询券商历史订单失败: {e}")
+
+        # 过滤可取消的订单
+        cancelable_orders = []
+        order_details = []
+
+        for order in all_orders:
+            status_str = str(order.status).replace("OrderStatus.", "")
+            order_info = {
+                "order_id": order.order_id,
+                "symbol": order.symbol,
+                "side": "BUY" if order.side == openapi.OrderSide.Buy else "SELL",
+                "quantity": order.quantity,
+                "price": float(order.price) if hasattr(order, 'price') and order.price else 0,
+                "status": status_str,
+                "created_at": order.created_at if hasattr(order, 'created_at') else None
+            }
+            order_details.append(order_info)
+
+            if status_str in cancelable_statuses:
+                cancelable_orders.append(order.order_id)
+
+        logger.info(
+            f"可取消订单: {len(cancelable_orders)}/{len(all_orders)} "
+            f"(状态: {', '.join(cancelable_statuses)})"
+        )
+
+        # 如果是预览模式，返回详情
+        if dry_run:
+            logger.info("【预览模式】不执行实际取消操作")
+            return {
+                "total_found": len(all_orders),
+                "cancelable": len(cancelable_orders),
+                "cancelled": 0,
+                "failed": 0,
+                "dry_run": True,
+                "orders": order_details,
+                "cancel_result": None
+            }
+
+        # 执行批量取消
+        cancel_result = None
+        if len(cancelable_orders) > 0:
+            logger.info(f"开始批量取消 {len(cancelable_orders)} 个订单...")
+            cancel_result = await trade_client.cancel_orders_batch(cancelable_orders)
+
+            # 更新数据库中的订单状态
+            for order_id in cancel_result.get("success_ids", []):
+                await self.update_order_status(order_id, "Canceled")
+
+        return {
+            "total_found": len(all_orders),
+            "cancelable": len(cancelable_orders),
+            "cancelled": cancel_result.get("succeeded", 0) if cancel_result else 0,
+            "failed": cancel_result.get("failed", 0) if cancel_result else 0,
+            "dry_run": False,
+            "orders": order_details,
+            "cancel_result": cancel_result
+        }

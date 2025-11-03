@@ -318,6 +318,70 @@ class LongportTradingClient:
             raise
         return {"order_id": order_id, "status": "cancelled"}
 
+    async def cancel_orders_batch(
+        self,
+        order_ids: List[str],
+        continue_on_error: bool = True
+    ) -> Dict[str, Any]:
+        """
+        批量取消订单
+
+        Args:
+            order_ids: 订单ID列表
+            continue_on_error: 遇到错误时是否继续（默认True）
+
+        Returns:
+            包含成功、失败统计的字典:
+            {
+                "total": 总订单数,
+                "succeeded": 成功数,
+                "failed": 失败数,
+                "success_ids": 成功的订单ID列表,
+                "failed_ids": 失败的订单ID列表,
+                "errors": 错误详情字典 {order_id: error_message}
+            }
+        """
+        total = len(order_ids)
+        succeeded = 0
+        failed = 0
+        success_ids = []
+        failed_ids = []
+        errors = {}
+
+        logger.info(f"开始批量取消订单，共 {total} 个订单")
+
+        for i, order_id in enumerate(order_ids, 1):
+            try:
+                await self.cancel_order(order_id)
+                succeeded += 1
+                success_ids.append(order_id)
+                logger.debug(f"[{i}/{total}] ✅ 已取消订单: {order_id}")
+            except Exception as e:
+                failed += 1
+                failed_ids.append(order_id)
+                error_msg = str(e)
+                errors[order_id] = error_msg
+                logger.warning(f"[{i}/{total}] ❌ 取消订单失败: {order_id}, 原因: {error_msg}")
+
+                if not continue_on_error:
+                    logger.error(f"批量取消中止，已处理 {i}/{total} 个订单")
+                    break
+
+        result = {
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "success_ids": success_ids,
+            "failed_ids": failed_ids,
+            "errors": errors
+        }
+
+        logger.info(
+            f"批量取消完成: 总计={total}, 成功={succeeded}, 失败={failed}"
+        )
+
+        return result
+
     async def account_balance(self, currency: str | None = None) -> List[openapi.AccountBalance]:
         ctx = await self._ensure_context()
         return await asyncio.to_thread(ctx.account_balance, currency)
