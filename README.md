@@ -41,6 +41,7 @@ This repository provides a Python scaffold for building fully automated trading 
 ## Development Workflow
 - `scripts/run_strategy.py` boots the live trading loop.
 - `scripts/ingest_watchlist.py` keeps the configured watchlist in sync with the database.
+- `scripts/cancel_old_orders.py` batch cancels historical orders (see [docs/BATCH_CANCEL_ORDERS.md](docs/BATCH_CANCEL_ORDERS.md) for details).
 - `tests/` contains starting points for unit tests and stubs for integration pipelines.
 
 ## Roadmap
