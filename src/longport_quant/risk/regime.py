@@ -53,6 +53,45 @@ class RegimeClassifier:
 
         return [s.strip() for s in active_symbols.split(',') if s.strip()]
 
+    def _parse_inverse_symbols(self, filter_by_market: bool = True) -> List[str]:
+        """
+        解析反向指标列表（如VIX）
+
+        Args:
+            filter_by_market: 是否根据当前市场时段过滤指数
+
+        Returns:
+            反向指标符号列表
+        """
+        raw = (self._settings.regime_inverse_symbols or "").strip()
+        if not raw:
+            return []
+
+        if not filter_by_market:
+            # 不过滤，返回所有配置的反向指标
+            return [s.strip() for s in raw.split(',') if s.strip()]
+
+        # 根据当前市场时段过滤反向指标
+        # VIX 等美股指标通常以 ^ 开头或 .US 结尾
+        current_market = MarketHours.get_current_market()
+
+        # 如果不在交易时段，返回空
+        if current_market == "NONE":
+            return []
+
+        symbols = [s.strip() for s in raw.split(',') if s.strip()]
+        filtered = []
+
+        for sym in symbols:
+            # 美股时段：包含 .US 结尾或 ^ 开头的符号
+            if current_market == "US" and (sym.endswith('.US') or sym.startswith('^')):
+                filtered.append(sym)
+            # 港股时段：包含 .HK 结尾的符号
+            elif current_market == "HK" and sym.endswith('.HK'):
+                filtered.append(sym)
+
+        return filtered
+
     async def classify(self, quote: QuoteDataClient, filter_by_market: bool = True) -> RegimeResult:
         """
         分类市场状态
@@ -67,16 +106,21 @@ class RegimeClassifier:
         # 获取当前活跃市场
         current_market = MarketHours.get_current_market()
 
+        # 获取正向和反向指标
         symbols = self._parse_symbols(filter_by_market=filter_by_market)
-        if not symbols:
+        inverse_symbols = self._parse_inverse_symbols(filter_by_market=filter_by_market)
+
+        if not symbols and not inverse_symbols:
             if filter_by_market and current_market == "NONE":
                 return RegimeResult("RANGE", "非交易时段", active_market="NONE")
             return RegimeResult("RANGE", "无指数配置", active_market=current_market)
 
         ups = 0
         total = 0
-        used = []
+        used_normal = []
+        used_inverse = []
 
+        # 处理正向指标（普通指数）
         for sym in symbols:
             try:
                 candles = await quote.get_candlesticks(
@@ -91,9 +135,34 @@ class RegimeClassifier:
                 last = closes[-1]
                 ma = sum(closes[-self._ma_n:]) / self._ma_n
                 total += 1
-                used.append(sym)
+                used_normal.append(sym)
                 if last >= ma:
                     ups += 1
+                logger.debug(f"正向指标 {sym}: last={last:.2f}, MA{self._ma_n}={ma:.2f}, 看涨={last >= ma}")
+            except Exception as e:
+                logger.debug(f"获取{sym}数据失败: {e}")
+                continue
+
+        # 处理反向指标（如VIX：低于MA=市场平静=看涨）
+        for sym in inverse_symbols:
+            try:
+                candles = await quote.get_candlesticks(
+                    symbol=sym,
+                    period=self._period,
+                    count=max(self._ma_n + 5, 210),
+                    adjust_type=openapi.AdjustType.NoAdjust,
+                )
+                if not candles or len(candles) < self._ma_n + 1:
+                    continue
+                closes = [float(c.close) for c in candles]
+                last = closes[-1]
+                ma = sum(closes[-self._ma_n:]) / self._ma_n
+                total += 1
+                used_inverse.append(sym)
+                # 反向逻辑：低于MA表示看涨（市场平静）
+                if last < ma:
+                    ups += 1
+                logger.debug(f"反向指标 {sym}: last={last:.2f}, MA{self._ma_n}={ma:.2f}, 看涨={last < ma}")
             except Exception as e:
                 logger.debug(f"获取{sym}数据失败: {e}")
                 continue
@@ -109,9 +178,17 @@ class RegimeClassifier:
         else:
             regime = "RANGE"
 
+        # 构建详细说明
+        details_parts = []
+        if used_normal:
+            details_parts.append(f"{', '.join(used_normal)} 收盘在MA{self._ma_n}之上")
+        if used_inverse:
+            details_parts.append(f"{', '.join(used_inverse)} 低于MA{self._ma_n}（市场平静）")
+
+        details = f"{ups}/{total} 指数看涨 ({'; '.join(details_parts)})"
+
         # 添加市场信息到详情
         market_name = MarketHours.get_market_name(current_market)
-        details = f"{ups}/{total} 指数收盘在MA{self._ma_n}之上（{', '.join(used)}）"
         if filter_by_market and current_market != "NONE":
             details = f"[{market_name}市场] {details}"
 

@@ -165,6 +165,7 @@ class Settings(BaseSettings):
     # 市场状态与仓位/购买力调度（Regime Engine）
     regime_enabled: bool = Field(False, alias="REGIME_ENABLED")
     regime_index_symbols: str = Field("HSI.HK", alias="REGIME_INDEX_SYMBOLS")  # 逗号分隔，如 "HSI.HK,SPY.US"
+    regime_inverse_symbols: str = Field("", alias="REGIME_INVERSE_SYMBOLS")  # 反向指标（如VIX），逗号分隔
     regime_ma_period: int = Field(200, alias="REGIME_MA_PERIOD")
     regime_update_interval_minutes: int = Field(10, alias="REGIME_UPDATE_INTERVAL_MINUTES")
     # 各状态购买力保留比例（预留不出手的现金）
