@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 from loguru import logger
+from longport import openapi
 
 from longport_quant.config import get_settings
 from longport_quant.data.quote_client import QuoteDataClient
@@ -16,6 +17,7 @@ from longport_quant.execution.client import LongportTradingClient
 from longport_quant.messaging.signal_queue import SignalQueue
 from longport_quant.risk.regime import RegimeClassifier
 from longport_quant.utils import LotSizeHelper
+from longport_quant.utils.market_hours import MarketHours
 from longport_quant.features.technical_indicators import TechnicalIndicators
 
 
@@ -232,7 +234,24 @@ class RegimeRebalancer:
                     plan.append(RebalancePlanItem(sym, ccy, price, sell_qty, reason))
                     remaining -= sell_qty * price
 
-            # 6) 发布 SELL 信号（由 OrderExecutor 执行）
+            # 6) 检查市场时段 - 避免在非交易时段发布信号导致市价单风险
+            if plan:
+                current_market = MarketHours.get_current_market()
+                if current_market == "NONE":
+                    total_qty = sum(p.sell_qty for p in plan)
+                    total_value = sum(p.sell_qty * p.price for p in plan)
+                    logger.warning(
+                        f"⏸️ 市场休市，暂不发布去杠杆信号\n"
+                        f"   Regime状态: {regime}\n"
+                        f"   计划卖单: {len(plan)}个标的\n"
+                        f"   总数量: {total_qty}股\n"
+                        f"   估算金额: ${total_value:,.0f}\n"
+                        f"   说明: 将在下次检查周期（市场开盘时）重新评估并发布\n"
+                        f"   原因: 避免非交易时段提交市价单在开盘时跳空风险"
+                    )
+                    return regime, []  # 返回空计划，不发布信号
+
+            # 7) 发布 SELL 信号（由 OrderExecutor 执行）
             for item in plan:
                 signal = {
                     'symbol': item.symbol,

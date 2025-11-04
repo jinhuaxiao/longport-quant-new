@@ -157,6 +157,8 @@ class SignalGenerator:
             # 其他
             "RKLB.US": {"name": "火箭实验室", "sector": "航天"},
             "RDDT.US": {"name": "reddit", "sector": "reddit"},
+            "IREN.US": {"name": "IREN", "sector": "iren"},
+            "AVGO.US": {"name": "avgo", "sector": "avgo"},
             "HOOD.US": {"name": "Robinhood", "sector": "金融科技"},
         }
 

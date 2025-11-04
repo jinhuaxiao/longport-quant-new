@@ -1115,18 +1115,136 @@ class OrderExecutor:
                     logger.debug("  🔄 预估结果满足最小手数，跳过持仓轮换")
             else:
                 logger.warning(
-                    f"  ⚠️ {symbol}: 预估最大可买数量为0，跳过下单以避免被券商拒绝"
+                    f"  ⚠️ {symbol}: 预估最大可买数量为0"
                 )
-                if self.slack:
-                    await self._send_capacity_notification(
-                        symbol=symbol,
-                        signal=signal,
-                        price=current_price,
-                        available_cash=available_cash,
-                        buy_power=account.get('buy_power', {}).get(currency, 0),
-                        reason="预估最大可买数量为0"
+
+                # 🔥 分层挪仓策略：根据信号评分决定是否尝试挪仓
+                needed_amount = min_required_cash - available_cash
+                rotation_attempted = False
+                rotation_success = False
+
+                logger.info(
+                    f"  📊 挪仓决策分析:\n"
+                    f"     • 信号评分: {score}分\n"
+                    f"     • 所需金额: ${needed_amount:.2f}\n"
+                    f"     • 可用资金: ${available_cash:.2f}"
+                )
+
+                if score >= 70:
+                    # 高分信号（70+）：积极挪仓，评分差10分即可
+                    logger.info(
+                        f"  🔥 高分信号({score}分 ≥ 70)：积极挪仓（评分差≥10分）"
                     )
-                return
+                    rotation_attempted = True
+                    rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
+                        signal, needed_amount, score_threshold=10
+                    )
+                elif score >= 60:
+                    # 中分信号（60-70）：适度挪仓，评分差15分
+                    logger.info(
+                        f"  ⚡ 中分信号({score}分 ∈ [60,70))：适度挪仓（评分差≥15分）"
+                    )
+                    rotation_attempted = True
+                    rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
+                        signal, needed_amount, score_threshold=15
+                    )
+                elif score >= 55:
+                    # 低分信号（55-60）：保守挪仓，评分差20分
+                    logger.info(
+                        f"  💡 低分信号({score}分 ∈ [55,60))：保守挪仓（评分差≥20分）"
+                    )
+                    rotation_attempted = True
+                    rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
+                        signal, needed_amount, score_threshold=20
+                    )
+                else:
+                    # 太低分（<55）：不触发挪仓
+                    logger.warning(
+                        f"  ⛔ 信号评分{score}分 < 55分，不触发挪仓\n"
+                        f"     说明: 评分过低，不值得卖出现有持仓"
+                    )
+
+                # 如果尝试了挪仓
+                if rotation_attempted:
+                    if rotation_success and freed_amount > 0:
+                        logger.success(f"  ✅ 挪仓成功，释放资金 ${freed_amount:,.2f}")
+
+                        # 发送挪仓通知
+                        if rotation_details:
+                            await self._notify_rotation_result(
+                                new_signal=signal,
+                                needed_amount=needed_amount,
+                                freed_amount=freed_amount,
+                                sold_positions=rotation_details,
+                                success=True
+                            )
+
+                        # 重新获取账户信息并估算可买数量
+                        logger.info("  🔄 挪仓后重新估算可买数量...")
+                        try:
+                            account = await self.trade_client.get_account()
+                            available_cash = account["cash"].get(currency, 0)
+
+                            # 重新估算
+                            estimated_quantity = await self._estimate_available_quantity(
+                                symbol=symbol,
+                                price=current_price,
+                                lot_size=lot_size,
+                                currency=currency
+                            )
+
+                            if estimated_quantity > 0:
+                                quantity = estimated_quantity
+                                num_lots = quantity // lot_size
+                                required_cash = current_price * quantity
+                                dynamic_budget = required_cash
+
+                                logger.success(
+                                    f"  ✅ 挪仓后可买数量: {quantity}股 ({num_lots}手)，"
+                                    f"需要 ${required_cash:.2f}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"  ⚠️ 挪仓后预估数量仍为0\n"
+                                    f"     可能原因: 购买力限制（非现金问题）"
+                                )
+                                if self.slack:
+                                    await self._send_capacity_notification(
+                                        symbol=symbol,
+                                        signal=signal,
+                                        price=current_price,
+                                        available_cash=available_cash,
+                                        buy_power=account.get('buy_power', {}).get(currency, 0),
+                                        reason="挪仓后预估数量仍为0（购买力限制）"
+                                    )
+                                return
+                        except Exception as e:
+                            logger.error(f"  ❌ 挪仓后重新估算失败: {e}")
+                            return
+                    else:
+                        logger.warning(f"  ⚠️ 挪仓未能释放足够资金")
+                        if self.slack:
+                            await self._send_capacity_notification(
+                                symbol=symbol,
+                                signal=signal,
+                                price=current_price,
+                                available_cash=available_cash,
+                                buy_power=account.get('buy_power', {}).get(currency, 0),
+                                reason="挪仓失败，预估数量为0"
+                            )
+                        return
+                else:
+                    # 未尝试挪仓（评分太低）
+                    if self.slack:
+                        await self._send_capacity_notification(
+                            symbol=symbol,
+                            signal=signal,
+                            price=current_price,
+                            available_cash=available_cash,
+                            buy_power=account.get('buy_power', {}).get(currency, 0),
+                            reason=f"预估数量为0且评分{score}分太低不触发挪仓"
+                        )
+                    return
             if not (quantity > 0 and dynamic_budget >= min_required_cash):
                 logger.warning(
                     f"  ⚠️ {symbol}: 动态预算不足 "
@@ -1148,16 +1266,48 @@ class OrderExecutor:
                 # 尝试智能持仓轮换释放资金
                 needed_amount = required_cash - available_cash
 
-                # 🔥 关键修复：只在确实需要资金且信号质量足够高时才触发轮换
-                if needed_amount > 0 and score >= 60:
+                # 🔥 分层挪仓策略：根据信号评分决定是否尝试挪仓
+                if needed_amount > 0:
                     logger.info(
-                        f"  🔄 尝试智能持仓轮换释放 ${needed_amount:,.2f}...\n"
-                        f"     策略: 卖出评分较低的持仓，为评分{score}分的新信号腾出空间"
+                        f"  📊 挪仓决策分析:\n"
+                        f"     • 信号评分: {score}分\n"
+                        f"     • 所需金额: ${needed_amount:.2f}\n"
+                        f"     • 可用资金: ${available_cash:.2f}"
                     )
 
-                    rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
-                        signal, needed_amount
-                    )
+                    if score >= 70:
+                        # 高分信号（70+）：积极挪仓，评分差10分即可
+                        logger.info(
+                            f"  🔥 高分信号({score}分 ≥ 70)：积极挪仓（评分差≥10分）"
+                        )
+                        rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
+                            signal, needed_amount, score_threshold=10
+                        )
+                    elif score >= 60:
+                        # 中分信号（60-70）：适度挪仓，评分差15分
+                        logger.info(
+                            f"  ⚡ 中分信号({score}分 ∈ [60,70))：适度挪仓（评分差≥15分）"
+                        )
+                        rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
+                            signal, needed_amount, score_threshold=15
+                        )
+                    elif score >= 55:
+                        # 低分信号（55-60）：保守挪仓，评分差20分
+                        logger.info(
+                            f"  💡 低分信号({score}分 ∈ [55,60))：保守挪仓（评分差≥20分）"
+                        )
+                        rotation_success, freed_amount, rotation_details = await self._try_smart_rotation(
+                            signal, needed_amount, score_threshold=20
+                        )
+                    else:
+                        # 太低分（<55）：不触发挪仓
+                        logger.warning(
+                            f"  ⛔ 信号评分{score}分 < 55分，不触发挪仓\n"
+                            f"     说明: 评分过低，不值得卖出现有持仓"
+                        )
+                        rotation_success = False
+                        freed_amount = 0
+                        rotation_details = []
                 elif needed_amount <= 0:
                     # 资金已经足够，不应该到这里
                     logger.warning(
@@ -1613,23 +1763,89 @@ class OrderExecutor:
             symbol=symbol
         )
 
+        # 🔍 价格陈旧性和跳空风险检查
+        signal_price = signal.get('price', current_price)
+        if signal_price and signal_price > 0:
+            price_deviation_pct = abs(bid_price - signal_price) / signal_price
+            max_allowed_gap = 0.03  # 3% 最大允许偏差
+
+            if price_deviation_pct > max_allowed_gap:
+                logger.error(
+                    f"  ⚠️ {symbol}: 价格偏差过大，暂停下单\n"
+                    f"     信号价格: ${signal_price:.2f}\n"
+                    f"     当前买价: ${bid_price:.2f}\n"
+                    f"     偏差: {price_deviation_pct*100:.2f}% > {max_allowed_gap*100:.0f}%\n"
+                    f"     风险: 可能存在跳空或价格陈旧\n"
+                    f"     处理: 跳过本次订单，等待下一个交易周期"
+                )
+
+                # 发送Slack警报（如果配置）
+                if self.slack:
+                    try:
+                        await self.slack.send(
+                            f"⚠️ *卖单价格偏差警报*\n\n"
+                            f"标的: `{symbol}`\n"
+                            f"信号价格: ${signal_price:.2f}\n"
+                            f"当前买价: ${bid_price:.2f}\n"
+                            f"偏差: *{price_deviation_pct*100:.2f}%*\n"
+                            f"原因: {reason}\n\n"
+                            f"已暂停下单，等待价格稳定"
+                        )
+                    except Exception as e:
+                        logger.debug(f"发送Slack警报失败: {e}")
+
+                return  # 跳过订单
+            elif price_deviation_pct > 0.01:  # 1% 偏差警告
+                logger.warning(
+                    f"  ⚠️ {symbol}: 价格有偏差（{price_deviation_pct*100:.2f}%），"
+                    f"信号${signal_price:.2f} → 当前${bid_price:.2f}"
+                )
+
         # 提交订单（使用SmartOrderRouter的自适应策略）
         try:
+            # 检查市场时段 - 避免非交易时段使用市价单
+            from longport_quant.utils.market_hours import MarketHours
+            current_market = MarketHours.get_current_market()
+            is_market_closed = (current_market == "NONE")
+
+            # 根据订单类型和市场状态设置策略和紧急度
+            is_rebalancer_sell = "Regime去杠杆" in reason or "去杠杆" in reason
+
+            if is_market_closed:
+                # 市场关闭：强制使用低紧急度和PASSIVE策略（限价单）
+                urgency_level = 3
+                execution_strategy = ExecutionStrategy.PASSIVE
+                logger.warning(
+                    f"  ⏸️ {symbol}: 市场休市，强制使用PASSIVE策略（限价单）\n"
+                    f"     原因: 避免开盘时市价单跳空风险\n"
+                    f"     策略: urgency={urgency_level}, strategy=PASSIVE"
+                )
+            elif is_rebalancer_sell:
+                # 去杠杆：中等紧急度（限价单）
+                urgency_level = 5
+                execution_strategy = ExecutionStrategy.ADAPTIVE
+                logger.info(f"  📊 去杠杆卖单：使用中等紧急度(urgency={urgency_level})，避免市价单风险")
+            else:
+                # 止损/止盈：高紧急度（市场开盘时可以使用市价单）
+                urgency_level = 8
+                execution_strategy = ExecutionStrategy.ADAPTIVE
+
             # 创建订单请求
-            # 止损/止盈订单使用高紧急度（自动选择AGGRESSIVE策略）
             order_request = OrderRequest(
                 symbol=symbol,
                 side="SELL",
                 quantity=quantity,
                 order_type="LIMIT",
                 limit_price=order_price,
-                strategy=ExecutionStrategy.ADAPTIVE,  # 自适应策略
-                urgency=8,  # 高紧急度（止损/止盈需要快速执行）
+                strategy=execution_strategy,  # 根据市场状态选择策略
+                urgency=urgency_level,  # 根据订单类型和市场状态动态调整紧急度
                 max_slippage=0.015,  # 允许1.5%滑点
                 signal=signal,
                 metadata={
                     "reason": reason,
-                    "signal_type": signal_type
+                    "signal_type": signal_type,
+                    "market_state": current_market,
+                    "forced_passive": is_market_closed
                 }
             )
 
@@ -2254,7 +2470,8 @@ class OrderExecutor:
     async def _try_smart_rotation(
         self,
         signal: Dict,
-        needed_amount: float
+        needed_amount: float,
+        score_threshold: int = 15
     ) -> tuple[bool, float, list[dict]]:
         """
         尝试通过智能持仓轮换释放资金
@@ -2262,6 +2479,7 @@ class OrderExecutor:
         Args:
             signal: 新信号数据（包含symbol, score等）
             needed_amount: 需要释放的资金量
+            score_threshold: 评分差异阈值（新信号评分需比持仓高这么多分）
 
         Returns:
             (成功与否, 实际释放的资金量, 卖出明细列表)
@@ -2279,7 +2497,8 @@ class OrderExecutor:
             # 调用智能轮换释放资金
             logger.info(
                 f"  📊 智能轮换参数: 新信号={signal.get('symbol', 'N/A')} "
-                f"评分={signal.get('score', 0)}, 需要资金=${needed_amount:,.2f}"
+                f"评分={signal.get('score', 0)}, 需要资金=${needed_amount:,.2f}, "
+                f"评分差异阈值={score_threshold}分"
             )
 
             success, freed, sold_positions = await rotator.try_free_up_funds(
@@ -2287,7 +2506,7 @@ class OrderExecutor:
                 new_signal=signal,
                 trade_client=self.trade_client,
                 quote_client=self.quote_client,
-                score_threshold=15  # 🔥 提高到15分，避免频繁买卖浪费手续费
+                score_threshold=score_threshold  # 🔥 使用动态阈值
             )
 
             if success:
