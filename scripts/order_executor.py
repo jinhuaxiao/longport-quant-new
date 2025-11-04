@@ -362,6 +362,34 @@ class OrderExecutor:
         buy_power = account.get("buy_power", {}).get(currency, 0)
         remaining_finance = account.get("remaining_finance", {}).get(currency, 0)
 
+        # 跨币种债务诊断：检测"有现金但买入力为负"的情况
+        if available_cash > 0 and buy_power < 0:
+            # 获取所有币种的现金和买入力
+            all_cash = account.get("cash", {})
+            all_buy_power = account.get("buy_power", {})
+
+            logger.warning(
+                f"🔍 跨币种债务诊断 - {currency}:\n"
+                f"   {currency}现金: ${available_cash:,.2f} ✅\n"
+                f"   {currency}买入力: ${buy_power:,.2f} ❌\n"
+                f"   \n"
+                f"   📊 全账户状态:\n"
+                + "\n".join([
+                    f"   • {ccy}: 现金=${float(all_cash.get(ccy, 0)):,.0f}, "
+                    f"买入力=${float(all_buy_power.get(ccy, 0)):,.0f}"
+                    for ccy in sorted(set(list(all_cash.keys()) + list(all_buy_power.keys())))
+                ]) +
+                f"\n\n"
+                f"   ⚠️ 可能原因:\n"
+                f"   • 其他币种融资债务影响整体账户购买力\n"
+                f"   • LongPort风控将跨币种债务纳入购买力计算\n"
+                f"   \n"
+                f"   💡 建议:\n"
+                f"   • 系统将尝试Fallback现金估算（使用50%现金）\n"
+                f"   • 考虑减仓释放购买力\n"
+                f"   • 或归还融资债务恢复购买力"
+            )
+
         # 显示购买力和融资额度信息
         logger.debug(
             f"  💰 {currency} 资金状态 - 可用: ${available_cash:,.2f}, "
@@ -1025,6 +1053,34 @@ class OrderExecutor:
         buy_power = account.get("buy_power", {}).get(currency, 0)
         remaining_finance = account.get("remaining_finance", {}).get(currency, 0)
 
+        # 跨币种债务诊断：检测"有现金但买入力为负"的情况
+        if available_cash > 0 and buy_power < 0:
+            # 获取所有币种的现金和买入力
+            all_cash = account.get("cash", {})
+            all_buy_power = account.get("buy_power", {})
+
+            logger.warning(
+                f"🔍 跨币种债务诊断 - {currency}:\n"
+                f"   {currency}现金: ${available_cash:,.2f} ✅\n"
+                f"   {currency}买入力: ${buy_power:,.2f} ❌\n"
+                f"   \n"
+                f"   📊 全账户状态:\n"
+                + "\n".join([
+                    f"   • {ccy}: 现金=${float(all_cash.get(ccy, 0)):,.0f}, "
+                    f"买入力=${float(all_buy_power.get(ccy, 0)):,.0f}"
+                    for ccy in sorted(set(list(all_cash.keys()) + list(all_buy_power.keys())))
+                ]) +
+                f"\n\n"
+                f"   ⚠️ 可能原因:\n"
+                f"   • 其他币种融资债务影响整体账户购买力\n"
+                f"   • LongPort风控将跨币种债务纳入购买力计算\n"
+                f"   \n"
+                f"   💡 建议:\n"
+                f"   • 系统将尝试Fallback现金估算（使用50%现金）\n"
+                f"   • 考虑减仓释放购买力\n"
+                f"   • 或归还融资债务恢复购买力"
+            )
+
         # 显示购买力和融资额度信息
         logger.debug(
             f"  💰 {currency} 资金状态 - 可用: ${available_cash:,.2f}, "
@@ -1115,8 +1171,26 @@ class OrderExecutor:
                     logger.debug("  🔄 预估结果满足最小手数，跳过持仓轮换")
             else:
                 logger.warning(
-                    f"  ⚠️ {symbol}: 预估最大可买数量为0"
+                    f"  ⚠️ {symbol}: 预估最大可买数量为0，尝试Fallback现金估算..."
                 )
+
+                # Fallback: 使用现金保守估算
+                fallback_quantity = await self._fallback_cash_estimate(
+                    symbol=symbol,
+                    price=current_price,
+                    lot_size=lot_size
+                )
+
+                if fallback_quantity > 0:
+                    quantity = fallback_quantity
+                    num_lots = quantity // lot_size
+                    required_cash = current_price * quantity
+                    dynamic_budget = required_cash
+
+                    logger.info(
+                        f"  ✅ Fallback估算成功: {quantity}股 ({num_lots}手)，"
+                        f"估算资金需求=${required_cash:.2f}"
+                    )
 
                 # 🔥 分层挪仓策略：根据信号评分决定是否尝试挪仓
                 needed_amount = min_required_cash - available_cash
@@ -1205,18 +1279,37 @@ class OrderExecutor:
                                 )
                             else:
                                 logger.warning(
-                                    f"  ⚠️ 挪仓后预估数量仍为0\n"
-                                    f"     可能原因: 购买力限制（非现金问题）"
+                                    f"  ⚠️ 挪仓后预估数量仍为0，尝试Fallback现金估算..."
                                 )
-                                if self.slack:
-                                    await self._send_capacity_notification(
-                                        symbol=symbol,
-                                        signal=signal,
-                                        price=current_price,
-                                        available_cash=available_cash,
-                                        buy_power=account.get('buy_power', {}).get(currency, 0),
-                                        reason="挪仓后预估数量仍为0（购买力限制）"
+
+                                # Fallback: 使用现金保守估算
+                                fallback_quantity = await self._fallback_cash_estimate(
+                                    symbol=symbol,
+                                    price=current_price,
+                                    lot_size=lot_size
+                                )
+
+                                if fallback_quantity > 0:
+                                    quantity = fallback_quantity
+                                    num_lots = quantity // lot_size
+                                    required_cash = current_price * quantity
+                                    dynamic_budget = required_cash
+
+                                    logger.success(
+                                        f"  ✅ Fallback估算成功: {quantity}股 ({num_lots}手)，"
+                                        f"需要 ${required_cash:.2f}"
                                     )
+                                else:
+                                    logger.error(f"  ❌ Fallback估算也失败，现金不足")
+                                    if self.slack:
+                                        await self._send_capacity_notification(
+                                            symbol=symbol,
+                                            signal=signal,
+                                            price=current_price,
+                                            available_cash=available_cash,
+                                            buy_power=account.get('buy_power', {}).get(currency, 0),
+                                            reason="挪仓后预估数量仍为0（购买力限制+现金不足）"
+                                        )
                                 return
                         except Exception as e:
                             logger.error(f"  ❌ 挪仓后重新估算失败: {e}")
@@ -1821,14 +1914,15 @@ class OrderExecutor:
                     f"     策略: urgency={urgency_level}, strategy=PASSIVE"
                 )
             elif is_rebalancer_sell:
-                # 去杠杆：中等紧急度（限价单）
-                urgency_level = 5
-                execution_strategy = ExecutionStrategy.ADAPTIVE
-                logger.info(f"  📊 去杠杆卖单：使用中等紧急度(urgency={urgency_level})，避免市价单风险")
+                # 去杠杆：低紧急度，强制限价单
+                urgency_level = 3
+                execution_strategy = ExecutionStrategy.PASSIVE
+                logger.info(f"  📊 去杠杆卖单：使用限价单策略(urgency={urgency_level})，确保价格可控")
             else:
-                # 止损/止盈：高紧急度（市场开盘时可以使用市价单）
-                urgency_level = 8
-                execution_strategy = ExecutionStrategy.ADAPTIVE
+                # 止损/止盈：中等紧急度，使用限价单而非市价单
+                urgency_level = 5
+                execution_strategy = ExecutionStrategy.PASSIVE
+                logger.info(f"  🛡️ 止损/止盈卖单：使用限价单策略(urgency={urgency_level})，避免滑点风险")
 
             # 创建订单请求
             order_request = OrderRequest(
@@ -2121,6 +2215,58 @@ class OrderExecutor:
 
         except Exception as e:
             logger.debug(f"  ⚠️ 预估最大可买数量失败: {e}")
+            return 0
+
+    async def _fallback_cash_estimate(
+        self,
+        symbol: str,
+        price: float,
+        lot_size: int
+    ) -> int:
+        """
+        Fallback现金估算：当broker estimate返回0时的备用方案
+
+        使用50%现金进行保守估算，保留50%安全边际
+
+        Returns:
+            int: 按手数取整后的估算数量，若现金不足返回0
+        """
+        try:
+            # 获取币种现金
+            currency = "HKD" if symbol.endswith(".HK") else "USD"
+            balance = await self.trade_client.account_balance()
+
+            cash_dict = balance.get("cash", {})
+            cash_available = float(cash_dict.get(currency, 0))
+
+            # 如果没有现金，返回0
+            if cash_available <= 0:
+                logger.debug(f"  ⚠️ {currency}现金不足: ${cash_available:,.0f}")
+                return 0
+
+            # 使用50%现金进行保守估算
+            conservative_cash = cash_available * 0.5
+            estimated_qty = int(conservative_cash / price)
+
+            # 按手数取整
+            lots = int(estimated_qty // lot_size)
+            if lots <= 0:
+                return 0
+
+            final_qty = lots * lot_size
+
+            logger.warning(
+                f"⚠️ Fallback现金估算 - {symbol}:\n"
+                f"   {currency}现金: ${cash_available:,.0f} ✅\n"
+                f"   保守策略: 使用50%现金 = ${conservative_cash:,.0f}\n"
+                f"   估算数量: {final_qty}股 ({lots}手 × {lot_size}股/手)\n"
+                f"   说明: Broker estimate返回0，但现金充足，尝试保守下单"
+            )
+
+            return final_qty
+
+        except Exception as e:
+            logger.error(f"  ❌ Fallback现金估算失败: {e}")
             return 0
 
     async def _get_bid_ask(self, symbol: str):

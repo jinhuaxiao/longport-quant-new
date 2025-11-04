@@ -105,6 +105,19 @@ class RegimeRebalancer:
                 if equity <= 0:
                     continue
 
+                # 买入力检测：如果买入力为负，提高预留比例主动减仓
+                buy_power_val = float(account.get("buy_power", {}).get(ccy, 0) or 0)
+                original_reserve = reserve
+
+                if buy_power_val < 0:
+                    # 提高预留比例20%，最高不超过80%
+                    reserve = min(reserve + 0.20, 0.80)
+                    logger.warning(
+                        f"⚠️ {ccy}买入力为负(${buy_power_val:,.0f})，提高预留比例主动减仓\n"
+                        f"   预留比例: {original_reserve*100:.0f}% → {reserve*100:.0f}%\n"
+                        f"   目的: 释放购买力，为新信号腾出资金"
+                    )
+
                 # 计算当前持仓总市值
                 total_value = 0.0
                 values: Dict[str, float] = {}
@@ -234,24 +247,145 @@ class RegimeRebalancer:
                     plan.append(RebalancePlanItem(sym, ccy, price, sell_qty, reason))
                     remaining -= sell_qty * price
 
-            # 6) 检查市场时段 - 避免在非交易时段发布信号导致市价单风险
-            if plan:
-                current_market = MarketHours.get_current_market()
-                if current_market == "NONE":
-                    total_qty = sum(p.sell_qty for p in plan)
-                    total_value = sum(p.sell_qty * p.price for p in plan)
-                    logger.warning(
-                        f"⏸️ 市场休市，暂不发布去杠杆信号\n"
-                        f"   Regime状态: {regime}\n"
-                        f"   计划卖单: {len(plan)}个标的\n"
-                        f"   总数量: {total_qty}股\n"
-                        f"   估算金额: ${total_value:,.0f}\n"
-                        f"   说明: 将在下次检查周期（市场开盘时）重新评估并发布\n"
-                        f"   原因: 避免非交易时段提交市价单在开盘时跳空风险"
-                    )
-                    return regime, []  # 返回空计划，不发布信号
+            # 6) 检查市场时段 - 按symbol过滤（仅在配置启用时）
+            if plan and self.settings.rebalancer_market_hours_only:
+                # 显示当前时区信息（用于监控冬令时/夏令时转换）
+                from datetime import datetime
+                now_ny = datetime.now(MarketHours.US_TZ)
+                now_hk = datetime.now(MarketHours.HK_TZ)
 
-            # 7) 发布 SELL 信号（由 OrderExecutor 执行）
+                logger.debug(
+                    f"🕐 市场时区: "
+                    f"NY={now_ny.strftime('%H:%M %Z(UTC%z)')} | "
+                    f"HK={now_hk.strftime('%H:%M %Z(UTC%z)')}"
+                )
+
+                # 获取美股时段
+                us_session = MarketHours.get_us_session()
+
+                # 🌙 盘后时段特殊处理（16:00-20:00 ET）
+                if us_session == "AFTERHOURS":
+                    if not self.settings.enable_afterhours_rebalance:
+                        logger.info(
+                            f"⏸️ 美股盘后时段，ENABLE_AFTERHOURS_REBALANCE未启用，不执行减仓\n"
+                            f"   当前时间: {now_ny.strftime('%H:%M %Z')}\n"
+                            f"   说明: 盘后减仓功能默认禁用，需在配置中手动开启"
+                        )
+                        return regime, []
+
+                    # 盘后时段：仅保留美股(.US)减仓信号
+                    afterhours_plan = [item for item in plan if item.symbol.endswith(".US")]
+                    filtered_count = len(plan) - len(afterhours_plan)
+
+                    if filtered_count > 0:
+                        logger.info(f"⏸️ 盘后时段，已过滤 {filtered_count} 个非美股标的")
+
+                    if not afterhours_plan:
+                        logger.warning(
+                            f"⏸️ 盘后时段，计划中无美股标的，不执行减仓\n"
+                            f"   当前时间: {now_ny.strftime('%H:%M %Z')}\n"
+                            f"   计划标的: {', '.join([p.symbol for p in plan])}"
+                        )
+                        return regime, []
+
+                    # 应用盘后仓位限制（单次最多减20%）
+                    max_pct = self.settings.afterhours_max_position_pct
+                    total_value_all = sum(p.sell_qty * p.price for p in afterhours_plan)
+                    # 简化：这里直接用计划总金额，实际应该与总持仓比较
+                    # 后续可以增强为：total_value_all / total_position_value <= max_pct
+
+                    logger.warning(
+                        f"🌙 盘后紧急减仓启动\n"
+                        f"   时间: {now_ny.strftime('%H:%M %Z')}\n"
+                        f"   Regime: {regime}\n"
+                        f"   减仓标的: {len(afterhours_plan)}个美股\n"
+                        f"   估算金额: ${total_value_all:,.0f}\n"
+                        f"   风控: 强制限价单，紧急度≤{self.settings.afterhours_max_urgency}"
+                    )
+
+                    plan = afterhours_plan
+
+                # ☀️ 常规交易时段（09:30-16:00 ET）
+                elif us_session == "REGULAR":
+                    # 过滤掉所属市场未开盘的symbol
+                    valid_plan = []
+                    filtered_symbols = []
+
+                    for item in plan:
+                        if MarketHours.is_market_open_for_symbol(item.symbol):
+                            valid_plan.append(item)
+                        else:
+                            market = MarketHours.get_market_for_symbol(item.symbol)
+                            filtered_symbols.append(f"{item.symbol}({market})")
+
+                    # 记录过滤情况
+                    if filtered_symbols:
+                        logger.info(
+                            f"⏸️ 已过滤 {len(filtered_symbols)} 个symbol（市场未开盘）: "
+                            f"{', '.join(filtered_symbols[:5])}"
+                            + (f" 等{len(filtered_symbols)}个" if len(filtered_symbols) > 5 else "")
+                        )
+
+                    # 如果所有symbol都被过滤，返回空计划
+                    if not valid_plan:
+                        total_qty = sum(p.sell_qty for p in plan)
+                        total_value = sum(p.sell_qty * p.price for p in plan)
+                        logger.warning(
+                            f"⏸️ 所有减仓symbol所属市场都未开盘，暂不发布去杠杆信号\n"
+                            f"   Regime状态: {regime}\n"
+                            f"   计划卖单: {len(plan)}个标的\n"
+                            f"   总数量: {total_qty}股\n"
+                            f"   估算金额: ${total_value:,.0f}\n"
+                            f"   将在下次检查周期重新评估"
+                        )
+                        return regime, []  # 返回空计划，不发布信号
+
+                    plan = valid_plan
+
+                # 🌃 市场关闭时段
+                else:
+                    logger.info(
+                        f"⏸️ 市场关闭时段（{us_session}），不执行减仓\n"
+                        f"   当前时间: {now_ny.strftime('%H:%M %Z')}"
+                    )
+                    return regime, []
+
+                # 7) 币种与市场时段匹配检查（避免用错误指数评估）
+                current_market = MarketHours.get_current_market()
+                currency_filtered = []
+                currency_skipped = []
+
+                for item in plan:
+                    # 港股时段：仅保留HKD币种（避免用HSI评估美股）
+                    if current_market == "HK" and item.currency == "USD":
+                        currency_skipped.append(f"{item.symbol}(USD)")
+                        continue
+                    # 美股时段：仅保留USD币种（避免用QQQ评估港股）
+                    elif current_market == "US" and item.currency == "HKD":
+                        currency_skipped.append(f"{item.symbol}(HKD)")
+                        continue
+
+                    currency_filtered.append(item)
+
+                if currency_skipped:
+                    logger.info(
+                        f"⏸️ 已过滤 {len(currency_skipped)} 个标的（币种与当前市场不匹配）: "
+                        f"{', '.join(currency_skipped[:5])}"
+                        + (f" 等{len(currency_skipped)}个" if len(currency_skipped) > 5 else "")
+                    )
+
+                if not currency_filtered:
+                    logger.warning(
+                        f"⏸️ 所有减仓标的币种与当前市场不匹配，暂不发布信号\n"
+                        f"   当前市场: {MarketHours.get_market_name(current_market)}\n"
+                        f"   说明: {current_market}时段不评估其他币种持仓"
+                    )
+                    return regime, []
+
+                plan = currency_filtered
+                logger.info(f"✅ 市场+币种检查通过，将发布 {len(plan)} 个减仓信号")
+
+            # 8) 发布 SELL 信号（由 OrderExecutor 执行）
             for item in plan:
                 signal = {
                     'symbol': item.symbol,

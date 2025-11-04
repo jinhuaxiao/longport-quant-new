@@ -191,6 +191,51 @@ class Settings(BaseSettings):
     # 去杠杆调仓（Regime Rebalancer）
     rebalancer_enabled: bool = Field(False, alias="REBALANCER_ENABLED")
     rebalancer_min_interval_minutes: int = Field(30, alias="REBALANCER_MIN_INTERVAL_MINUTES")
+    rebalancer_market_hours_only: bool = Field(True, alias="REBALANCER_MARKET_HOURS_ONLY")
+    rebalancer_use_limit_orders: bool = Field(True, alias="REBALANCER_USE_LIMIT_ORDERS")
+    rebalancer_max_urgency: int = Field(5, alias="REBALANCER_MAX_URGENCY")
+    rebalancer_max_price_gap_pct: float = Field(0.03, alias="REBALANCER_MAX_PRICE_GAP_PCT")
+
+    # ============================================================
+    # 盘后交易配置（After-Hours Trading）
+    # ============================================================
+    # 说明：
+    # - 支持美股盘后时段（16:00-20:00 ET）的紧急减仓
+    # - 仅支持SELL，不支持BUY
+    # - 强制限价单，低紧急度，保守策略
+    # ============================================================
+
+    # 启用盘后减仓（默认禁用，需要时手动开启）
+    enable_afterhours_rebalance: bool = Field(False, alias="ENABLE_AFTERHOURS_REBALANCE")
+
+    # 盘后订单强制限价单（强烈推荐，避免盘后滑点）
+    afterhours_force_limit_orders: bool = Field(True, alias="AFTERHOURS_FORCE_LIMIT_ORDERS")
+
+    # 盘后最大紧急度（建议≤3，避免市价单）
+    afterhours_max_urgency: int = Field(3, alias="AFTERHOURS_MAX_URGENCY")
+
+    # 盘后最大仓位比例（单次减仓不超过总仓位的20%）
+    afterhours_max_position_pct: float = Field(0.20, alias="AFTERHOURS_MAX_POSITION_PCT")
+
+    # ============================================================
+    # 订单执行安全控制（Order Execution Safety Controls）
+    # ============================================================
+    # 说明：
+    # - 全局订单安全开关，防止市价单造成的滑点风险
+    # - 建议：启用所有限价单保护，禁用盘外市价单
+    # ============================================================
+
+    # 强制所有订单使用限价单（推荐开启）
+    force_limit_orders: bool = Field(True, alias="FORCE_LIMIT_ORDERS")
+
+    # 仅在交易时段允许市价单（盘外时段强制限价单）
+    allow_market_orders_during_market_hours: bool = Field(True, alias="ALLOW_MARKET_ORDERS_DURING_MARKET_HOURS")
+
+    # 最大紧急度上限（>=8会触发市价单，建议设为5）
+    max_urgency_level: int = Field(5, alias="MAX_URGENCY_LEVEL")
+
+    # 价格陈旧检查：信号价格与实时价格偏差超过此百分比时暂停订单
+    max_price_staleness_pct: float = Field(0.03, alias="MAX_PRICE_STALENESS_PCT")
 
     model_config = SettingsConfigDict(
         env_file=".env",

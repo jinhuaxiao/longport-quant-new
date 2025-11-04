@@ -18,9 +18,15 @@ class MarketHours:
     HK_TZ = ZoneInfo("Asia/Hong_Kong")
 
     # 美股交易时间 (美东时间 UTC-5/-4)
-    US_OPEN = time(9, 30)
-    US_CLOSE = time(16, 0)
+    US_REGULAR_OPEN = time(9, 30)
+    US_REGULAR_CLOSE = time(16, 0)
+    US_AFTERHOURS_OPEN = time(16, 0)
+    US_AFTERHOURS_CLOSE = time(20, 0)
     US_TZ = ZoneInfo("America/New_York")
+
+    # 向后兼容
+    US_OPEN = US_REGULAR_OPEN
+    US_CLOSE = US_REGULAR_CLOSE
 
     @classmethod
     def get_current_market(cls) -> MarketType:
@@ -110,6 +116,46 @@ class MarketHours:
             return ""
 
     @classmethod
+    def get_market_for_symbol(cls, symbol: str) -> MarketType:
+        """
+        获取symbol所属的市场
+
+        Args:
+            symbol: 股票代码，如 "AAPL.US", "700.HK"
+
+        Returns:
+            "HK": 港股
+            "US": 美股
+            "NONE": 未知市场
+        """
+        if symbol.endswith(".HK"):
+            return "HK"
+        elif symbol.endswith(".US"):
+            return "US"
+        return "NONE"
+
+    @classmethod
+    def is_market_open_for_symbol(cls, symbol: str) -> bool:
+        """
+        检查指定symbol所属市场是否开盘
+
+        Args:
+            symbol: 股票代码，如 "AAPL.US", "700.HK"
+
+        Returns:
+            True: 该symbol所属市场正在交易时段
+            False: 该symbol所属市场未开盘或未知市场
+        """
+        market = cls.get_market_for_symbol(symbol)
+
+        if market == "HK":
+            return cls._is_hk_trading_hours(datetime.now(cls.HK_TZ))
+        elif market == "US":
+            return cls._is_us_trading_hours(datetime.now(cls.US_TZ))
+
+        return False  # 未知市场默认不开盘
+
+    @classmethod
     def get_market_name(cls, market: MarketType) -> str:
         """获取市场中文名称"""
         names = {
@@ -118,6 +164,51 @@ class MarketHours:
             "NONE": "无"
         }
         return names.get(market, "未知")
+
+    @classmethod
+    def get_us_session(cls) -> str:
+        """
+        获取当前美股交易时段
+
+        Returns:
+            "REGULAR": 常规交易时段 (09:30-16:00 ET)
+            "AFTERHOURS": 盘后交易时段 (16:00-20:00 ET)
+            "CLOSED": 市场关闭
+        """
+        now_us = datetime.now(cls.US_TZ)
+
+        # 排除周末
+        if now_us.weekday() >= 5:
+            return "CLOSED"
+
+        current_time = now_us.time()
+
+        # 常规交易时段
+        if cls.US_REGULAR_OPEN <= current_time < cls.US_REGULAR_CLOSE:
+            return "REGULAR"
+
+        # 盘后交易时段
+        if cls.US_AFTERHOURS_OPEN <= current_time <= cls.US_AFTERHOURS_CLOSE:
+            return "AFTERHOURS"
+
+        return "CLOSED"
+
+    @classmethod
+    def is_afterhours_for_symbol(cls, symbol: str) -> bool:
+        """
+        检查指定symbol是否在盘后交易时段
+
+        Args:
+            symbol: 股票代码，如 "AAPL.US"
+
+        Returns:
+            True: 该symbol为美股且当前在盘后时段
+            False: 非美股或不在盘后时段
+        """
+        if not symbol.endswith(".US"):
+            return False
+
+        return cls.get_us_session() == "AFTERHOURS"
 
 
 __all__ = ["MarketHours", "MarketType"]

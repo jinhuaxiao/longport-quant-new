@@ -80,7 +80,8 @@ class SmartOrderRouter:
         self,
         trade_context: TradeContext,
         db: DatabaseSessionManager,
-        quote_client = None
+        quote_client = None,
+        settings = None
     ):
         """
         Initialize smart order router.
@@ -89,10 +90,12 @@ class SmartOrderRouter:
             trade_context: LongPort trade context
             db: Database session manager
             quote_client: Optional QuoteDataClient for fetching tick size info
+            settings: Optional Settings instance for safety controls
         """
         self.trade_context = trade_context
         self.db = db
         self.quote_client = quote_client
+        self.settings = settings
         self._active_orders: Dict[str, OrderRequest] = {}
         self._order_slices: Dict[str, List[OrderSlice]] = {}
         self._market_data_cache: Dict[str, Dict] = {}
@@ -226,6 +229,118 @@ class SmartOrderRouter:
         logger.debug(f"  ✅ {symbol}: 订单数量{quantity}股有效（{quantity // lot_size}手 × {lot_size}股/手）")
         return quantity
 
+    async def _fallback_cash_estimate(
+        self,
+        symbol: str,
+        price: float,
+        lot_size: int
+    ) -> int:
+        """
+        Fallback现金估算：当broker estimate返回0时的备用方案
+        使用50%现金进行保守估算，保留50%安全边际
+
+        Args:
+            symbol: 股票代码
+            price: 估算价格
+            lot_size: 手数大小
+
+        Returns:
+            估算的可买数量（股）
+        """
+        try:
+            # 获取币种现金
+            currency = "HKD" if symbol.endswith(".HK") else "USD"
+
+            # 使用trade_context获取账户余额（指定币种）
+            balance_resp = await asyncio.to_thread(
+                self.trade_context.account_balance,
+                currency  # 只获取指定币种的余额
+            )
+
+            if not balance_resp or len(balance_resp) == 0:
+                logger.debug(f"  ⚠️ {currency}账户余额为空")
+                return 0
+
+            balance = balance_resp[0]
+
+            # 解析现金余额和买入力
+            cash_available = 0.0
+            buy_power = float(getattr(balance, 'buy_power', 0) or 0)
+
+            # 从cash_infos中提取可用现金
+            if hasattr(balance, 'cash_infos') and balance.cash_infos:
+                for cash_info in balance.cash_infos:
+                    if cash_info.currency == currency:
+                        cash_available = float(getattr(cash_info, 'available_cash', 0) or 0)
+                        break
+
+            # 获取所有币种的余额信息（用于诊断）
+            all_balances_resp = await asyncio.to_thread(
+                self.trade_context.account_balance
+            )
+
+            all_balances = {}
+            for bal in all_balances_resp:
+                if hasattr(bal, 'cash_infos') and bal.cash_infos:
+                    for cash_info in bal.cash_infos:
+                        ccy = cash_info.currency
+                        cash_val = float(getattr(cash_info, 'available_cash', 0) or 0)
+                        power_val = float(getattr(bal, 'buy_power', 0) or 0)
+                        all_balances[ccy] = {"cash": cash_val, "buy_power": power_val}
+
+            # 🔍 跨币种债务诊断：检测"有现金但买入力为负"的情况
+            if cash_available > 0 and buy_power < 0:
+                logger.warning(
+                    f"🔍 跨币种债务诊断 - {currency}:\n"
+                    f"   {currency}现金: ${cash_available:,.2f} ✅\n"
+                    f"   {currency}买入力: ${buy_power:,.2f} ❌\n"
+                    f"   \n"
+                    f"   📊 全账户状态:\n"
+                    + "\n".join([
+                        f"   • {ccy}: 现金=${bal['cash']:,.0f}, "
+                        f"买入力=${bal['buy_power']:,.0f}"
+                        for ccy, bal in sorted(all_balances.items())
+                    ]) +
+                    f"\n\n"
+                    f"   ⚠️ 可能原因:\n"
+                    f"   • 其他币种融资债务影响整体账户购买力\n"
+                    f"   • LongPort风控将跨币种债务纳入购买力计算\n"
+                    f"   \n"
+                    f"   💡 建议:\n"
+                    f"   • 系统将使用50%现金进行保守估算\n"
+                    f"   • 考虑减仓释放购买力\n"
+                    f"   • 或归还融资债务恢复购买力"
+                )
+
+            if cash_available <= 0:
+                logger.debug(f"  ⚠️ {currency}现金不足: ${cash_available:,.0f}")
+                return 0
+
+            # 使用50%现金进行保守估算
+            conservative_cash = cash_available * 0.5
+            estimated_qty = int(conservative_cash / price)
+
+            # 按手数取整
+            lots = int(estimated_qty // lot_size)
+            if lots <= 0:
+                return 0
+
+            final_qty = lots * lot_size
+
+            logger.warning(
+                f"⚠️ Fallback现金估算 - {symbol}:\n"
+                f"   {currency}现金: ${cash_available:,.0f} ✅\n"
+                f"   保守策略: 使用50%现金 = ${conservative_cash:,.0f}\n"
+                f"   估算数量: {final_qty}股 ({lots}手 × {lot_size}股/手)\n"
+                f"   说明: Broker estimate返回0，但现金充足，尝试保守估算"
+            )
+
+            return final_qty
+
+        except Exception as e:
+            logger.error(f"  ❌ Fallback现金估算失败: {e}")
+            return 0
+
     async def execute_order(self, request: OrderRequest) -> ExecutionResult:
         """
         Execute an order using smart routing.
@@ -238,6 +353,51 @@ class SmartOrderRouter:
         """
         try:
             logger.info(f"Executing order: {request.symbol} {request.side} {request.quantity}")
+
+            # 🌙 盘后时段安全控制（仅美股）
+            if request.symbol.endswith('.US'):
+                from longport_quant.utils.market_hours import MarketHours
+                us_session = MarketHours.get_us_session()
+
+                if us_session == "AFTERHOURS":
+                    # 从配置获取盘后限制
+                    afterhours_force_limit = getattr(self._settings, 'afterhours_force_limit_orders', True)
+                    afterhours_max_urgency = getattr(self._settings, 'afterhours_max_urgency', 3)
+
+                    # 强制限价单
+                    if afterhours_force_limit and request.order_type == "MARKET":
+                        logger.warning(
+                            f"[盘后安全] {request.symbol}: 盘后时段禁止市价单，"
+                            f"自动转为限价单（MARKET → LIMIT）"
+                        )
+                        request.order_type = "LIMIT"
+                        # 如果没有限价，使用当前价格
+                        if request.limit_price is None:
+                            market_data = await self._get_market_data(request.symbol)
+                            if market_data:
+                                request.limit_price = market_data.last_price
+
+                    # 限制紧急度
+                    if request.urgency > afterhours_max_urgency:
+                        original_urgency = request.urgency
+                        request.urgency = afterhours_max_urgency
+                        logger.warning(
+                            f"[盘后安全] {request.symbol}: 盘后紧急度过高，"
+                            f"降低紧急度 {original_urgency} → {afterhours_max_urgency}"
+                        )
+
+                    # 强制PASSIVE策略（避免AGGRESSIVE）
+                    if request.strategy == ExecutionStrategy.AGGRESSIVE:
+                        request.strategy = ExecutionStrategy.PASSIVE
+                        logger.warning(
+                            f"[盘后安全] {request.symbol}: 盘后时段禁止AGGRESSIVE策略，"
+                            f"改为PASSIVE策略"
+                        )
+
+                    logger.info(
+                        f"🌙 [盘后订单] {request.symbol} {request.side} {request.quantity}\n"
+                        f"   类型: {request.order_type} | 紧急度: {request.urgency} | 策略: {request.strategy.value}"
+                    )
 
             # Update market data
             await self._update_market_data(request.symbol)
@@ -309,10 +469,34 @@ class SmartOrderRouter:
         return True
 
     async def _select_strategy(self, request: OrderRequest) -> ExecutionStrategy:
-        """Select appropriate execution strategy based on market conditions."""
+        """Select appropriate execution strategy based on market conditions and safety controls."""
+        from longport_quant.utils.market_hours import MarketHours
+
         market_data = self._market_data_cache.get(request.symbol, {})
 
-        # High urgency - use aggressive
+        # 🔒 安全控制1：全局强制限价单开关
+        if self.settings and self.settings.force_limit_orders:
+            logger.debug("🔒 FORCE_LIMIT_ORDERS=True, 强制使用PASSIVE策略（限价单）")
+            return ExecutionStrategy.PASSIVE
+
+        # 🔒 安全控制2：应用最大紧急度上限
+        max_urgency = 10  # 默认无上限
+        if self.settings and hasattr(self.settings, 'max_urgency_level'):
+            max_urgency = self.settings.max_urgency_level
+            if request.urgency > max_urgency:
+                logger.warning(
+                    f"🔒 紧急度{request.urgency}超过上限{max_urgency}，已自动调整"
+                )
+                request.urgency = max_urgency
+
+        # 🔒 安全控制3：盘外时段禁用市价单
+        if self.settings and not self.settings.allow_market_orders_during_market_hours:
+            current_market = MarketHours.get_current_market()
+            if current_market == "NONE":
+                logger.debug("🔒 市场休市且禁用盘外市价单，强制使用PASSIVE策略")
+                return ExecutionStrategy.PASSIVE
+
+        # High urgency - use aggressive (如果没有被上面的安全控制拦截)
         if request.urgency >= 8:
             return ExecutionStrategy.AGGRESSIVE
 
@@ -330,8 +514,8 @@ class SmartOrderRouter:
         if request.urgency <= 3:
             return ExecutionStrategy.PASSIVE
 
-        # Default to standard execution
-        return ExecutionStrategy.AGGRESSIVE
+        # Default to passive execution (limit orders for better control)
+        return ExecutionStrategy.PASSIVE
 
     def _calculate_dynamic_limit_price(
         self,
@@ -548,8 +732,35 @@ class SmartOrderRouter:
                     )
 
                     if allow_max <= 0:
-                        logger.error("  ❌ 券商估算可买数量为0，跳过下单")
-                        return ExecutionResult(success=False, error_message="可买数量为0")
+                        logger.warning(
+                            f"  ⚠️ {request.symbol}: 券商估算可买数量为0，尝试Fallback现金估算..."
+                        )
+
+                        # Fallback: 使用现金保守估算
+                        lot_size = await self._get_lot_size(request.symbol)
+                        fallback_quantity = await self._fallback_cash_estimate(
+                            symbol=request.symbol,
+                            price=limit_price,
+                            lot_size=lot_size
+                        )
+
+                        if fallback_quantity <= 0:
+                            logger.error("  ❌ Fallback估算也失败，跳过下单")
+                            return ExecutionResult(success=False, error_message="可买数量为0（Fallback也失败）")
+
+                        # 检查请求数量是否超过Fallback估算
+                        if request.quantity > fallback_quantity:
+                            logger.warning(
+                                f"  ⚠️ 请求数量{request.quantity}超过Fallback估算{fallback_quantity}，"
+                                f"调整为{fallback_quantity}"
+                            )
+                            request.quantity = fallback_quantity
+
+                        logger.info(
+                            f"  ✅ Fallback估算成功，继续下单: {request.quantity}股"
+                        )
+                        # 跳过后续的allow_max检查
+                        allow_max = fallback_quantity
 
                     if request.quantity > allow_max:
                         logger.error(
@@ -563,12 +774,28 @@ class SmartOrderRouter:
                     # 估算失败时不中断下单流程，仅警告
                     logger.warning(f"  ⚠️ 可买上限估算失败，继续下单: {e}")
 
+            # 🔍 最终手数验证（提交前最后检查）
+            final_lot_size = await self._get_lot_size(request.symbol)
+            if request.quantity % final_lot_size != 0:
+                original_qty = request.quantity
+                request.quantity = (request.quantity // final_lot_size) * final_lot_size
+                logger.warning(
+                    f"  ⚠️ 提交前发现手数不匹配，自动调整: "
+                    f"{original_qty}股 → {request.quantity}股 "
+                    f"({request.quantity // final_lot_size}手 × {final_lot_size}股/手)"
+                )
+
+                if request.quantity <= 0:
+                    logger.error(f"  ❌ 调整后数量为0，无法下单")
+                    return ExecutionResult(success=False, error_message="调整后数量为0")
+
             # Submit limit order
             order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
 
             # 转换为 Decimal 并打印最终值
             price_decimal = Decimal(str(limit_price))
             logger.debug(f"  🔢 最终提交价格(Decimal): {price_decimal}")
+            logger.debug(f"  📦 最终提交数量: {request.quantity}股 ({request.quantity // final_lot_size}手)")
 
             # Wrap synchronous SDK call with asyncio.to_thread
             # 正确的参数顺序: symbol, order_type, side, quantity, time_in_force, price, ...
@@ -616,7 +843,84 @@ class SmartOrderRouter:
 
         except Exception as e:
             error_str = str(e)
-            # 🔥 增强错误处理：对602035错误进行自动重试（使用市场价格）
+
+            # 🔥 增强错误处理1：手数倍数错误自动重试（602001）
+            if "602001" in error_str or "lot size" in error_str.lower():
+                logger.warning(f"  ⚠️ 遇到手数倍数错误(602001)，尝试自动调整数量并重试...")
+                logger.debug(f"  原始错误: {error_str}")
+
+                try:
+                    # 重新获取正确的lot_size
+                    correct_lot_size = await self._get_lot_size(request.symbol)
+                    logger.info(f"  📏 正确的lot_size: {correct_lot_size}股/手")
+
+                    # 调整数量到正确的手数倍数
+                    adjusted_quantity = (request.quantity // correct_lot_size) * correct_lot_size
+
+                    if adjusted_quantity <= 0:
+                        # 至少买一手
+                        adjusted_quantity = correct_lot_size
+                        logger.warning(f"  ⚠️ 调整后数量为0，改为最小1手: {adjusted_quantity}股")
+
+                    logger.info(
+                        f"  🔄 数量调整: {request.quantity}股 → {adjusted_quantity}股 "
+                        f"({adjusted_quantity // correct_lot_size}手 × {correct_lot_size}股/手)"
+                    )
+
+                    # 如果调整后数量与原数量相同，说明不是手数问题，直接失败
+                    if adjusted_quantity == request.quantity:
+                        logger.error(
+                            f"  ❌ 数量已经是手数倍数({request.quantity} = {request.quantity // correct_lot_size}手 × {correct_lot_size}股)，"
+                            f"但仍报手数错误，可能是其他原因"
+                        )
+                        return ExecutionResult(success=False, error_message=error_str)
+
+                    # 重新提交订单（使用调整后的数量）
+                    order_side = OrderSide.Buy if request.side == "BUY" else OrderSide.Sell
+                    price_decimal = Decimal(str(limit_price))
+
+                    logger.info(f"  💰 重试订单参数: {request.side} {adjusted_quantity}股 @ ${limit_price:.2f}")
+
+                    resp = await asyncio.to_thread(
+                        self.trade_context.submit_order,
+                        request.symbol,
+                        OrderType.LO,
+                        order_side,
+                        adjusted_quantity,  # 使用调整后的数量
+                        TimeInForceType.Day,
+                        price_decimal,
+                        None, None, None, None, None
+                    )
+
+                    logger.success(f"  ✅ 手数调整后重试成功！订单已提交: order_id={resp.order_id}")
+
+                    # Track order
+                    self._active_orders[resp.order_id] = request
+
+                    # Wait for fill
+                    filled_qty, avg_price = await self._wait_for_fill(resp.order_id, timeout=60)
+
+                    if filled_qty < adjusted_quantity:
+                        logger.warning(f"Partial fill: {filled_qty}/{adjusted_quantity}")
+
+                    success = filled_qty > 0
+                    return ExecutionResult(
+                        success=success,
+                        order_id=resp.order_id,
+                        filled_quantity=filled_qty,
+                        average_price=avg_price,
+                        execution_time=datetime.now(),
+                        error_message="订单被拒绝或未成交" if not success else None
+                    )
+
+                except Exception as retry_error:
+                    logger.error(f"  ❌ 手数调整重试也失败: {retry_error}")
+                    return ExecutionResult(
+                        success=False,
+                        error_message=f"原始错误: {error_str}, 重试错误: {str(retry_error)}"
+                    )
+
+            # 🔥 增强错误处理2：对602035错误进行自动重试（使用市场价格）
             if "602035" in error_str or "Wrong bid size" in error_str:
                 logger.warning(f"  ⚠️ 遇到602035错误，尝试使用实时市场价格重试...")
                 logger.debug(f"  原始错误: {error_str}")

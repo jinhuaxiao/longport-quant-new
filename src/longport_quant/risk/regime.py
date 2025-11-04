@@ -106,6 +106,15 @@ class RegimeClassifier:
         # 获取当前活跃市场
         current_market = MarketHours.get_current_market()
 
+        # 🌙 盘后时段数据可用性检查
+        us_session = MarketHours.get_us_session()
+        if us_session == "AFTERHOURS":
+            logger.warning(
+                f"🌙 当前为美股盘后时段 (16:00-20:00 ET)\n"
+                f"   数据策略: 尝试获取实时数据，失败则使用RTH收盘价\n"
+                f"   说明: LongPort盘后数据可能延迟或不可用"
+            )
+
         # 获取正向和反向指标
         symbols = self._parse_symbols(filter_by_market=filter_by_market)
         inverse_symbols = self._parse_inverse_symbols(filter_by_market=filter_by_market)

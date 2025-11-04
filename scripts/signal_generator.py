@@ -149,8 +149,6 @@ class SignalGenerator:
             "PLTR.US": {"name": "Palantir", "sector": "AI"},
             # 电商 & 金融科技
             "SHOP.US": {"name": "Shopify", "sector": "电商"},
-            # ETF指数基金
-            "QQQ.US": {"name": "纳指100ETF", "sector": "ETF"},
             # 杠杆ETF
             "TQQQ.US": {"name": "纳指三倍做多ETF", "sector": "ETF"},
             "NVDU.US": {"name": "英伟达二倍做多ETF", "sector": "ETF"},
