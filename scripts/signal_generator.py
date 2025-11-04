@@ -640,6 +640,17 @@ class SignalGenerator:
             if not self._should_recalculate(symbol, current_price):
                 return
 
+            # 🔧 港股市场时间检查（美股不受限，支持盘前盘后买入）
+            if symbol.endswith('.HK') and self.check_market_hours:
+                if not self._is_market_open(symbol):
+                    logger.debug(f"  ⏭️  {symbol}: 港股市场未开盘，跳过买入信号分析")
+                    # 港股收盘后仍然检查止损止盈（风险管理优先）
+                    if symbol in self.current_positions:
+                        has_position = await self.position_manager.has_position(symbol)
+                        if has_position:
+                            await self._check_realtime_stop_loss(symbol, current_price, quote)
+                    return
+
             logger.debug(f"⚡ {symbol}: 价格变化触发实时计算 (${current_price:.2f})")
 
             # 优先级1：检查持仓的止损止盈（实时检查）
