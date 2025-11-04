@@ -146,7 +146,7 @@ class SignalGenerator:
             "TSM.US": {"name": "台积电", "sector": "半导体"},
             "ASML.US": {"name": "阿斯麦", "sector": "半导体"},
             # AI & 云计算
-            "PLTR.US": {"name": "Palantir", "sector": "AI"},
+            #"PLTR.US": {"name": "Palantir", "sector": "AI"},
             # 电商 & 金融科技
             "SHOP.US": {"name": "Shopify", "sector": "电商"},
             # 杠杆ETF
@@ -1216,6 +1216,8 @@ class SignalGenerator:
                 'bb_middle': bb['middle'][-1] if len(bb['middle']) > 0 else np.nan,
                 'bb_lower': bb['lower'][-1] if len(bb['lower']) > 0 else np.nan,
                 'macd': macd_result['macd'][-1] if len(macd_result['macd']) > 0 else np.nan,
+                'macd_line': macd_result['macd'][-1] if len(macd_result['macd']) > 0 else np.nan,  # 🔥 MACD线（用于0轴检测）
+                'prev_macd_line': macd_result['macd'][-2] if len(macd_result['macd']) > 1 else 0,  # 🔥 前一个MACD线
                 'macd_signal': macd_result['signal'][-1] if len(macd_result['signal']) > 0 else np.nan,
                 'macd_histogram': macd_result['histogram'][-1] if len(macd_result['histogram']) > 0 else np.nan,
                 'prev_macd_histogram': macd_result['histogram'][-2] if len(macd_result['histogram']) > 1 else 0,
@@ -1239,7 +1241,8 @@ class SignalGenerator:
             # 返回空指标
             return {
                 'rsi': np.nan, 'bb_upper': np.nan, 'bb_middle': np.nan, 'bb_lower': np.nan,
-                'macd': np.nan, 'macd_signal': np.nan, 'macd_histogram': np.nan,
+                'macd': np.nan, 'macd_line': np.nan, 'prev_macd_line': 0,
+                'macd_signal': np.nan, 'macd_histogram': np.nan,
                 'prev_macd_histogram': 0, 'sma_20': np.nan, 'sma_50': np.nan,
                 'volume_sma': np.nan, 'atr': np.nan,
             }
@@ -1646,10 +1649,46 @@ class SignalGenerator:
 
         # === 平仓信号（正分）===
 
-        # 1. MACD死叉（+50分）- 最强卖出信号
+        # 1. MACD趋势止损（增强版）
+        macd_line = indicators.get('macd_line', 0)
+        macd_signal = indicators.get('macd_signal', 0)
+
+        # 🔥 MACD死叉（+50-70分）- 根据盈亏状态调整
         if prev_macd_histogram > 0 > macd_histogram:
-            score += 50
-            reasons.append("⚠️ MACD死叉")
+            # 盈利时激进：立即触发
+            if profit_pct >= self.settings.profit_aggressive_threshold:
+                score += 70
+                reasons.append("⚠️ MACD死叉（盈利时激进）")
+            # 亏损时稳健：需要额外验证
+            elif profit_pct < 0 and self.settings.loss_conservative_mode:
+                # 需要配合RSI或0轴跌破才触发
+                if rsi > 60 or macd_line < 0:
+                    score += 50
+                    reasons.append("⚠️ MACD死叉（保守确认）")
+                else:
+                    score += 20  # 单一死叉信号权重降低
+                    reasons.append("MACD死叉（待确认）")
+            else:
+                score += 50
+                reasons.append("⚠️ MACD死叉")
+
+        # 🔥 MACD跌破0轴（+30分）- 趋势彻底反转
+        prev_macd_line = indicators.get('prev_macd_line', 0)
+        if self.settings.macd_zero_cross_threshold:
+            if prev_macd_line > 0 > macd_line:
+                score += 30
+                reasons.append("⚠️ MACD跌破0轴")
+            elif macd_line < 0 and macd_histogram < prev_macd_histogram:
+                # 0轴下方且直方图继续萎缩（加速下跌）
+                score += 15
+                reasons.append("MACD空头加速")
+
+        # 🔥 MACD+RSI组合验证（+20分额外加分）
+        if self.settings.macd_rsi_combo:
+            if macd_histogram < 0 and rsi > 60:
+                # MACD弱势 + RSI超买 = 强卖出信号
+                score += 20
+                reasons.append("⚠️ MACD弱势+RSI超买")
 
         # 2. RSI极度超买（+40分）
         if rsi > 80 and profit_pct > 0:
@@ -1686,11 +1725,15 @@ class SignalGenerator:
             score += 15
             reasons.append("成交量萎缩")
 
-        # 根据评分决定动作（🔥 提高门槛避免过早止盈）
+        # 根据评分决定动作（🔥 提高门槛避免过早止盈 + 分批止损）
         if score >= 70:  # 从50提高到70
             action = "TAKE_PROFIT_NOW"
             adjusted_take_profit = current_price  # 立即止盈
-        elif score >= 50:  # 从30提高到50
+        elif score >= 50 and self.settings.partial_exit_enabled:
+            # 🔥 分批止损：先减50%仓位，观察趋势
+            action = "PARTIAL_EXIT"
+            adjusted_take_profit = current_price * 1.05
+        elif score >= 50:  # 未启用分批止损时保持原逻辑
             action = "TAKE_PROFIT_EARLY"
             adjusted_take_profit = current_price * 1.05  # 提前止盈（+5%）
         elif score >= 10:
@@ -1706,17 +1749,56 @@ class SignalGenerator:
             action = "STANDARD"
             adjusted_take_profit = stops.get('take_profit', current_price * 1.10)
 
-        # 止损位调整（根据趋势和ATR）
+        # 🔥 ATR动态止损（根据趋势和盈亏状态自适应调整）
         atr = indicators.get('atr', 0)
-        if atr and atr > 0:
-            # 使用ATR动态调整止损
+        if atr and atr > 0 and self.settings.atr_dynamic_enabled:
+            # 1. 判断趋势（上涨/下跌/震荡）
+            sma_20 = indicators.get('sma_20', 0)
+            sma_50 = indicators.get('sma_50', 0)
+
+            # 判断趋势方向
+            if not np.isnan(sma_20) and not np.isnan(sma_50) and not np.isnan(macd_line):
+                if macd_line > 0 and sma_20 > sma_50:
+                    # 上涨趋势：放宽止损
+                    trend_multiplier = self.settings.atr_multiplier_bull  # 默认2.5
+                    trend_type = "上涨"
+                elif macd_line < 0 and sma_20 < sma_50:
+                    # 下跌趋势：收紧止损
+                    trend_multiplier = self.settings.atr_multiplier_bear  # 默认1.5
+                    trend_type = "下跌"
+                else:
+                    # 震荡趋势：标准止损
+                    trend_multiplier = self.settings.atr_multiplier_range  # 默认2.0
+                    trend_type = "震荡"
+            else:
+                # 数据不足，使用标准倍数
+                trend_multiplier = 2.0
+                trend_type = "标准"
+
+            # 2. 根据盈亏状态调整（混合策略）
+            if profit_pct >= self.settings.profit_aggressive_threshold:
+                # 盈利>5%时收紧止损，锁定利润
+                trend_multiplier *= 0.8
+                trend_type += "（盈利收紧）"
+            elif profit_pct < -3.0 and self.settings.loss_conservative_mode:
+                # 亏损>3%时放宽止损，给予恢复空间
+                trend_multiplier *= 1.2
+                trend_type += "（亏损放宽）"
+
+            # 3. 计算ATR止损位
+            adjusted_stop_loss = current_price - (trend_multiplier * atr)
+
+            # 记录趋势和倍数信息
+            reasons.append(f"ATR动态({trend_type}, {trend_multiplier:.1f}x)")
+
+        elif atr and atr > 0:
+            # ATR存在但动态调整未启用，使用传统逻辑
             if action in ["STRONG_HOLD", "DELAY_TAKE_PROFIT"]:
-                # 持有信号：放宽止损
                 adjusted_stop_loss = current_price - (3.0 * atr)
             else:
                 adjusted_stop_loss = current_price - (2.5 * atr)
         else:
-            # 固定百分比止损
+            # 无ATR数据，使用固定百分比止损
             if action in ["STRONG_HOLD", "DELAY_TAKE_PROFIT"]:
                 adjusted_stop_loss = current_price * 0.93  # -7%
             else:
@@ -1768,6 +1850,26 @@ class SignalGenerator:
                 quote = quote_dict[symbol]
                 current_price = float(quote.last_done)
 
+                # 🔥 检查是否在分批止损观察期内
+                is_in_observation = False
+                partial_exit_data = None
+                if self.settings.partial_exit_enabled:
+                    try:
+                        import json
+                        partial_exit_key = f"partial_exit:{account.get('account_id', '')}:{symbol}"
+                        partial_exit_str = await self.redis_client.get(partial_exit_key)
+                        if partial_exit_str:
+                            partial_exit_data = json.loads(partial_exit_str)
+                            is_in_observation = True
+                            logger.info(
+                                f"  👀 {symbol}: 观察期内（部分平仓后）\n"
+                                f"     已卖出: {partial_exit_data['partial_qty']}股\n"
+                                f"     剩余: {partial_exit_data['remaining_qty']}股\n"
+                                f"     观察开始: {partial_exit_data['timestamp']}"
+                            )
+                    except Exception as e:
+                        logger.debug(f"检查观察期状态失败: {e}")
+
                 # 检查是否有止损止盈设置
                 stops = await self.stop_manager.get_position_stops(account.get("account_id", ""), symbol)
 
@@ -1799,6 +1901,65 @@ class SignalGenerator:
                         f"     评分={score:+d}, 动作={action}\n"
                         f"     原因: {', '.join(reasons) if reasons else '无'}"
                     )
+
+                    # 🔥 观察期后的趋势确认逻辑
+                    if is_in_observation and partial_exit_data:
+                        prev_score = partial_exit_data.get('exit_score', 50)
+
+                        if score >= 60:
+                            # 趋势继续恶化，清仓剩余50%
+                            logger.error(
+                                f"🔴 {symbol}: 观察期确认下跌 - 清仓剩余仓位\n"
+                                f"   评分: {prev_score} → {score} (继续恶化)\n"
+                                f"   当前=${current_price:.2f}, 收益={profit_pct:+.2f}%\n"
+                                f"   原因: {', '.join(reasons)}"
+                            )
+                            exit_signals.append({
+                                'symbol': symbol,
+                                'type': 'FULL_EXIT_CONFIRMED',
+                                'side': 'SELL',
+                                'quantity': quantity,  # 卖出剩余全部
+                                'price': current_price,
+                                'reason': f"观察期确认下跌，清仓: {', '.join(reasons[:3])}",
+                                'score': 95,
+                                'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                                'priority': 95,
+                                'cost_price': cost_price,
+                                'entry_time': position.get('entry_time'),
+                                'indicators': indicators,
+                                'exit_score_details': reasons,
+                            })
+                            # 清除观察期状态
+                            try:
+                                partial_exit_key = f"partial_exit:{account.get('account_id', '')}:{symbol}"
+                                await self.redis_client.delete(partial_exit_key)
+                            except:
+                                pass
+                            continue  # 已生成清仓信号，跳过后续逻辑
+
+                        elif score < 30:
+                            # 趋势恢复，保留剩余仓位
+                            logger.success(
+                                f"✅ {symbol}: 观察期确认恢复 - 保留剩余仓位\n"
+                                f"   评分: {prev_score} → {score} (趋势恢复)\n"
+                                f"   当前=${current_price:.2f}, 收益={profit_pct:+.2f}%\n"
+                                f"   动作: 继续持有{quantity}股"
+                            )
+                            # 清除观察期状态
+                            try:
+                                partial_exit_key = f"partial_exit:{account.get('account_id', '')}:{symbol}"
+                                await self.redis_client.delete(partial_exit_key)
+                            except:
+                                pass
+                            continue  # 保留仓位，跳过后续逻辑
+                        else:
+                            # 趋势不明确，继续观察
+                            logger.info(
+                                f"  ⏳ {symbol}: 观察期继续 - 趋势不明确\n"
+                                f"   评分: {prev_score} → {score}\n"
+                                f"   继续观察剩余{quantity}股"
+                            )
+                            continue  # 继续观察，跳过后续逻辑
 
                     # 🔥 检查最小持仓时间（智能止盈也需要遵守）
                     entry_time_str = position.get('entry_time')
@@ -1858,6 +2019,55 @@ class SignalGenerator:
                             'indicators': indicators,  # 完整的技术指标
                             'exit_score_details': reasons,  # 卖出评分详情
                         })
+
+                    elif action == "PARTIAL_EXIT":
+                        # 🔥 分批止损：先卖出50%仓位
+                        partial_qty = int(quantity * self.settings.partial_exit_pct)
+                        if partial_qty > 0:
+                            logger.warning(
+                                f"⚠️  {symbol}: 分批止损 - 先减{int(self.settings.partial_exit_pct*100)}%仓位 (评分={score:+d})\n"
+                                f"   当前=${current_price:.2f}, 收益={profit_pct:+.2f}%\n"
+                                f"   卖出数量: {partial_qty}/{quantity}股\n"
+                                f"   原因: {', '.join(reasons)}\n"
+                                f"   观察期: {self.settings.partial_exit_observation_minutes}分钟"
+                            )
+                            exit_signals.append({
+                                'symbol': symbol,
+                                'type': 'PARTIAL_EXIT',
+                                'side': 'SELL',
+                                'quantity': partial_qty,  # 🔥 只卖出部分仓位
+                                'price': current_price,
+                                'reason': f"分批止损({int(self.settings.partial_exit_pct*100)}%): {', '.join(reasons[:3])}",
+                                'score': 90,
+                                'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                                'priority': 90,
+                                # 🔥 增强数据：供Slack通知使用
+                                'cost_price': cost_price,
+                                'entry_time': position.get('entry_time'),
+                                'indicators': indicators,  # 完整的技术指标
+                                'exit_score_details': reasons,  # 卖出评分详情
+                                'is_partial': True,  # 标记为部分平仓
+                                'remaining_qty': quantity - partial_qty,
+                            })
+
+                            # 🔥 记录部分平仓状态到Redis（用于观察期判断）
+                            try:
+                                import json
+                                partial_exit_key = f"partial_exit:{account.get('account_id', '')}:{symbol}"
+                                partial_exit_data = {
+                                    'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                                    'partial_qty': partial_qty,
+                                    'remaining_qty': quantity - partial_qty,
+                                    'exit_score': score,
+                                    'price': current_price,
+                                }
+                                await self.redis_client.setex(
+                                    partial_exit_key,
+                                    self.settings.partial_exit_observation_minutes * 60,  # TTL = 观察期
+                                    json.dumps(partial_exit_data)
+                                )
+                            except Exception as e:
+                                logger.warning(f"记录部分平仓状态失败: {e}")
 
                     elif action == "TAKE_PROFIT_EARLY":
                         # 提前止盈（不等固定止盈位）

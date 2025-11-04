@@ -237,6 +237,36 @@ class Settings(BaseSettings):
     # 价格陈旧检查：信号价格与实时价格偏差超过此百分比时暂停订单
     max_price_staleness_pct: float = Field(0.03, alias="MAX_PRICE_STALENESS_PCT")
 
+    # ============================================================
+    # 趋势止损配置（Trend-Based Stop Loss）
+    # ============================================================
+    # 说明：
+    # - 基于MACD和ATR的智能趋势止损系统
+    # - 支持盈利/亏损混合策略（盈利时激进，亏损时稳健）
+    # - 支持分批止损（趋势反转时先减50%仓位）
+    # ============================================================
+
+    # MACD趋势止损配置
+    macd_stop_enabled: bool = Field(True, alias="MACD_STOP_ENABLED")  # 启用MACD趋势止损
+    macd_zero_cross_threshold: bool = Field(True, alias="MACD_ZERO_CROSS_THRESHOLD")  # 启用MACD 0轴跌破检测
+    macd_rsi_combo: bool = Field(True, alias="MACD_RSI_COMBO")  # 启用MACD+RSI组合验证
+
+    # ATR动态止损配置
+    atr_dynamic_enabled: bool = Field(True, alias="ATR_DYNAMIC_ENABLED")  # 启用ATR动态止损
+    atr_multiplier_bull: float = Field(2.5, alias="ATR_MULTIPLIER_BULL")  # 上涨趋势ATR倍数（放宽）
+    atr_multiplier_bear: float = Field(1.5, alias="ATR_MULTIPLIER_BEAR")  # 下跌趋势ATR倍数（收紧）
+    atr_multiplier_range: float = Field(2.0, alias="ATR_MULTIPLIER_RANGE")  # 震荡趋势ATR倍数（标准）
+
+    # 分批止损配置
+    partial_exit_enabled: bool = Field(True, alias="PARTIAL_EXIT_ENABLED")  # 启用分批止损
+    partial_exit_pct: float = Field(0.5, alias="PARTIAL_EXIT_PCT")  # 首次部分平仓比例（50%）
+    partial_exit_observation_minutes: int = Field(5, alias="PARTIAL_EXIT_OBSERVATION_MINUTES")  # 观察期（分钟）
+
+    # 混合策略配置（盈利时激进，亏损时稳健）
+    profit_aggressive_threshold: float = Field(5.0, alias="PROFIT_AGGRESSIVE_THRESHOLD")  # 盈利超过5%时激进止损
+    profit_trailing_threshold: float = Field(10.0, alias="PROFIT_TRAILING_THRESHOLD")  # 盈利超过10%时启用Trailing Stop
+    loss_conservative_mode: bool = Field(True, alias="LOSS_CONSERVATIVE_MODE")  # 亏损时启用保守模式（需多信号确认）
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
