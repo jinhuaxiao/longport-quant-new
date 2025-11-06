@@ -434,8 +434,8 @@ class OrderExecutor:
             持仓分析结果
         """
         symbol = position.get('symbol', '')
-        quantity = position.get('quantity', 0)
-        cost_price = position.get('cost_price', 0)
+        quantity = float(position.get('quantity', 0))
+        cost_price = float(position.get('cost_price', 0))
 
         # 获取当前市价
         try:
@@ -824,9 +824,9 @@ class OrderExecutor:
 
         # 4. 资金检查（保留原有逻辑以兼容）
         currency = "HKD" if ".HK" in symbol else "USD"
-        available_cash = account["cash"].get(currency, 0)
-        buy_power = account.get("buy_power", {}).get(currency, 0)
-        remaining_finance = account.get("remaining_finance", {}).get(currency, 0)
+        available_cash = float(account["cash"].get(currency, 0))
+        buy_power = float(account.get("buy_power", {}).get(currency, 0))
+        remaining_finance = float(account.get("remaining_finance", {}).get(currency, 0))
 
         # 跨币种债务诊断：检测"有现金但买入力为负"的情况
         if available_cash > 0 and buy_power < 0:
@@ -954,7 +954,7 @@ class OrderExecutor:
                 # 重新获取账户信息（轮换后强制刷新缓存）
                 try:
                     account = await self._get_account_with_cache(force_refresh=True)
-                    available_cash = account["cash"].get(currency, 0)
+                    available_cash = float(account["cash"].get(currency, 0))
 
                     if available_cash >= required_cash:
                         logger.success(f"  💰 轮换后可用资金: ${available_cash:,.2f}，继续执行订单")
@@ -1480,12 +1480,12 @@ class OrderExecutor:
                 # 获取账户信息
                 try:
                     account = await self.trade_client.get_account()
-                    hkd_cash = account["cash"].get("HKD", 0)
-                    usd_cash = account["cash"].get("USD", 0)
-                    hkd_power = account.get("buy_power", {}).get("HKD", 0)
-                    usd_power = account.get("buy_power", {}).get("USD", 0)
+                    hkd_cash = float(account["cash"].get("HKD", 0))
+                    usd_cash = float(account["cash"].get("USD", 0))
+                    hkd_power = float(account.get("buy_power", {}).get("HKD", 0))
+                    usd_power = float(account.get("buy_power", {}).get("USD", 0))
                 except:
-                    hkd_cash = usd_cash = hkd_power = usd_power = 0
+                    hkd_cash = usd_cash = hkd_power = usd_power = 0.0
 
                 # 队列长时间为空的警告（连续3小时）
                 if queue_size == 0:
@@ -1826,9 +1826,9 @@ class OrderExecutor:
         currency = "HKD" if ".HK" in symbol else "USD"
 
         # 获取总资产
-        net_assets = account.get("net_assets", {}).get(currency, 0)
+        net_assets = float(account.get("net_assets", {}).get(currency, 0))
         if net_assets <= 0:
-            net_assets = 50000  # 默认值
+            net_assets = 50000.0  # 默认值
 
         # 基础预算（总资产的百分比）
         base_budget = net_assets * self.min_position_size_pct
@@ -1853,9 +1853,9 @@ class OrderExecutor:
         dynamic_budget = net_assets * budget_pct
 
         # 🔥 不能超过该币种的实际购买力和融资额度
-        available_cash = account.get("cash", {}).get(currency, 0)
-        remaining_finance = account.get("remaining_finance", {}).get(currency, 0)
-        buy_power = account.get("buy_power", {}).get(currency, 0)
+        available_cash = float(account.get("cash", {}).get(currency, 0))
+        remaining_finance = float(account.get("remaining_finance", {}).get(currency, 0))
+        buy_power = float(account.get("buy_power", {}).get(currency, 0))
 
         # 计算可支配上限：优先使用购买力，其次可用资金，最后剩余融资额度
         if buy_power and buy_power > 0:
@@ -3172,11 +3172,11 @@ class OrderExecutor:
                         try:
                             account = await self.trade_client.get_account()
                             currency = "HKD" if ".HK" in symbol else "USD"
-                            cash = account["cash"].get(currency, 0)
-                            power = account.get("buy_power", {}).get(currency, 0)
+                            cash = float(account["cash"].get(currency, 0))
+                            power = float(account.get("buy_power", {}).get(currency, 0))
                         except:
                             currency = "HKD" if ".HK" in symbol else "USD"
-                            cash = power = 0
+                            cash = power = 0.0
 
                         # 估算所需资金（简单估算）
                         current_price = signal.get('price', 0)
@@ -3231,12 +3231,12 @@ class OrderExecutor:
                 # 获取账户信息用于通知
                 try:
                     account = await self.trade_client.get_account()
-                    hkd_cash = account["cash"].get("HKD", 0)
-                    usd_cash = account["cash"].get("USD", 0)
-                    hkd_power = account.get("buy_power", {}).get("HKD", 0)
-                    usd_power = account.get("buy_power", {}).get("USD", 0)
+                    hkd_cash = float(account["cash"].get("HKD", 0))
+                    usd_cash = float(account["cash"].get("USD", 0))
+                    hkd_power = float(account.get("buy_power", {}).get("HKD", 0))
+                    usd_power = float(account.get("buy_power", {}).get("USD", 0))
                 except:
-                    hkd_cash = usd_cash = hkd_power = usd_power = 0
+                    hkd_cash = usd_cash = hkd_power = usd_power = 0.0
 
                 # 构建延迟信号列表（去重：同一标的只显示一次）
                 seen_symbols = set()
