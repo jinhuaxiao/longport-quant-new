@@ -40,6 +40,8 @@ from longport_quant.utils import LotSizeHelper
 from longport_quant.persistence.stop_manager import StopLossManager
 from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.position_manager import RedisPositionManager
+from longport_quant.risk.regime import RegimeClassifier
+from longport_quant.notifications.notifier import MultiChannelNotifier
 
 
 def sanitize_unicode(text: str) -> str:
@@ -197,6 +199,9 @@ class SignalGenerator:
             redis_url=self.settings.redis_url,
             key_prefix="trading"
         )
+
+        # 🔥 市场状态分类器（用于牛熊市判断）
+        self.regime_classifier = RegimeClassifier(self.settings)
 
         # 今日已交易标的集合（避免重复下单）
         self.traded_today = set()  # 今日买单标的（包括pending）
@@ -640,11 +645,12 @@ class SignalGenerator:
             if not self._should_recalculate(symbol, current_price):
                 return
 
-            # 🔧 港股市场时间检查（美股不受限，支持盘前盘后买入）
-            if symbol.endswith('.HK') and self.check_market_hours:
+            # 🔧 市场时间检查（港股和美股都需要在交易时间内才生成买入信号）
+            if self.check_market_hours:
                 if not self._is_market_open(symbol):
-                    logger.debug(f"  ⏭️  {symbol}: 港股市场未开盘，跳过买入信号分析")
-                    # 港股收盘后仍然检查止损止盈（风险管理优先）
+                    market_name = "港股" if symbol.endswith('.HK') else "美股" if symbol.endswith('.US') else "市场"
+                    logger.debug(f"  ⏭️  {symbol}: {market_name}未开盘，跳过买入信号分析")
+                    # 收盘后仍然检查止损止盈（风险管理优先）
                     if symbol in self.current_positions:
                         has_position = await self.position_manager.has_position(symbol)
                         if has_position:
@@ -757,7 +763,113 @@ class SignalGenerator:
             cost_price = position_detail.get('cost_price', 0)
             quantity = position_detail.get('quantity', 0)
 
-            # 2. 获取止损止盈设置（从数据库）
+            # 2. 🔥 混合硬止损检查（-8% + 技术验证）
+            # 这是最后防线，防止单日大幅亏损（如PLTR -10%）
+            if cost_price > 0:
+                profit_pct = (current_price - cost_price) / cost_price
+
+                # 硬止损阈值：-8%
+                HARD_STOP_LOSS_PCT = -0.08
+
+                if profit_pct <= HARD_STOP_LOSS_PCT:
+                    # 杠杆ETF列表（3x杠杆需要更严格保护）
+                    leveraged_keywords = ['TQQQ', 'SQQQ', 'NVDU', 'NVDD', 'LABU', 'LABD',
+                                         'TECL', 'TECS', 'UPRO', 'SPXU', 'UDOW', 'SDOW',
+                                         'FAS', 'FAZ', 'TNA', 'TZA', 'NAIL', 'DIRV']
+                    is_leveraged = any(kw in symbol.upper() for kw in leveraged_keywords)
+
+                    # 技术验证标志
+                    technical_confirm = False
+
+                    if is_leveraged:
+                        # 杠杆ETF：直接触发，无需技术验证
+                        technical_confirm = True
+                        technical_reason = "杠杆ETF风险控制"
+                    else:
+                        # 普通股票：尝试技术验证
+                        # 从缓存获取指标（避免实时计算影响性能）
+                        cached_data = self.indicator_cache.get(symbol, {})
+                        indicators = cached_data.get('indicators', {})
+
+                        if indicators:
+                            # 有缓存指标：进行技术验证
+                            macd_histogram = indicators.get('macd_histogram', 0)
+                            rsi = indicators.get('rsi', 50)
+                            sma_20 = indicators.get('sma_20', 0)
+
+                            # 技术弱势信号：
+                            # 1. MACD死叉或弱势（柱状图<0）
+                            # 2. RSI < 40（弱势区）
+                            # 3. 价格跌破MA20
+                            macd_weak = macd_histogram < 0
+                            rsi_weak = rsi < 40
+                            below_ma20 = (sma_20 > 0 and current_price < sma_20)
+
+                            # 任一技术信号确认即触发
+                            if macd_weak or rsi_weak or below_ma20:
+                                technical_confirm = True
+                                signals = []
+                                if macd_weak:
+                                    signals.append(f"MACD弱势({macd_histogram:.2f})")
+                                if rsi_weak:
+                                    signals.append(f"RSI弱势({rsi:.1f})")
+                                if below_ma20:
+                                    signals.append(f"跌破MA20(${sma_20:.2f})")
+                                technical_reason = " + ".join(signals)
+                            else:
+                                # 技术指标未确认，暂不触发
+                                logger.info(
+                                    f"  ⚠️  {symbol}: 达到-8%但技术指标未确认止损 "
+                                    f"(MACD={macd_histogram:.2f}, RSI={rsi:.1f}, "
+                                    f"MA20=${sma_20:.2f}, 当前${current_price:.2f})"
+                                )
+                        else:
+                            # 无缓存指标：保护优先，直接触发
+                            technical_confirm = True
+                            technical_reason = "无技术指标缓存，保护优先"
+
+                    # 触发硬止损
+                    if technical_confirm:
+                        # 去重检查
+                        should_generate, skip_reason = await self._should_generate_signal(symbol, 'HARD_STOP_LOSS')
+                        if not should_generate:
+                            logger.debug(f"  ⏭️  {symbol}: 跳过硬止损信号 - {skip_reason}")
+                        else:
+                            loss_pct_abs = abs(profit_pct * 100)
+                            entry_time = position_detail.get('entry_time')
+
+                            # 生成硬止损信号
+                            signal = {
+                                'symbol': symbol,
+                                'type': 'HARD_STOP_LOSS',
+                                'side': 'SELL',
+                                'price': current_price,
+                                'quantity': quantity,
+                                'reason': f"🚨混合硬止损触发 (亏损{loss_pct_abs:.1f}%, {technical_reason})",
+                                'score': 100,  # 最高优先级
+                                'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                                'priority': 100,
+                                'strategy': 'HYBRID_HARD_STOP',
+                                'cost_price': cost_price,
+                                'entry_time': entry_time,
+                                'indicators': {
+                                    'current_price': current_price,
+                                    'loss_pct': profit_pct * 100,
+                                    'technical_reason': technical_reason,
+                                    'is_leveraged': is_leveraged,
+                                },
+                            }
+
+                            success = await self.signal_queue.publish_signal(signal)
+                            if success:
+                                logger.error(
+                                    f"🚨🚨🚨 {symbol}: 混合硬止损触发! "
+                                    f"亏损{loss_pct_abs:.1f}% (${cost_price:.2f} → ${current_price:.2f})\n"
+                                    f"       原因: {technical_reason}"
+                                )
+                            return
+
+            # 3. 获取止损止盈设置（从数据库）
             # 注意：account_id 可以为空字符串，stop_manager会处理
             stops = await self.stop_manager.get_position_stops("", symbol)
 
@@ -915,12 +1027,18 @@ class SignalGenerator:
             logger.info("✅ Redis持仓管理器已连接")
 
             # 使用async with正确初始化客户端
+            # 初始化通知（支持Slack和Discord）
+            slack_url = str(self.settings.slack_webhook_url) if self.settings.slack_webhook_url else None
+            discord_url = str(self.settings.discord_webhook_url) if self.settings.discord_webhook_url else None
+
             async with QuoteDataClient(self.settings) as quote_client, \
-                       LongportTradingClient(self.settings) as trade_client:
+                       LongportTradingClient(self.settings) as trade_client, \
+                       MultiChannelNotifier(slack_webhook_url=slack_url, discord_webhook_url=discord_url) as slack:
 
                 # 保存客户端引用
                 self.quote_client = quote_client
                 self.trade_client = trade_client
+                self.slack = slack
 
                 # 🔥 保存主事件循环引用（供WebSocket回调使用）
                 self._main_loop = asyncio.get_event_loop()
@@ -1057,10 +1175,22 @@ class SignalGenerator:
                                     logger.error(f"  ❌ 分析标的失败 {symbol}: {e}")
                                     continue
 
-                        # 5. 检查现有持仓的止损止盈（生成平仓信号）
+                        # 5. 🔥 获取当前市场状态（牛熊市判断）
+                        try:
+                            regime_result = await self.regime_classifier.classify(
+                                quote=self.quote_client,
+                                filter_by_market=True
+                            )
+                            regime = regime_result.regime
+                            logger.info(f"📈 市场状态: {regime} - {regime_result.details}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ 市场状态检测失败: {e}，使用默认值RANGE")
+                            regime = "RANGE"
+
+                        # 6. 检查现有持仓的止损止盈（生成平仓信号）
                         try:
                             if account:
-                                exit_signals = await self.check_exit_signals(quotes, account)
+                                exit_signals = await self.check_exit_signals(quotes, account, regime)
                             else:
                                 exit_signals = []
 
@@ -1087,7 +1217,37 @@ class SignalGenerator:
                         except Exception as e:
                             logger.warning(f"⚠️ 检查止损止盈失败: {e}")
 
-                        # 5. 显示本轮统计
+                        # 7. 🔥 检查加仓机会（智能加仓）
+                        try:
+                            if account:
+                                add_signals = await self.check_add_position_signals(quotes, account, regime)
+                            else:
+                                add_signals = []
+
+                            for add_signal in add_signals:
+                                # 检查是否应该生成信号（去重检查）
+                                should_generate, skip_reason = await self._should_generate_signal(
+                                    add_signal['symbol'],
+                                    add_signal['type']
+                                )
+
+                                if not should_generate:
+                                    logger.info(f"  ⏭️  跳过加仓信号 ({add_signal['symbol']}): {skip_reason}")
+                                    continue
+
+                                success = await self.signal_queue.publish_signal(add_signal)
+                                if success:
+                                    signals_generated += 1
+                                    # 记录信号生成时间（用于冷却期检查）
+                                    self.signal_history[add_signal['symbol']] = datetime.now(self.beijing_tz)
+                                    logger.success(
+                                        f"  ✅ 加仓信号已发送: {add_signal['symbol']}, "
+                                        f"数量={add_signal.get('quantity', 0)}"
+                                    )
+                        except Exception as e:
+                            logger.warning(f"⚠️ 检查加仓机会失败: {e}")
+
+                        # 8. 显示本轮统计
                         queue_stats = await self.signal_queue.get_stats()
                         logger.info(f"\n📊 本轮统计:")
                         logger.info(f"  新生成信号: {signals_generated}")
@@ -1171,6 +1331,21 @@ class SignalGenerator:
 
             # 分析买入信号
             signal = self._analyze_buy_signals(symbol, current_price, quote, indicators, closes, highs, lows)
+
+            # 🔥 买入前预检查：如果是买入信号，检查可买数量
+            if signal and signal.get('type') in ['BUY', 'WEAK_BUY']:
+                signal_score = signal.get('score', 0)
+                can_buy, analysis_msg = await self._check_buying_power_before_signal(
+                    symbol=symbol,
+                    current_price=current_price,
+                    signal_score=signal_score,
+                    signal=signal
+                )
+
+                if not can_buy:
+                    # 预检查失败，不生成买入信号
+                    logger.warning(f"  ⏭️  {symbol}: 预检查失败，跳过买入信号生成")
+                    return None
 
             return signal
 
@@ -1580,7 +1755,8 @@ class SignalGenerator:
         indicators: Dict,
         position: Dict,
         current_price: float,
-        stops: Dict
+        stops: Dict,
+        regime: str = "RANGE"
     ) -> Dict:
         """
         基于技术指标计算退出评分和决策
@@ -1595,6 +1771,7 @@ class SignalGenerator:
             position: 持仓信息
             current_price: 当前价格
             stops: 数据库中的止损止盈设置
+            regime: 市场状态 ('BULL' | 'BEAR' | 'RANGE')
 
         Returns:
             退出决策字典
@@ -1736,12 +1913,36 @@ class SignalGenerator:
             score += 15
             reasons.append("成交量萎缩")
 
-        # 根据评分决定动作（🔥 提高门槛避免过早止盈 + 分批止损）
+        # 🔥 6. 市场状态调整（Regime Integration）
+        if getattr(self.settings, 'regime_exit_score_adjustment', True):
+            if regime == "BULL":
+                # 牛市：降低卖出倾向，给予持仓更多空间
+                score -= 10
+                reasons.append("🐂 牛市状态(-10分)")
+            elif regime == "BEAR":
+                # 熊市：提高卖出倾向，及早离场
+                score += 15
+                reasons.append("🐻 熊市状态(+15分)")
+            # RANGE: 不调整评分
+
+        # 根据评分决定动作（🔥 提高门槛避免过早止盈 + 分批止损 + 渐进式减仓）
+        gradual_exit_enabled = getattr(self.settings, 'gradual_exit_enabled', False)
+        gradual_exit_threshold_25 = int(getattr(self.settings, 'gradual_exit_threshold_25', 40))
+        gradual_exit_threshold_50 = int(getattr(self.settings, 'gradual_exit_threshold_50', 50))
+
         if score >= 70:  # 从50提高到70
             action = "TAKE_PROFIT_NOW"
             adjusted_take_profit = current_price  # 立即止盈
+        elif score >= gradual_exit_threshold_50 and gradual_exit_enabled:
+            # 🔥 渐进式减仓50%：评分50-69分时减50%仓位，观察趋势
+            action = "PARTIAL_EXIT"
+            adjusted_take_profit = current_price * 1.05
+        elif score >= gradual_exit_threshold_25 and gradual_exit_enabled:
+            # 🔥 渐进式减仓25%：评分40-49分时减25%仓位，观察趋势
+            action = "GRADUAL_EXIT"
+            adjusted_take_profit = current_price * 1.08
         elif score >= 50 and self.settings.partial_exit_enabled:
-            # 🔥 分批止损：先减50%仓位，观察趋势
+            # 传统分批止损：先减50%仓位（向后兼容）
             action = "PARTIAL_EXIT"
             adjusted_take_profit = current_price * 1.05
         elif score >= 50:  # 未启用分批止损时保持原逻辑
@@ -1829,7 +2030,7 @@ class SignalGenerator:
             'profit_pct': profit_pct,
         }
 
-    async def check_exit_signals(self, quotes, account):
+    async def check_exit_signals(self, quotes, account, regime: str = "RANGE"):
         """
         检查现有持仓的止损止盈条件（智能版 - 基于技术指标）
 
@@ -1838,6 +2039,12 @@ class SignalGenerator:
         2. 计算智能退出评分
         3. 根据指标决定是否延迟止盈或提前止损
         4. 保留固定止损止盈作为保底逻辑
+        5. 🔥 集成市场状态（牛熊市）调整评分
+
+        Args:
+            quotes: 实时行情列表
+            account: 账户信息
+            regime: 市场状态 ('BULL' | 'BEAR' | 'RANGE')
         """
         exit_signals = []
 
@@ -1868,7 +2075,7 @@ class SignalGenerator:
                     try:
                         import json
                         partial_exit_key = f"partial_exit:{account.get('account_id', '')}:{symbol}"
-                        partial_exit_str = await self.redis_client.get(partial_exit_key)
+                        partial_exit_str = await self.position_manager._redis.get(partial_exit_key)
                         if partial_exit_str:
                             partial_exit_data = json.loads(partial_exit_str)
                             is_in_observation = True
@@ -1897,7 +2104,8 @@ class SignalGenerator:
                         indicators=indicators,
                         position=position,
                         current_price=current_price,
-                        stops=stops
+                        stops=stops,
+                        regime=regime
                     )
 
                     action = exit_decision['action']
@@ -1943,7 +2151,7 @@ class SignalGenerator:
                             # 清除观察期状态
                             try:
                                 partial_exit_key = f"partial_exit:{account.get('account_id', '')}:{symbol}"
-                                await self.redis_client.delete(partial_exit_key)
+                                await self.position_manager._redis.delete(partial_exit_key)
                             except:
                                 pass
                             continue  # 已生成清仓信号，跳过后续逻辑
@@ -1959,7 +2167,7 @@ class SignalGenerator:
                             # 清除观察期状态
                             try:
                                 partial_exit_key = f"partial_exit:{account.get('account_id', '')}:{symbol}"
-                                await self.redis_client.delete(partial_exit_key)
+                                await self.position_manager._redis.delete(partial_exit_key)
                             except:
                                 pass
                             continue  # 保留仓位，跳过后续逻辑
@@ -2072,13 +2280,62 @@ class SignalGenerator:
                                     'exit_score': score,
                                     'price': current_price,
                                 }
-                                await self.redis_client.setex(
+                                await self.position_manager._redis.setex(
                                     partial_exit_key,
                                     self.settings.partial_exit_observation_minutes * 60,  # TTL = 观察期
                                     json.dumps(partial_exit_data)
                                 )
                             except Exception as e:
                                 logger.warning(f"记录部分平仓状态失败: {e}")
+
+                    elif action == "GRADUAL_EXIT":
+                        # 🔥 渐进式减仓：卖出25%仓位
+                        gradual_qty = int(quantity * 0.25)
+                        if gradual_qty > 0:
+                            logger.warning(
+                                f"📉 {symbol}: 渐进式减仓 - 先减25%仓位 (评分={score:+d})\n"
+                                f"   当前=${current_price:.2f}, 收益={profit_pct:+.2f}%\n"
+                                f"   卖出数量: {gradual_qty}/{quantity}股\n"
+                                f"   原因: {', '.join(reasons)}\n"
+                                f"   观察期: {self.settings.partial_exit_observation_minutes}分钟"
+                            )
+                            exit_signals.append({
+                                'symbol': symbol,
+                                'type': 'GRADUAL_EXIT',
+                                'side': 'SELL',
+                                'quantity': gradual_qty,  # 🔥 只卖出25%仓位
+                                'price': current_price,
+                                'reason': f"渐进式减仓(25%): {', '.join(reasons[:3])}",
+                                'score': 85,
+                                'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                                'priority': 85,
+                                # 🔥 增强数据：供Slack通知使用
+                                'cost_price': cost_price,
+                                'entry_time': position.get('entry_time'),
+                                'indicators': indicators,  # 完整的技术指标
+                                'exit_score_details': reasons,  # 卖出评分详情
+                                'is_partial': True,  # 标记为部分平仓
+                                'remaining_qty': quantity - gradual_qty,
+                            })
+
+                            # 🔥 记录部分平仓状态到Redis（用于观察期判断）
+                            try:
+                                import json
+                                partial_exit_key = f"partial_exit:{account.get('account_id', '')}:{symbol}"
+                                partial_exit_data = {
+                                    'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                                    'partial_qty': gradual_qty,
+                                    'remaining_qty': quantity - gradual_qty,
+                                    'exit_score': score,
+                                    'price': current_price,
+                                }
+                                await self.position_manager._redis.setex(
+                                    partial_exit_key,
+                                    self.settings.partial_exit_observation_minutes * 60,  # TTL = 观察期
+                                    json.dumps(partial_exit_data)
+                                )
+                            except Exception as e:
+                                logger.warning(f"记录渐进式减仓状态失败: {e}")
 
                     elif action == "TAKE_PROFIT_EARLY":
                         # 提前止盈（不等固定止盈位）
@@ -2150,7 +2407,7 @@ class SignalGenerator:
                     # 如果有指标分析且建议持有，则不执行固定止盈
                     if indicators:
                         exit_decision = self._calculate_exit_score(
-                            indicators, position, current_price, stops
+                            indicators, position, current_price, stops, regime
                         )
                         if exit_decision['action'] in ["STRONG_HOLD", "DELAY_TAKE_PROFIT"]:
                             # 已经在上面记录日志了，这里跳过
@@ -2182,6 +2439,742 @@ class SignalGenerator:
             logger.debug(traceback.format_exc())
 
         return exit_signals
+
+    async def check_add_position_signals(self, quotes, account, regime: str = "RANGE"):
+        """
+        检查是否应该对盈利持仓加仓
+
+        策略：当盈利持仓健康且出现新的强买入信号时，适度加仓（10-20%）
+
+        条件：
+        1. 持仓健康：exit_score > -30（无明显卖出信号）
+        2. 持仓盈利：profit_pct > 2%（已有2%以上盈利）
+        3. 市场环境：regime in ['BULL', 'RANGE']（牛市或震荡市）
+        4. 新信号强度：buy_signal_score >= 60（出现强买入信号）
+        5. 仓位限制：position_pct < MAX_POSITION_PCT（未超过最大仓位）
+        6. 冷却期：距离上次加仓 > COOLDOWN（避免频繁操作）
+
+        Args:
+            quotes: 实时行情列表
+            account: 账户信息
+            regime: 市场状态 ('BULL' | 'BEAR' | 'RANGE')
+
+        Returns:
+            加仓信号列表
+        """
+        add_signals = []
+
+        # 检查功能是否启用
+        if not getattr(self.settings, 'add_position_enabled', False):
+            return add_signals
+
+        # 检查市场环境（熊市不加仓）
+        if regime == "BEAR":
+            logger.debug("🐻 熊市状态，跳过加仓检查")
+            return add_signals
+
+        try:
+            # 获取持仓
+            positions = account.get("positions", [])
+            if not positions:
+                return add_signals
+
+            # 创建行情字典
+            quote_dict = {q.symbol: q for q in quotes}
+
+            # 获取配置参数
+            min_profit_pct = float(getattr(self.settings, 'add_position_min_profit_pct', 2.0))
+            min_signal_score = int(getattr(self.settings, 'add_position_min_signal_score', 60))
+            max_position_pct = float(getattr(self.settings, 'add_position_max_position_pct', 0.20))
+            add_pct = float(getattr(self.settings, 'add_position_pct', 0.15))  # 默认加15%
+            cooldown_minutes = int(getattr(self.settings, 'add_position_cooldown_minutes', 60))
+
+            for position in positions:
+                symbol = position["symbol"]
+                quantity = position["quantity"]
+                cost_price = position["cost_price"]
+
+                if symbol not in quote_dict:
+                    continue
+
+                quote = quote_dict[symbol]
+                current_price = float(quote.last_done)
+
+                # 1. 检查持仓盈利状态
+                if cost_price > 0:
+                    profit_pct = (current_price - cost_price) / cost_price * 100
+                else:
+                    profit_pct = 0
+
+                if profit_pct < min_profit_pct:
+                    logger.debug(f"  ⏭️ {symbol}: 盈利不足 ({profit_pct:.2f}% < {min_profit_pct}%)")
+                    continue
+
+                # 2. 检查持仓健康度（使用exit_score）
+                indicators = await self._fetch_current_indicators(symbol, quote)
+                if not indicators:
+                    logger.debug(f"  ⏭️ {symbol}: 无法获取技术指标")
+                    continue
+
+                stops = await self.stop_manager.get_position_stops(account.get("account_id", ""), symbol)
+                if not stops:
+                    continue
+
+                exit_decision = self._calculate_exit_score(
+                    indicators=indicators,
+                    position=position,
+                    current_price=current_price,
+                    stops=stops,
+                    regime=regime
+                )
+
+                exit_score = exit_decision['score']
+                if exit_score > -30:  # 健康度不足（有明显卖出信号）
+                    logger.debug(f"  ⏭️ {symbol}: 持仓健康度不足 (exit_score={exit_score:+d} > -30)")
+                    continue
+
+                # 3. 检查是否有新的强买入信号
+                # 这里需要重新分析当前标的，获取买入评分
+                signal = await self.analyze_symbol_and_generate_signal(symbol, quote, current_price)
+                if not signal or signal['type'] not in ['BUY', 'STRONG_BUY']:
+                    logger.debug(f"  ⏭️ {symbol}: 无强买入信号")
+                    continue
+
+                buy_signal_score = signal.get('score', 0)
+                if buy_signal_score < min_signal_score:
+                    logger.debug(f"  ⏭️ {symbol}: 买入信号不足 (score={buy_signal_score} < {min_signal_score})")
+                    continue
+
+                # 4. 检查仓位比例（TODO: 需要获取总资产计算仓位占比）
+                # 简化：假设通过quantity判断是否已经太大
+                # 这里可以后续优化为基于总资产的仓位百分比
+
+                # 5. 检查冷却期
+                try:
+                    add_history_key = f"add_position:{account.get('account_id', '')}:{symbol}"
+                    last_add_str = await self.position_manager._redis.get(add_history_key)
+                    if last_add_str:
+                        from dateutil import parser
+                        last_add_time = parser.parse(last_add_str)
+                        now = datetime.now(self.beijing_tz)
+                        elapsed_minutes = (now - last_add_time.astimezone(self.beijing_tz)).total_seconds() / 60
+                        if elapsed_minutes < cooldown_minutes:
+                            logger.debug(f"  ⏭️ {symbol}: 加仓冷却期内 ({elapsed_minutes:.0f}/{cooldown_minutes}分钟)")
+                            continue
+                except Exception as e:
+                    logger.debug(f"  检查加仓冷却期失败: {e}")
+
+                # 所有条件满足，生成加仓信号
+                add_qty = int(quantity * add_pct)
+                if add_qty > 0:
+                    logger.success(
+                        f"📈 {symbol}: 智能加仓信号\n"
+                        f"   持仓健康 (exit_score={exit_score:+d}), 盈利={profit_pct:+.2f}%\n"
+                        f"   新信号评分={buy_signal_score}, 市场={regime}\n"
+                        f"   加仓数量: +{add_qty}股 (+{int(add_pct*100)}%)\n"
+                        f"   原因: {signal['reason']}"
+                    )
+                    add_signals.append({
+                        'symbol': symbol,
+                        'type': 'ADD_POSITION',
+                        'side': 'BUY',
+                        'quantity': add_qty,
+                        'price': current_price,
+                        'reason': f"加仓(+{int(add_pct*100)}%): 持仓健康+强信号",
+                        'score': buy_signal_score,
+                        'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                        'priority': buy_signal_score,
+                        # 增强数据
+                        'cost_price': cost_price,
+                        'current_position_qty': quantity,
+                        'profit_pct': profit_pct,
+                        'exit_score': exit_score,
+                        'regime': regime,
+                    })
+
+                    # 记录加仓时间到Redis
+                    try:
+                        add_history_key = f"add_position:{account.get('account_id', '')}:{symbol}"
+                        await self.position_manager._redis.setex(
+                            add_history_key,
+                            cooldown_minutes * 60,
+                            datetime.now(self.beijing_tz).isoformat()
+                        )
+                    except Exception as e:
+                        logger.warning(f"记录加仓时间失败: {e}")
+
+        except Exception as e:
+            logger.error(f"❌ 检查加仓信号失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+        return add_signals
+
+    def _format_signal_technical_analysis(self, signal: Dict) -> List[str]:
+        """
+        格式化信号的技术分析信息
+
+        Args:
+            signal: 信号字典（包含indicators和reasons）
+
+        Returns:
+            格式化的文本行列表
+        """
+        lines = []
+
+        # 买入理由
+        reasons = signal.get('reasons', [])
+        if reasons:
+            lines.append(f"• 买入理由：{', '.join(reasons)}")
+
+        # 技术指标详情
+        indicators = signal.get('indicators', {})
+        if indicators:
+            lines.append(f"• 技术指标：")
+
+            # RSI
+            rsi = indicators.get('rsi')
+            if rsi is not None:
+                rsi_status = "超卖" if rsi < 30 else "偏低" if rsi < 50 else "中性" if rsi < 70 else "超买"
+                lines.append(f"  - RSI: {rsi:.1f} ({rsi_status})")
+
+            # MACD
+            macd = indicators.get('macd')
+            macd_signal = indicators.get('macd_signal')
+            if macd is not None and macd_signal is not None:
+                macd_status = "金叉" if macd > macd_signal else "死叉"
+                lines.append(f"  - MACD: {macd_status} (DIF:{macd:.3f}, DEA:{macd_signal:.3f})")
+
+            # 布林带
+            bb_upper = indicators.get('bb_upper')
+            bb_middle = indicators.get('bb_middle')
+            bb_lower = indicators.get('bb_lower')
+            price = signal.get('price', 0)
+            if bb_upper and bb_middle and bb_lower and price > 0:
+                if price < bb_lower:
+                    bb_status = f"下轨支撑 (${bb_lower:.2f})"
+                elif price > bb_upper:
+                    bb_status = f"上轨压力 (${bb_upper:.2f})"
+                else:
+                    bb_status = f"中轨附近 (${bb_middle:.2f})"
+                lines.append(f"  - 布林带: {bb_status}")
+
+            # 成交量
+            volume_ratio = indicators.get('volume_ratio')
+            if volume_ratio is not None:
+                vol_status = "放量" if volume_ratio > 1.5 else "缩量" if volume_ratio < 0.8 else "正常"
+                lines.append(f"  - 成交量比: {volume_ratio:.1f}x ({vol_status})")
+
+            # 均线
+            sma_20 = indicators.get('sma_20')
+            sma_50 = indicators.get('sma_50')
+            if sma_20 and sma_50 and price > 0:
+                if price > sma_20 > sma_50:
+                    ma_status = "多头排列"
+                elif price < sma_20 < sma_50:
+                    ma_status = "空头排列"
+                else:
+                    ma_status = "均线纠缠"
+                lines.append(f"  - 均线: {ma_status} (MA20:${sma_20:.2f}, MA50:${sma_50:.2f})")
+
+        return lines
+
+    async def _check_buying_power_before_signal(
+        self,
+        symbol: str,
+        current_price: float,
+        signal_score: int,
+        signal: Optional[Dict] = None
+    ) -> tuple[bool, Optional[str]]:
+        """
+        在生成买入信号前检查可买数量
+
+        Args:
+            symbol: 标的代码
+            current_price: 当前价格
+            signal_score: 信号评分
+            signal: 完整的信号字典（包含indicators和reasons）
+
+        Returns:
+            (can_buy, analysis_message): 是否可以买入，以及分析消息（如果不能买入）
+        """
+        try:
+            # 获取手数
+            lot_size = await self.lot_size_helper.get_lot_size(symbol, self.quote_client)
+
+            # 调用 API 预估可买数量
+            try:
+                estimate = await self.trade_client.estimate_max_purchase_quantity(
+                    symbol=symbol,
+                    order_type=openapi.OrderType.LO,
+                    side=openapi.OrderSide.Buy,
+                    price=float(current_price)
+                )
+
+                # 检查可买数量
+                max_qty = estimate.cash_max_qty if hasattr(estimate, 'cash_max_qty') else 0
+
+                if max_qty <= 0:
+                    logger.warning(f"  ⚠️ {symbol}: 预估可买数量为0，将分析持仓情况")
+
+                    # 分析持仓并发送通知
+                    analysis_msg = await self._analyze_and_notify_positions(
+                        symbol=symbol,
+                        current_price=current_price,
+                        signal_score=signal_score,
+                        signal=signal
+                    )
+
+                    return False, analysis_msg
+                else:
+                    logger.debug(f"  ✅ {symbol}: 可买数量 {max_qty} 股")
+                    return True, None
+
+            except Exception as e:
+                logger.debug(f"  ⚠️ {symbol}: 预估可买数量失败: {e}")
+                # API 失败时，继续生成信号（由 order_executor 的 fallback 处理）
+                return True, None
+
+        except Exception as e:
+            logger.error(f"❌ 买入前检查失败 {symbol}: {e}")
+            # 出错时继续生成信号
+            return True, None
+
+    async def _analyze_position_technical(self, symbol: str, current_price: float) -> Dict:
+        """
+        对单个持仓进行技术分析，判断是否应该卖出
+
+        Returns:
+            {
+                'symbol': str,
+                'action': 'SELL' | 'HOLD',
+                'reason': str,
+                'score': int,  # 卖出紧急度评分 0-100
+                'signals': []
+            }
+        """
+        try:
+            # 获取K线数据
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=100)
+
+            candles = await self.quote_client.get_history_candles(
+                symbol=symbol,
+                period=openapi.Period.Day,
+                adjust_type=openapi.AdjustType.NoAdjust,
+                start=start_date,
+                end=end_date
+            )
+
+            if not candles or len(candles) < 30:
+                return {'symbol': symbol, 'action': 'HOLD', 'reason': '数据不足', 'score': 0, 'signals': []}
+
+            # 提取数据
+            closes = np.array([float(c.close) for c in candles])
+            highs = np.array([float(c.high) for c in candles])
+            lows = np.array([float(c.low) for c in candles])
+            volumes = np.array([c.volume for c in candles])
+
+            # 计算指标
+            indicators = self._calculate_all_indicators(closes, highs, lows, volumes)
+
+            # 卖出信号分析
+            sell_signals = []
+            sell_score = 0
+
+            # 1. 趋势反转（下跌趋势）
+            if indicators['ema_short'][-1] < indicators['ema_long'][-1]:
+                sell_signals.append('短期均线跌破长期均线')
+                sell_score += 20
+
+            # 2. MACD死叉
+            if indicators['macd'][-1] < indicators['macd_signal'][-1]:
+                sell_signals.append('MACD死叉')
+                sell_score += 15
+
+            # 3. RSI超买
+            if indicators['rsi'][-1] > 70:
+                sell_signals.append(f'RSI超买({indicators["rsi"][-1]:.0f})')
+                sell_score += 10
+
+            # 4. 跌破布林下轨
+            if current_price < indicators['bb_lower'][-1]:
+                sell_signals.append('跌破布林下轨')
+                sell_score += 15
+
+            # 5. 成交量放大+价格下跌
+            if volumes[-1] > np.mean(volumes[-20:]) * 1.5 and closes[-1] < closes[-2]:
+                sell_signals.append('放量下跌')
+                sell_score += 10
+
+            # 6. 价格跌幅检查
+            price_change_5d = (current_price - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 else 0
+            price_change_10d = (current_price - closes[-10]) / closes[-10] * 100 if len(closes) >= 10 else 0
+
+            if price_change_5d < -5:
+                sell_signals.append(f'5日跌幅{price_change_5d:.1f}%')
+                sell_score += 20
+
+            if price_change_10d < -10:
+                sell_signals.append(f'10日跌幅{price_change_10d:.1f}%')
+                sell_score += 15
+
+            # 判断操作
+            if sell_score >= 40:
+                action = 'SELL'
+                reason = '建议卖出'
+            else:
+                action = 'HOLD'
+                reason = '继续持有'
+
+            return {
+                'symbol': symbol,
+                'action': action,
+                'reason': reason,
+                'score': sell_score,
+                'signals': sell_signals
+            }
+
+        except Exception as e:
+            logger.debug(f"分析{symbol}技术指标失败: {e}")
+            return {'symbol': symbol, 'action': 'HOLD', 'reason': '分析失败', 'score': 0, 'signals': []}
+
+    async def _analyze_and_notify_positions(
+        self,
+        symbol: str,
+        current_price: float,
+        signal_score: int,
+        signal: Optional[Dict] = None
+    ) -> str:
+        """
+        分析当前持仓并发送到 Slack（智能显示：有挪仓机会时显示完整分析，无挪仓机会时显示简化通知）
+
+        Args:
+            symbol: 触发分析的标的代码
+            current_price: 触发分析的标的价格
+            signal_score: 信号评分
+            signal: 完整的信号字典（包含indicators和reasons）
+
+        Returns:
+            分析消息文本
+        """
+        try:
+            # 获取账户信息
+            account = await self.trade_client.get_account()
+
+            # 获取持仓
+            positions_resp = await self.trade_client.stock_positions()
+            positions = []
+
+            if positions_resp and positions_resp.channels:
+                for channel in positions_resp.channels:
+                    for position in channel.positions:
+                        cost_price = float(position.cost_price) if hasattr(position, 'cost_price') else 0
+                        quantity = float(position.quantity)
+                        market_value = float(position.market_value) if hasattr(position, 'market_value') else 0
+
+                        # 如果market_value为0（非交易时间），使用成本价估算
+                        if market_value == 0 and cost_price > 0 and quantity > 0:
+                            market_value = cost_price * quantity
+                            logger.debug(f"  使用成本价估算{position.symbol}市值: ${market_value:,.0f}")
+
+                        positions.append({
+                            'symbol': position.symbol,
+                            'quantity': quantity,
+                            'available_quantity': float(position.available_quantity) if hasattr(position, 'available_quantity') else quantity,
+                            'cost_price': cost_price,
+                            'market_value': market_value,
+                        })
+
+            # 获取现金和购买力
+            cash_info = account.get("cash", {})
+            buy_power_info = account.get("buy_power", {})
+
+            # 构建分析消息
+            analysis_lines = [
+                f"💰 **资金不足 - 无法买入 {symbol}**",
+                f"",
+                f"📊 **买入信号详情**:",
+                f"  • 标的: {symbol}",
+                f"  • 价格: ${current_price:.2f}",
+                f"  • 评分: {signal_score}/100",
+                f"",
+                f"💼 **账户状态**:",
+            ]
+
+            # 现金和购买力
+            for currency in sorted(set(list(cash_info.keys()) + list(buy_power_info.keys()))):
+                cash = float(cash_info.get(currency, 0))
+                buy_power = float(buy_power_info.get(currency, 0))
+                analysis_lines.append(f"  • {currency}: 现金=${cash:,.0f}, 购买力=${buy_power:,.0f}")
+
+            # 持仓分析 - 根据标的币种过滤持仓
+            # 确定需要的币种（港股 -> HKD，美股 -> USD）
+            target_currency = "HKD" if ".HK" in symbol else "USD"
+            target_suffix = ".HK" if target_currency == "HKD" else ".US"
+
+            # 过滤出同币种的持仓
+            filtered_positions = [p for p in positions if target_suffix in p['symbol']]
+
+            if filtered_positions:
+                # 获取所有持仓的实时价格和技术分析
+                symbols = [p['symbol'] for p in filtered_positions]
+                try:
+                    quotes = await self.quote_client.get_realtime_quotes(symbols)
+                    quote_dict = {q.symbol: q for q in quotes}
+                except Exception as e:
+                    logger.warning(f"获取持仓行情失败: {e}")
+                    quote_dict = {}
+
+                # 计算总市值
+                total_market_value = sum(p['market_value'] for p in filtered_positions)
+
+                # 对每个持仓进行技术分析
+                logger.info(f"开始对{len(filtered_positions)}个{target_currency}持仓进行技术分析...")
+                positions_with_analysis = []
+
+                for pos in filtered_positions:
+                    pos_symbol = pos['symbol']
+                    quantity = pos['quantity']
+                    cost_price = pos['cost_price']
+                    market_value = pos['market_value']
+
+                    # 获取当前价格 - 多级回退策略
+                    quote = quote_dict.get(pos_symbol)
+                    current = 0.0
+
+                    if quote:
+                        if hasattr(quote, 'last_done') and quote.last_done:
+                            current = float(quote.last_done)
+                        elif hasattr(quote, 'prev_close') and quote.prev_close:
+                            current = float(quote.prev_close)
+                        elif hasattr(quote, 'open') and quote.open:
+                            current = float(quote.open)
+
+                    # 如果还是0，尝试用市值和数量反推
+                    if current == 0 and quantity > 0 and market_value > 0:
+                        current = market_value / quantity
+
+                    # 如果仍然是0，使用成本价（非交易时间的兜底方案）
+                    if current == 0 and cost_price > 0:
+                        current = cost_price
+
+                    # 计算盈亏
+                    if cost_price > 0 and current > 0:
+                        profit_pct = ((current - cost_price) / cost_price) * 100
+                        profit_emoji = "🟢" if profit_pct > 0 else "🔴" if profit_pct < 0 else "⚪"
+                    else:
+                        profit_pct = 0
+                        profit_emoji = "⚪"
+
+                    # 技术分析
+                    tech_analysis = await self._analyze_position_technical(pos_symbol, current)
+
+                    positions_with_analysis.append({
+                        'symbol': pos_symbol,
+                        'quantity': quantity,
+                        'cost_price': cost_price,
+                        'current': current,
+                        'market_value': market_value,
+                        'profit_pct': profit_pct,
+                        'profit_emoji': profit_emoji,
+                        'tech': tech_analysis
+                    })
+
+                # 按卖出紧急度排序（分数高的排前面）
+                positions_sorted = sorted(positions_with_analysis, key=lambda x: x['tech']['score'], reverse=True)
+
+                # 🔥 智能判断：是否有挪仓机会（有建议卖出的持仓）
+                sell_positions = [p for p in positions_sorted if p['tech']['action'] == 'SELL']
+
+                # 如果没有挪仓机会，生成简化通知
+                if not sell_positions:
+                    logger.info(f"  💡 {target_currency}持仓技术面良好，无挪仓机会，发送简化通知")
+
+                    # 简化通知：只显示信号分析 + 简化账户状态
+                    simple_lines = [
+                        f"❌ **资金不足 - 无法买入 {symbol}**",
+                        f"",
+                        f"📊 **买入信号分析**",
+                        f"• 标的：{symbol} | 价格：${current_price:.2f} | 评分：{signal_score}/100",
+                    ]
+
+                    # 添加信号的技术分析
+                    if signal:
+                        tech_lines = self._format_signal_technical_analysis(signal)
+                        if tech_lines:
+                            simple_lines.extend(tech_lines)
+
+                    # 简化的账户状态（只显示相关币种）
+                    simple_lines.extend([
+                        f"",
+                        f"💼 **账户状态**",
+                    ])
+                    buy_power = float(buy_power_info.get(target_currency, 0))
+                    if buy_power < 0:
+                        simple_lines.append(f"• {target_currency}购买力：${buy_power:,.0f}（不足）")
+                    else:
+                        simple_lines.append(f"• {target_currency}购买力：${buy_power:,.0f}")
+
+                    # 建议
+                    simple_lines.extend([
+                        f"",
+                        f"💡 **建议**：当前{len(filtered_positions)}个{target_currency}持仓技术面良好，暂无挪仓机会，等待资金补充"
+                    ])
+
+                    analysis_msg = "\n".join(simple_lines)
+
+                    # 发送简化通知
+                    if hasattr(self, 'slack') and self.slack:
+                        try:
+                            await self.slack.send(analysis_msg)
+                            logger.info(f"  ✅ 简化通知已发送到 Slack")
+                        except Exception as e:
+                            logger.warning(f"  ⚠️ 发送 Slack 通知失败: {e}")
+
+                    return analysis_msg
+
+                # 有挪仓机会，显示完整分析（保持原逻辑）
+                logger.info(f"  💡 发现{len(sell_positions)}个可挪仓持仓，发送完整分析")
+
+                # 显示持仓分析
+                analysis_lines.extend([
+                    f"",
+                    f"📦 **{target_currency}持仓分析** ({len(filtered_positions)}个，按卖出紧急度排序):",
+                ])
+
+                for i, pos in enumerate(positions_sorted[:10], 1):
+                    position_pct = (pos['market_value'] / total_market_value * 100) if total_market_value > 0 else 0
+
+                    # 操作建议emoji
+                    action_emoji = "🔴" if pos['tech']['action'] == 'SELL' else "🟢"
+                    action_text = "建议卖出" if pos['tech']['action'] == 'SELL' else "继续持有"
+
+                    # 基本信息
+                    line = (
+                        f"  {i}. {action_emoji} **{pos['symbol']}** ({action_text}):\n"
+                        f"     持仓: {pos['quantity']:.0f}股 @ ${pos['cost_price']:.2f} → ${pos['current']:.2f} "
+                        f"({pos['profit_pct']:+.1f}%) | 市值=${pos['market_value']:,.0f} ({position_pct:.1f}%)"
+                    )
+
+                    # 添加技术信号
+                    if pos['tech']['signals']:
+                        signals_text = ", ".join(pos['tech']['signals'][:3])  # 只显示前3个信号
+                        line += f"\n     信号: {signals_text} (紧急度{pos['tech']['score']}分)"
+
+                    analysis_lines.append(line)
+
+                if len(filtered_positions) > 10:
+                    analysis_lines.append(f"  ... 还有 {len(filtered_positions) - 10} 个{target_currency}持仓")
+            else:
+                # 无同币种持仓，生成简化通知
+                logger.info(f"  💡 无{target_currency}持仓，发送简化通知")
+
+                simple_lines = [
+                    f"❌ **资金不足 - 无法买入 {symbol}**",
+                    f"",
+                    f"📊 **买入信号分析**",
+                    f"• 标的：{symbol} | 价格：${current_price:.2f} | 评分：{signal_score}/100",
+                ]
+
+                # 添加信号的技术分析
+                if signal:
+                    tech_lines = self._format_signal_technical_analysis(signal)
+                    if tech_lines:
+                        simple_lines.extend(tech_lines)
+
+                # 简化的账户状态（只显示相关币种）
+                simple_lines.extend([
+                    f"",
+                    f"💼 **账户状态**",
+                ])
+                buy_power = float(buy_power_info.get(target_currency, 0))
+                if buy_power < 0:
+                    simple_lines.append(f"• {target_currency}购买力：${buy_power:,.0f}（不足）")
+                else:
+                    simple_lines.append(f"• {target_currency}购买力：${buy_power:,.0f}")
+
+                # 建议
+                simple_lines.extend([
+                    f"",
+                    f"💡 **建议**：当前无{target_currency}持仓可挪仓，等待资金补充或考虑跨币种资金调配"
+                ])
+
+                analysis_msg = "\n".join(simple_lines)
+
+                # 发送简化通知
+                if hasattr(self, 'slack') and self.slack:
+                    try:
+                        await self.slack.send(analysis_msg)
+                        logger.info(f"  ✅ 简化通知已发送到 Slack")
+                    except Exception as e:
+                        logger.warning(f"  ⚠️ 发送 Slack 通知失败: {e}")
+
+                return analysis_msg
+
+            # 建议 - 根据技术分析结果给出具体操作建议
+            analysis_lines.append(f"")
+            analysis_lines.append(f"💡 **操作建议**:")
+
+            if filtered_positions and 'positions_sorted' in locals():
+                # 统计建议卖出的持仓
+                sell_positions = [p for p in positions_sorted if p['tech']['action'] == 'SELL']
+                hold_positions = [p for p in positions_sorted if p['tech']['action'] == 'HOLD']
+
+                if sell_positions:
+                    analysis_lines.append(f"  🔴 **建议卖出** ({len(sell_positions)}个):")
+                    for i, pos in enumerate(sell_positions[:5], 1):  # 最多显示5个
+                        reason = ", ".join(pos['tech']['signals'][:2]) if pos['tech']['signals'] else pos['tech']['reason']
+                        analysis_lines.append(
+                            f"     {i}. {pos['symbol']} - {reason} "
+                            f"(盈亏{pos['profit_pct']:+.1f}%, 紧急度{pos['tech']['score']}分)"
+                        )
+                    if len(sell_positions) > 5:
+                        analysis_lines.append(f"     ... 还有 {len(sell_positions) - 5} 个建议卖出")
+                else:
+                    analysis_lines.append(f"  ✅ 当前无明显技术卖出信号")
+
+                if hold_positions and sell_positions:
+                    analysis_lines.append(f"")
+                    analysis_lines.append(f"  🟢 **可继续持有** ({len(hold_positions)}个)")
+
+                # 资金释放建议
+                if sell_positions:
+                    total_sellable_value = sum(p['market_value'] for p in sell_positions)
+                    analysis_lines.append(f"")
+                    analysis_lines.append(
+                        f"  💰 卖出上述标的可释放购买力约${total_sellable_value:,.0f}"
+                    )
+
+            elif not filtered_positions:
+                # 没有同币种持仓
+                analysis_lines.append(f"  ⚠️ 当前无{target_currency}持仓可减仓")
+                analysis_lines.append(f"  • 等待{target_currency}资金补充")
+                analysis_lines.append(f"  • 或考虑跨币种资金调配")
+            else:
+                # 有持仓但没有技术分析
+                analysis_lines.append(f"  • 考虑卖出部分{target_currency}持仓释放购买力")
+
+            analysis_lines.append(f"")
+            analysis_lines.append(f"  📌 买入信号: {symbol} (${current_price:.2f}, 评分{signal_score}分)")
+
+            analysis_msg = "\n".join(analysis_lines)
+
+            # 发送到 Slack
+            if hasattr(self, 'slack') and self.slack:
+                try:
+                    await self.slack.send(analysis_msg)
+                    logger.info(f"  ✅ 持仓分析已发送到 Slack")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ 发送 Slack 通知失败: {e}")
+
+            return analysis_msg
+
+        except Exception as e:
+            logger.error(f"❌ 分析持仓失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return f"持仓分析失败: {e}"
 
 
 async def main(account_id: str | None = None):

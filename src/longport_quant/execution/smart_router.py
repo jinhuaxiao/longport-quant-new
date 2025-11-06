@@ -95,7 +95,7 @@ class SmartOrderRouter:
         self.trade_context = trade_context
         self.db = db
         self.quote_client = quote_client
-        self.settings = settings
+        self._settings = settings  # Fixed: use _settings to match usage in code
         self._active_orders: Dict[str, OrderRequest] = {}
         self._order_slices: Dict[str, List[OrderSlice]] = {}
         self._market_data_cache: Dict[str, Dict] = {}
@@ -312,11 +312,50 @@ class SmartOrderRouter:
                     f"   • 或归还融资债务恢复购买力"
                 )
 
+            # 🔧 融资账户Fallback修复
             if cash_available <= 0:
-                logger.debug(f"  ⚠️ {currency}现金不足: ${cash_available:,.0f}")
+                logger.info(f"  ⚠️ {currency}现金不足: ${cash_available:,.0f} (可能为融资账户)")
+
+                # 尝试获取融资额度信息
+                try:
+                    margin_call = float(getattr(balance, 'margin_call', 0) or 0)
+                    financing_amount = float(getattr(balance, 'financing_amount', 0) or 0)
+                    remaining_finance = margin_call - abs(financing_amount)
+
+                    logger.info(
+                        f"  🔍 融资信息检测:\n"
+                        f"     融资额度(margin_call): ${margin_call:,.2f}\n"
+                        f"     已用融资(financing_amount): ${abs(financing_amount):,.2f}\n"
+                        f"     剩余融资额度: ${remaining_finance:,.2f}"
+                    )
+
+                    # 检查剩余融资额度是否足够
+                    min_purchase = price * lot_size * 2  # 至少能买2手
+                    if remaining_finance > min_purchase:
+                        # 使用30%融资额度进行保守估算（比现金更保守）
+                        conservative_finance = remaining_finance * 0.3
+                        estimated_qty = int(conservative_finance / price)
+                        lots = int(estimated_qty // lot_size)
+
+                        if lots > 0:
+                            final_qty = lots * lot_size
+                            logger.warning(
+                                f"⚠️ Fallback融资估算 - {symbol}:\n"
+                                f"   {currency}现金: ${cash_available:,.0f} ❌\n"
+                                f"   剩余融资额度: ${remaining_finance:,.0f} ✅\n"
+                                f"   保守策略: 使用30%融资 = ${conservative_finance:,.0f}\n"
+                                f"   估算数量: {final_qty}股 ({lots}手 × {lot_size}股/手)\n"
+                                f"   说明: 现金不足但融资额度充足，尝试融资估算"
+                            )
+                            return final_qty
+                except Exception as e:
+                    logger.debug(f"  融资额度检测失败: {e}")
+
+                # 融资额度也不足，返回0
+                logger.debug(f"  ❌ {currency}现金和融资额度均不足")
                 return 0
 
-            # 使用50%现金进行保守估算
+            # 使用50%现金进行保守估算（现金账户）
             conservative_cash = cash_available * 0.5
             estimated_qty = int(conservative_cash / price)
 
@@ -475,14 +514,14 @@ class SmartOrderRouter:
         market_data = self._market_data_cache.get(request.symbol, {})
 
         # 🔒 安全控制1：全局强制限价单开关
-        if self.settings and self.settings.force_limit_orders:
+        if self._settings and self._settings.force_limit_orders:
             logger.debug("🔒 FORCE_LIMIT_ORDERS=True, 强制使用PASSIVE策略（限价单）")
             return ExecutionStrategy.PASSIVE
 
         # 🔒 安全控制2：应用最大紧急度上限
         max_urgency = 10  # 默认无上限
-        if self.settings and hasattr(self.settings, 'max_urgency_level'):
-            max_urgency = self.settings.max_urgency_level
+        if self._settings and hasattr(self._settings, 'max_urgency_level'):
+            max_urgency = self._settings.max_urgency_level
             if request.urgency > max_urgency:
                 logger.warning(
                     f"🔒 紧急度{request.urgency}超过上限{max_urgency}，已自动调整"
@@ -490,7 +529,7 @@ class SmartOrderRouter:
                 request.urgency = max_urgency
 
         # 🔒 安全控制3：盘外时段禁用市价单
-        if self.settings and not self.settings.allow_market_orders_during_market_hours:
+        if self._settings and not self._settings.allow_market_orders_during_market_hours:
             current_market = MarketHours.get_current_market()
             if current_market == "NONE":
                 logger.debug("🔒 市场休市且禁用盘外市价单，强制使用PASSIVE策略")

@@ -31,14 +31,8 @@ class LongportTradingClient:
         """清理资源，关闭连接"""
         if self._trade_ctx is not None:
             try:
-                # 尝试取消订单订阅（如果有的话）
-                try:
-                    await asyncio.to_thread(self._trade_ctx.unsubscribe)
-                    logger.debug("Unsubscribed from order updates")
-                except Exception as e:
-                    logger.debug(f"Failed to unsubscribe from orders: {e}")
-
                 # 强制删除对象，触发底层资源清理
+                # 注意：TradeContext 在销毁时会自动清理订阅和连接
                 ctx_to_delete = self._trade_ctx
                 self._trade_ctx = None
                 del ctx_to_delete
@@ -386,6 +380,43 @@ class LongportTradingClient:
         ctx = await self._ensure_context()
         return await asyncio.to_thread(ctx.account_balance, currency)
 
+    async def get_positions(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        获取股票持仓（按Longport通道展开）
+
+        Args:
+            symbols: 可选的标的过滤列表
+
+        Returns:
+            统一结构的持仓列表 [{symbol, quantity, available_quantity, cost_price, currency, market}]
+        """
+        try:
+            resp = await self.stock_positions(symbols)
+            positions: List[Dict[str, Any]] = []
+
+            channels = getattr(resp, "channels", [])
+            for channel in channels or []:
+                for pos in getattr(channel, "positions", []) or []:
+                    try:
+                        positions.append(
+                            {
+                                "symbol": pos.symbol,
+                                "quantity": int(pos.quantity),
+                                "available_quantity": int(pos.available_quantity),
+                                "cost_price": float(pos.cost_price) if pos.cost_price is not None else 0.0,
+                                "currency": getattr(pos, "currency", ""),
+                                "market": getattr(pos, "market", ""),
+                            }
+                        )
+                    except Exception as inner_exc:  # pragma: no cover - 容错处理
+                        logger.debug(f"解析持仓失败 {pos}: {inner_exc}")
+                        continue
+
+            return positions
+        except Exception as e:
+            logger.error(f"获取持仓失败: {e}")
+            raise
+
     async def cash_flow(
         self,
         start_at: datetime,
@@ -528,12 +559,14 @@ class LongportTradingClient:
         await asyncio.to_thread(ctx.set_on_order_changed, callback)
 
     async def subscribe_orders(self) -> None:
+        """订阅订单更新推送"""
         ctx = await self._ensure_context()
-        await asyncio.to_thread(ctx.subscribe)
+        await asyncio.to_thread(ctx.subscribe, [openapi.TopicType.Private])
 
     async def unsubscribe_orders(self) -> None:
+        """取消订阅订单更新推送"""
         ctx = await self._ensure_context()
-        await asyncio.to_thread(ctx.unsubscribe)
+        await asyncio.to_thread(ctx.unsubscribe, [openapi.TopicType.Private])
 
     async def _ensure_context(self) -> openapi.TradeContext:
         async with self._context_lock:
