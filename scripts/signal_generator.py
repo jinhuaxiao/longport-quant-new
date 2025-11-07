@@ -41,6 +41,8 @@ from longport_quant.persistence.stop_manager import StopLossManager
 from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.position_manager import RedisPositionManager
 from longport_quant.risk.regime import RegimeClassifier
+from longport_quant.risk.kelly import KellyCalculator
+from longport_quant.risk.timezone_capital import TimeZoneCapitalManager
 from longport_quant.notifications.notifier import MultiChannelNotifier
 
 
@@ -203,6 +205,24 @@ class SignalGenerator:
         # 🔥 市场状态分类器（用于牛熊市判断）
         self.regime_classifier = RegimeClassifier(self.settings)
 
+        # 🎯 凯利公式仓位管理器（智能仓位计算，使用 PostgreSQL）
+        self.kelly_calculator = KellyCalculator(
+            kelly_fraction=float(getattr(self.settings, 'kelly_fraction', 0.5)),
+            max_position_size=float(getattr(self.settings, 'kelly_max_position', 0.25)),
+            min_win_rate=float(getattr(self.settings, 'kelly_min_win_rate', 0.55)),
+            min_trades=int(getattr(self.settings, 'kelly_min_trades', 10)),
+            lookback_days=int(getattr(self.settings, 'kelly_lookback_days', 30))
+        )
+
+        # 🌐 时区轮动资金管理器（跨市场资金优化）
+        self.timezone_capital_manager = TimeZoneCapitalManager(
+            weak_position_threshold=int(getattr(self.settings, 'timezone_weak_threshold', 40)),
+            max_rotation_pct=float(getattr(self.settings, 'timezone_max_rotation', 0.30)),
+            min_profit_for_rotation=float(getattr(self.settings, 'timezone_min_profit_rotation', -0.10)),
+            strong_position_threshold=int(getattr(self.settings, 'timezone_strong_threshold', 70)),
+            min_holding_hours=float(getattr(self.settings, 'timezone_min_holding_hours', 0.5))
+        )
+
         # 今日已交易标的集合（避免重复下单）
         self.traded_today = set()  # 今日买单标的（包括pending）
         self.sold_today = set()     # 今日卖单标的（包括pending）- 新增
@@ -225,6 +245,19 @@ class SignalGenerator:
         self.realtime_quotes = {}  # 存储最新实时行情 {symbol: quote}
         self.last_calc_time = {}  # 上次计算时间（防抖）{symbol: timestamp}
         self.indicator_cache = {}  # 技术指标缓存 {symbol: {'price': float, 'indicators': dict}}
+
+        # 🚨 VIXY 恐慌指数实时监控
+        self.vixy_symbol = "VIXY.US"
+        self.vixy_current_price = None  # VIXY 当前价格
+        self.vixy_ma200 = None  # VIXY MA200
+        self.market_panic = False  # 市场恐慌标志
+        self.last_vixy_alert = None  # 上次恐慌告警时间
+        self.vixy_panic_threshold = float(getattr(self.settings, 'vixy_panic_threshold', 30.0))
+        self.vixy_alert_enabled = bool(getattr(self.settings, 'vixy_alert_enabled', True))
+
+        # 🔄 港股收盘前强制轮换配置
+        self.hk_force_rotation_enabled = bool(getattr(self.settings, 'hk_force_rotation_enabled', False))
+        self.hk_force_rotation_max = int(getattr(self.settings, 'hk_force_rotation_max', 2))
 
     def _is_market_open(self, symbol: str) -> bool:
         """
@@ -633,13 +666,19 @@ class SignalGenerator:
         处理实时行情更新
 
         优先级：
-        1. 检查持仓的止损止盈（最高优先级）
-        2. 分析新的买入信号（防抖：价格变化>0.5%才计算）
+        1. VIXY 恐慌指数监控（特殊处理，不生成买卖信号）
+        2. 检查持仓的止损止盈（最高优先级）
+        3. 分析新的买入信号（防抖：价格变化>0.5%才计算）
         """
         try:
             current_price = float(quote.last_done)
             if current_price <= 0:
                 return
+
+            # 🚨 特殊处理：VIXY 恐慌指数实时监控
+            if symbol == self.vixy_symbol:
+                await self._handle_vixy_update(current_price)
+                return  # VIXY 只监控，不生成买卖信号
 
             # 防抖：判断是否需要重新计算
             if not self._should_recalculate(symbol, current_price):
@@ -694,6 +733,129 @@ class SignalGenerator:
 
         except Exception as e:
             logger.debug(f"实时处理失败 {symbol}: {e}")
+
+    async def _handle_vixy_update(self, current_price: float):
+        """
+        处理 VIXY 恐慌指数更新
+
+        功能：
+        1. 更新 VIXY 当前价格
+        2. 检查是否达到恐慌水平
+        3. 发送告警通知
+        4. 设置市场恐慌标志
+
+        Args:
+            current_price: VIXY 当前价格
+        """
+        try:
+            # 更新当前价格
+            self.vixy_current_price = current_price
+
+            # 获取 MA200（首次获取后缓存）
+            if self.vixy_ma200 is None:
+                self.vixy_ma200 = await self._get_vixy_ma200()
+
+            # 检查恐慌级别
+            if current_price > self.vixy_panic_threshold:
+                # 达到恐慌水平
+                if not self.market_panic:
+                    # 首次触发恐慌
+                    logger.warning(
+                        f"🚨🚨🚨 恐慌指数飙升! VIXY={current_price:.2f} > 阈值{self.vixy_panic_threshold:.2f}"
+                    )
+                    self.market_panic = True
+
+                # 发送告警（5分钟内只发一次）
+                if self.vixy_alert_enabled:
+                    await self._send_vixy_panic_alert(current_price)
+
+                logger.debug(f"🚨 恐慌模式: VIXY={current_price:.2f}, 暂停买入")
+            else:
+                # 恢复正常
+                if self.market_panic:
+                    # 从恐慌中恢复
+                    logger.info(
+                        f"✅ 市场恢复平静: VIXY={current_price:.2f} <= {self.vixy_panic_threshold:.2f}"
+                    )
+                    self.market_panic = False
+
+                logger.debug(f"📊 VIXY={current_price:.2f}, MA200={self.vixy_ma200:.2f if self.vixy_ma200 else 'N/A'}")
+
+        except Exception as e:
+            logger.error(f"处理 VIXY 更新失败: {e}")
+
+    async def _get_vixy_ma200(self) -> Optional[float]:
+        """
+        获取 VIXY 的 MA200
+
+        Returns:
+            MA200 值，获取失败返回 None
+        """
+        try:
+            # 从 regime_classifier 获取（已经计算过）
+            if hasattr(self, 'regime_classifier') and self.regime_classifier:
+                # regime_classifier 在 classify() 时会计算 MA200
+                # 这里可以直接从最近的 regime 更新中获取
+                pass
+
+            # 暂时从行情计算
+            bars = await self.quote_client.get_candlesticks(
+                self.vixy_symbol,
+                period=openapi.Period.Day,
+                count=200
+            )
+
+            if bars and len(bars) >= 200:
+                closes = [float(bar.close) for bar in bars[-200:]]
+                ma200 = sum(closes) / len(closes)
+                logger.debug(f"✅ VIXY MA200 计算成功: {ma200:.2f}")
+                return ma200
+            else:
+                logger.warning(f"⚠️  VIXY 历史数据不足 ({len(bars) if bars else 0} bars)")
+                return None
+
+        except Exception as e:
+            logger.error(f"获取 VIXY MA200 失败: {e}")
+            return None
+
+    async def _send_vixy_panic_alert(self, current_price: float):
+        """
+        发送 VIXY 恐慌告警
+
+        5分钟内只发送一次，避免频繁通知
+
+        Args:
+            current_price: VIXY 当前价格
+        """
+        try:
+            now = datetime.now(self.beijing_tz)
+
+            # 检查是否需要发送（5分钟内只发一次）
+            if self.last_vixy_alert:
+                elapsed = (now - self.last_vixy_alert).total_seconds()
+                if elapsed < 300:  # 5分钟 = 300秒
+                    logger.debug(f"  ⏭️  恐慌告警冷却中 ({elapsed:.0f}s < 300s)")
+                    return
+
+            # 发送告警
+            if hasattr(self, 'slack') and self.slack:
+                message = (
+                    f"🚨 **市场恐慌指数飙升！**\n\n"
+                    f"VIXY 当前价格: **${current_price:.2f}**\n"
+                    f"恐慌阈值: ${self.vixy_panic_threshold:.2f}\n"
+                    f"MA200: {f'${self.vixy_ma200:.2f}' if self.vixy_ma200 else 'N/A'}\n\n"
+                    f"⚠️  **已自动停止生成买入信号**\n"
+                    f"市场恢复平静后将自动解除"
+                )
+
+                await self.slack.send_message(message, is_urgent=True)
+                logger.success("✅ 恐慌告警已发送")
+
+            # 更新告警时间
+            self.last_vixy_alert = now
+
+        except Exception as e:
+            logger.error(f"发送恐慌告警失败: {e}")
 
     def _should_recalculate(self, symbol: str, current_price: float) -> bool:
         """
@@ -1055,7 +1217,13 @@ class SignalGenerator:
                     watchlist_data = loader.load_watchlist()
                     all_symbols = {s: {"name": s} for s in watchlist_data.get('symbols', [])}
 
-                logger.info(f"📋 监控标的数量: {len(all_symbols)}")
+                # 🚨 添加 VIXY 恐慌指数到监控列表（只监控，不生成买卖信号）
+                all_symbols[self.vixy_symbol] = {
+                    "name": "VIXY恐慌指数ETF",
+                    "type": "RISK_INDICATOR"
+                }
+
+                logger.info(f"📋 监控标的数量: {len(all_symbols)} (含 VIXY 恐慌指数)")
                 logger.info(f"⏰ 轮询间隔: {self.poll_interval}秒")
                 logger.info(f"📤 信号队列: {self.settings.signal_queue_key}")
                 logger.info("")
@@ -1187,7 +1355,26 @@ class SignalGenerator:
                             logger.warning(f"⚠️ 市场状态检测失败: {e}，使用默认值RANGE")
                             regime = "RANGE"
 
-                        # 6. 检查现有持仓的止损止盈（生成平仓信号）
+                        # 6. 🔄 收盘前自动轮换检查（时区资金优化）
+                        rotation_signals = []
+                        try:
+                            if account and getattr(self.settings, 'timezone_rotation_enabled', True):
+                                rotation_signals = await self.check_pre_close_rotation(quotes, account, regime)
+
+                                # 发送轮换信号到队列
+                                for rotation_signal in rotation_signals:
+                                    success = await self.signal_queue.publish_signal(rotation_signal)
+                                    if success:
+                                        logger.success(
+                                            f"  ✅ 轮换信号已发送: {rotation_signal['symbol']}, "
+                                            f"评分={rotation_signal['score']}"
+                                        )
+                                    else:
+                                        logger.error(f"  ❌ 轮换信号发送失败: {rotation_signal['symbol']}")
+                        except Exception as e:
+                            logger.error(f"⚠️ 收盘前轮换检查失败: {e}")
+
+                        # 7. 检查现有持仓的止损止盈（生成平仓信号）
                         try:
                             if account:
                                 exit_signals = await self.check_exit_signals(quotes, account, regime)
@@ -1289,6 +1476,14 @@ class SignalGenerator:
             Dict: 信号数据，如果不生成信号则返回None
         """
         try:
+            # 🚨 恐慌断路器：市场恐慌时停止买入信号生成
+            if self.market_panic:
+                logger.warning(
+                    f"🚨 {symbol}: 市场恐慌 (VIXY={self.vixy_current_price:.2f}), "
+                    f"暂停买入信号生成"
+                )
+                return None
+
             # 获取历史K线数据
             end_date = datetime.now()
             days_to_fetch = 100  # 获取更多数据以确保有足够的历史
@@ -3175,6 +3370,336 @@ class SignalGenerator:
             import traceback
             logger.debug(traceback.format_exc())
             return f"持仓分析失败: {e}"
+
+    async def check_pre_close_rotation(
+        self,
+        quotes,
+        account,
+        regime: str = "RANGE"
+    ) -> List[Dict]:
+        """
+        收盘前自动评估并生成轮换卖出信号
+
+        在港股收盘前30分钟（15:30-16:00）或美股收盘前1小时（15:00-16:00 ET）触发
+        自动识别弱势持仓并生成卖出信号，为另一个市场释放资金
+
+        Args:
+            quotes: 实时行情列表
+            account: 账户信息
+            regime: 市场状态
+
+        Returns:
+            卖出信号列表
+        """
+        rotation_signals = []
+
+        try:
+            # 获取当前时间
+            now = datetime.now(self.beijing_tz)
+
+            # 判断是否在收盘前时间窗口
+            should_check_hk = False
+            should_check_us = False
+
+            # 港股收盘前检查（15:30-16:00）
+            if now.hour == 15 and now.minute >= 30:
+                should_check_hk = True
+                logger.info("🕐 港股收盘前时段：检查港股持仓轮换机会...")
+            elif now.hour == 16 and now.minute == 0:
+                should_check_hk = True
+
+            # 美股收盘前检查（22:00-23:59 北京时间，对应美东 15:00-16:59）
+            # 注意：需要根据夏令时/冬令时调整
+            # 简化处理：在22:00-23:59检查
+            if now.hour == 22 or now.hour == 23:
+                should_check_us = True
+                logger.info("🕐 美股收盘前时段：检查美股持仓轮换机会...")
+
+            if not should_check_hk and not should_check_us:
+                logger.debug("  ⏭️  非收盘前时段，跳过轮换检查")
+                return []
+
+            # 获取持仓
+            positions = account.get("positions", [])
+            if not positions:
+                logger.info("  ℹ️  当前无持仓，跳过轮换检查")
+                return []
+
+            # 筛选需要检查的市场持仓
+            target_positions = []
+            if should_check_hk:
+                target_positions = [p for p in positions if p.get("symbol", "").endswith(".HK")]
+                logger.info(f"  🇭🇰 港股持仓: {len(target_positions)}个")
+            elif should_check_us:
+                target_positions = [p for p in positions if p.get("symbol", "").endswith(".US")]
+                logger.info(f"  🇺🇸 美股持仓: {len(target_positions)}个")
+
+            if not target_positions:
+                logger.info("  ℹ️  目标市场无持仓，跳过轮换检查")
+                return []
+
+            # 构建行情字典
+            quote_dict = {q.symbol: q for q in quotes}
+
+            # 准备技术指标数据（简化版，使用缓存或快速计算）
+            technical_data = {}
+
+            for pos in target_positions:
+                symbol = pos.get("symbol")
+                try:
+                    # 获取当前价格
+                    quote = quote_dict.get(symbol)
+                    if not quote:
+                        logger.debug(f"    {symbol}: 无行情数据，跳过")
+                        continue
+
+                    current_price = float(quote.last_done) if quote.last_done else 0
+                    if current_price <= 0:
+                        logger.debug(f"    {symbol}: 价格无效，跳过")
+                        continue
+
+                    # 获取技术指标（尝试从缓存或快速计算）
+                    indicators = await self._fetch_current_indicators(symbol, quote)
+                    if indicators:
+                        technical_data[symbol] = indicators
+                    else:
+                        # 如果获取失败，使用空指标
+                        technical_data[symbol] = {}
+
+                except Exception as e:
+                    logger.debug(f"    {symbol}: 获取数据失败 - {e}")
+                    continue
+
+            # 使用时区资金管理器识别可轮换持仓
+            logger.info("  🔍 分析持仓轮换评分...")
+
+            rotatable_positions = self.timezone_capital_manager.identify_rotatable_positions(
+                positions=target_positions,
+                quotes=quote_dict,
+                technical_data=technical_data,
+                regime=regime,
+                target_market="US" if should_check_hk else "HK"  # 为哪个市场释放资金
+            )
+
+            # 🔥 港股强制轮换逻辑
+            if not rotatable_positions and should_check_hk and self.hk_force_rotation_enabled:
+                logger.warning(
+                    f"  🔄 港股收盘前强制轮换：虽然无弱势持仓，"
+                    f"但仍将卖出最弱的 {self.hk_force_rotation_max} 个港股为美股腾出资金"
+                )
+
+                # 获取所有港股持仓的评分
+                from dataclasses import dataclass
+                from typing import Optional
+
+                @dataclass
+                class PositionScore:
+                    symbol: str
+                    rotation_score: float
+                    profit_pct: float
+                    market_value: float
+                    reason: str
+                    quantity: int
+
+                scored_positions = []
+
+                for pos in target_positions:
+                    symbol = pos.get("symbol")
+                    try:
+                        quote = quote_dict.get(symbol)
+                        if not quote or not quote.last_done:
+                            continue
+
+                        current_price = float(quote.last_done)
+                        cost_price = pos.get('avg_cost', current_price)
+                        quantity = pos.get('quantity', 0)
+                        market_value = current_price * quantity
+                        profit_pct = (current_price - cost_price) / cost_price if cost_price > 0 else 0
+
+                        # 计算评分（使用时区资金管理器的评分逻辑）
+                        indicators = technical_data.get(symbol, {})
+
+                        # 简化评分：基于盈亏、技术指标
+                        score = 50  # 基准分
+
+                        # 盈亏调整
+                        if profit_pct < -0.05:
+                            score += 30  # 亏损持仓评分高（弱）
+                        elif profit_pct < 0:
+                            score += 15
+                        elif profit_pct > 0.10:
+                            score -= 30  # 高盈利持仓评分低（强）
+                        elif profit_pct > 0.05:
+                            score -= 15
+
+                        # 技术指标调整
+                        if indicators.get('trend') == 'down':
+                            score += 20
+                        elif indicators.get('trend') == 'up':
+                            score -= 20
+
+                        if indicators.get('macd_signal') == 'bearish':
+                            score += 15
+                        elif indicators.get('macd_signal') == 'bullish':
+                            score -= 15
+
+                        reason_parts = []
+                        if profit_pct < 0:
+                            reason_parts.append(f"亏损{profit_pct:.1%}")
+                        else:
+                            reason_parts.append(f"盈利{profit_pct:.1%}")
+
+                        if indicators.get('trend'):
+                            reason_parts.append(f"{indicators['trend']}趋势")
+
+                        reason = ", ".join(reason_parts) if reason_parts else "强制轮换"
+
+                        scored_positions.append(PositionScore(
+                            symbol=symbol,
+                            rotation_score=score,
+                            profit_pct=profit_pct,
+                            market_value=market_value,
+                            reason=reason,
+                            quantity=quantity
+                        ))
+
+                    except Exception as e:
+                        logger.debug(f"    {symbol}: 评分计算失败 - {e}")
+                        continue
+
+                # 按评分排序（评分越高越弱），取最弱的N个
+                if scored_positions:
+                    scored_positions.sort(key=lambda x: x.rotation_score, reverse=True)
+                    rotatable_positions = scored_positions[:self.hk_force_rotation_max]
+
+                    logger.warning(f"  🎯 已选出 {len(rotatable_positions)} 个最弱持仓进行强制轮换")
+                    for i, pos in enumerate(rotatable_positions, 1):
+                        logger.info(
+                            f"    {i}. {pos.symbol}: 评分={pos.rotation_score:.0f}, "
+                            f"盈亏={pos.profit_pct:+.1%}, 市值=${pos.market_value:,.0f}"
+                        )
+                else:
+                    logger.warning("  ⚠️  无法为港股持仓评分，跳过强制轮换")
+                    return []
+
+            if not rotatable_positions:
+                logger.info("  ✅ 无弱势持仓需要轮换")
+                return []
+
+            # 生成自动卖出信号
+            logger.info(f"  🎯 生成自动卖出信号（{len(rotatable_positions)}个弱势持仓）...")
+
+            for rot_pos in rotatable_positions:
+                symbol = rot_pos.symbol
+
+                # 检查是否已有卖出订单（避免重复）
+                if symbol in self.sold_today:
+                    logger.debug(f"    {symbol}: 今日已有卖出订单，跳过")
+                    continue
+
+                # 🔥 从原始持仓获取 quantity（关键修复）
+                position = next((p for p in target_positions if p.get('symbol') == symbol), None)
+                if not position:
+                    logger.warning(f"    {symbol}: 找不到持仓信息，跳过")
+                    continue
+
+                quantity = position.get('quantity', 0)
+                if quantity <= 0:
+                    logger.warning(f"    {symbol}: 持仓数量无效 ({quantity})，跳过")
+                    continue
+
+                # 获取当前价格
+                quote = quote_dict.get(symbol)
+                current_price = float(quote.last_done) if quote and quote.last_done else 0
+
+                if current_price <= 0:
+                    logger.debug(f"    {symbol}: 价格无效，跳过")
+                    continue
+
+                # 构建卖出信号（添加缺失的 side 和 quantity 字段）
+                rotation_signal = {
+                    'symbol': symbol,
+                    'type': 'ROTATION_SELL',  # 标记为轮换卖出
+                    'side': 'SELL',  # 🔥 添加 side 字段
+                    'price': current_price,
+                    'quantity': quantity,  # 🔥 添加 quantity 字段
+                    'reason': f"收盘前自动轮换 (评分={rot_pos.rotation_score:.0f}, 盈亏={rot_pos.profit_pct:+.1%}, 原因={rot_pos.reason})",
+                    'score': 90,  # 轮换卖出优先级较高
+                    'priority': 90,
+                    'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                    'metadata': {
+                        'rotation_score': rot_pos.rotation_score,
+                        'profit_pct': rot_pos.profit_pct,
+                        'market_value': rot_pos.market_value,
+                        'rotation_reason': rot_pos.reason,
+                        'auto_rotation': True,  # 标记为自动轮换
+                        'target_market': "US" if should_check_hk else "HK"
+                    }
+                }
+
+                rotation_signals.append(rotation_signal)
+
+                logger.success(
+                    f"    ✅ {symbol}: 生成轮换卖出信号 "
+                    f"(数量={quantity}, 评分={rot_pos.rotation_score:.0f}, "
+                    f"盈亏={rot_pos.profit_pct:+.1%}, "
+                    f"市值=${rot_pos.market_value:,.0f})"
+                )
+
+            # 发送通知
+            if rotation_signals and hasattr(self, 'slack') and self.slack:
+                market_name = "港股" if should_check_hk else "美股"
+                target_market_name = "美股" if should_check_hk else "港股"
+
+                notification_lines = [
+                    f"🔄 **{market_name}收盘前自动轮换**",
+                    f"",
+                    f"为{target_market_name}交易时段释放资金，准备卖出以下弱势持仓：",
+                    f""
+                ]
+
+                for i, signal in enumerate(rotation_signals[:5], 1):
+                    metadata = signal.get('metadata', {})
+                    profit_pct = metadata.get('profit_pct', 0)
+                    market_value = metadata.get('market_value', 0)
+                    score = metadata.get('rotation_score', 0)
+
+                    profit_emoji = "🟢" if profit_pct > 0 else "🔴"
+
+                    notification_lines.append(
+                        f"{i}. {signal['symbol']} - ${signal['price']:.2f} "
+                        f"{profit_emoji} {profit_pct:+.1%} "
+                        f"(市值${market_value:,.0f}, 评分{score:.0f})"
+                    )
+
+                if len(rotation_signals) > 5:
+                    notification_lines.append(f"... 还有 {len(rotation_signals) - 5} 个")
+
+                total_value = sum(
+                    s.get('metadata', {}).get('market_value', 0)
+                    for s in rotation_signals
+                )
+
+                notification_lines.extend([
+                    f"",
+                    f"💰 预计释放购买力: ${total_value * 0.8:,.0f}",
+                    f"🎯 目标市场: {target_market_name}",
+                    f"⏰ 触发时间: {now.strftime('%H:%M:%S')}"
+                ])
+
+                try:
+                    await self.slack.send("\n".join(notification_lines))
+                    logger.info("  ✅ 轮换通知已发送")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ 发送通知失败: {e}")
+
+            return rotation_signals
+
+        except Exception as e:
+            logger.error(f"❌ 收盘前轮换检查失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return []
 
 
 async def main(account_id: str | None = None):

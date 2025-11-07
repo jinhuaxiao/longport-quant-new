@@ -37,6 +37,7 @@ from longport_quant.execution.smart_router import SmartOrderRouter, OrderRequest
 from longport_quant.execution.risk_assessor import RiskAssessor
 from longport_quant.risk.regime import RegimeClassifier
 from longport_quant.risk.rebalancer import RegimeRebalancer
+from longport_quant.risk.kelly import KellyCalculator
 from longport_quant.data.quote_client import QuoteDataClient
 from longport_quant.messaging import SignalQueue
 from longport_quant.notifications import MultiChannelNotifier
@@ -85,7 +86,7 @@ class OrderExecutor:
             'SZ': 2,   # A股深交所最多2个
         }
         self.min_position_size_pct = 0.05  # 最小仓位5%
-        self.max_position_size_pct = 0.40  # 最大仓位40%（极强信号专用，80-100分）
+        self.max_position_size_pct = 0.25  # 最大仓位25%（优化后，从40%降低）
         self.min_cash_reserve = 1000  # 最低现金储备
         self.use_adaptive_budget = True  # 启用自适应预算
 
@@ -101,6 +102,9 @@ class OrderExecutor:
         self.lot_size_helper = LotSizeHelper()
         self.order_manager = OrderManager()
         self.stop_manager = StopLossManager()
+
+        # 【新增】Kelly 公式计算器 - 基于历史胜率动态调整仓位
+        self.kelly_calculator = KellyCalculator(self.settings)
 
         # 【新增】风险评估器 - 智能决策备份条件单
         self.risk_assessor = RiskAssessor(config=self.settings.backup_orders)
@@ -132,6 +136,10 @@ class OrderExecutor:
         # 去杠杆调仓
         self._rebalancer_task = None
         self.rebalancer = RegimeRebalancer(account_id=self.account_id)
+
+        # 🔄 港股收盘前强制轮换配置（用于轮换分析）
+        self.hk_force_rotation_enabled = bool(getattr(self.settings, 'hk_force_rotation_enabled', False))
+        self.hk_force_rotation_max = int(getattr(self.settings, 'hk_force_rotation_max', 2))
 
     async def run(self):
         """主循环：消费信号并执行订单"""
@@ -572,7 +580,7 @@ class OrderExecutor:
             'score': score,
             'type': 'BUY'
         }
-        dynamic_budget = self._calculate_dynamic_budget(account, signal_dict)
+        dynamic_budget = await self._calculate_dynamic_budget(account, signal_dict)
 
         # 4. 券商端可买数量预估（避免明知无法下单仍然尝试）
         broker_max_qty = await self._estimate_available_quantity(
@@ -883,7 +891,7 @@ class OrderExecutor:
                 )
 
         # 4. 计算动态预算
-        dynamic_budget = self._calculate_dynamic_budget(account, signal)
+        dynamic_budget = await self._calculate_dynamic_budget(account, signal)
 
         # 5. 获取手数
         lot_size = await self.lot_size_helper.get_lot_size(symbol, self.quote_client)
@@ -960,7 +968,7 @@ class OrderExecutor:
                         logger.success(f"  💰 轮换后可用资金: ${available_cash:,.2f}，继续执行订单")
 
                         # 重新计算动态预算和购买数量
-                        dynamic_budget = self._calculate_dynamic_budget(account, signal)
+                        dynamic_budget = await self._calculate_dynamic_budget(account, signal)
 
                         quantity = self.lot_size_helper.calculate_order_quantity(
                             symbol, dynamic_budget, current_price, lot_size
@@ -1811,7 +1819,7 @@ class OrderExecutor:
             logger.error(f"❌ 提交平仓订单失败: {e}")
             raise
 
-    def _calculate_dynamic_budget(self, account: Dict, signal: Dict) -> float:
+    async def _calculate_dynamic_budget(self, account: Dict, signal: Dict) -> float:
         """
         计算动态预算（基于信号强度和风险）
 
@@ -1833,16 +1841,16 @@ class OrderExecutor:
         # 基础预算（总资产的百分比）
         base_budget = net_assets * self.min_position_size_pct
 
-        # 根据评分调整预算（更激进的高分信号仓位）
+        # 根据评分调整预算（优化后：降低最大仓位25%）
         if score >= 80:
-            # 极强买入信号：重仓（30-40%）
-            budget_pct = 0.30 + (score - 80) / 200  # 80分=30%, 100分=40%
+            # 极强买入信号：重仓（20-25%，从30-40%降低）
+            budget_pct = 0.20 + (score - 80) / 400  # 80分=20%, 100分=25%
         elif score >= 60:
-            # 强买入信号：标准仓（20-30%）
-            budget_pct = 0.20 + (score - 60) / 200  # 60分=20%, 80分=30%
+            # 强买入信号：标准仓（15-22%，从20-30%降低）
+            budget_pct = 0.15 + (score - 60) * 0.07 / 20  # 60分=15%, 80分=22%
         elif score >= 45:
-            # 买入信号：试探性小仓位（5-12%）
-            budget_pct = 0.05 + (score - 45) / 200  # 45分=5%, 59分=12%
+            # 买入信号：试探性小仓位（5-10%，微调上限）
+            budget_pct = 0.05 + (score - 45) * 0.05 / 14  # 45分=5%, 59分=10%
         else:
             # 低于45分：不应该生成信号（WEAK_BUY已禁用）
             budget_pct = 0.05  # 兜底最小值
@@ -1936,6 +1944,34 @@ class OrderExecutor:
                 )
         except Exception as e:
             logger.debug(f"Regime预算调整失败（忽略）: {e}")
+
+        # 🎲 集成 Kelly 公式：基于历史胜率和盈亏比动态调整仓位
+        try:
+            market = "HK" if ".HK" in symbol else ("US" if ".US" in symbol else None)
+            kelly_position, kelly_info = await self.kelly_calculator.get_recommended_position(
+                total_capital=net_assets,
+                signal_score=score,
+                symbol=symbol,
+                market=market,
+                regime=regime
+            )
+
+            # 取评分预算和 Kelly 推荐的较小值（双重保险）
+            if kelly_position > 0 and kelly_position < dynamic_budget:
+                logger.info(
+                    f"  🎲 Kelly 保护: 评分预算=${dynamic_budget:,.2f}, "
+                    f"Kelly推荐=${kelly_position:,.2f} (胜率={kelly_info.get('win_rate', 0):.1%}, "
+                    f"盈亏比={kelly_info.get('profit_loss_ratio', 0):.2f}), "
+                    f"采用较小值"
+                )
+                dynamic_budget = kelly_position
+            elif kelly_position > 0:
+                logger.debug(
+                    f"  ℹ️ Kelly推荐=${kelly_position:,.2f} ≥ 评分预算=${dynamic_budget:,.2f}, "
+                    f"保持评分预算"
+                )
+        except Exception as e:
+            logger.debug(f"Kelly公式计算失败（忽略）: {e}")
 
         if dynamic_budget > effective_cap:
             logger.warning(

@@ -197,6 +197,81 @@ class Settings(BaseSettings):
     rebalancer_max_price_gap_pct: float = Field(0.03, alias="REBALANCER_MAX_PRICE_GAP_PCT")
 
     # ============================================================
+    # 凯利公式仓位管理（Kelly Position Sizing）
+    # ============================================================
+    # 说明：
+    # - 基于历史胜率和盈亏比动态计算最优仓位
+    # - 使用保守系数（50% Kelly）降低风险
+    # - 结合信号评分和市场状态调整仓位
+    # ============================================================
+
+    # 启用凯利公式（默认启用）
+    kelly_enabled: bool = Field(True, alias="KELLY_ENABLED")
+
+    # 凯利公式保守系数（0.5 = 50% Kelly，推荐范围 0.25-0.5）
+    kelly_fraction: float = Field(0.5, alias="KELLY_FRACTION")
+
+    # 最大单笔仓位比例（安全上限，避免过度集中）
+    kelly_max_position: float = Field(0.25, alias="KELLY_MAX_POSITION")
+
+    # 最小胜率要求（低于此值不使用凯利公式）
+    kelly_min_win_rate: float = Field(0.55, alias="KELLY_MIN_WIN_RATE")
+
+    # 最少交易次数要求（历史数据不足时使用回退策略）
+    kelly_min_trades: int = Field(10, alias="KELLY_MIN_TRADES")
+
+    # 统计回溯天数（用于计算胜率和盈亏比）
+    kelly_lookback_days: int = Field(30, alias="KELLY_LOOKBACK_DAYS")
+
+    # ============================================================
+    # 时区轮动资金管理（Timezone Capital Rotation）
+    # ============================================================
+    # 说明：
+    # - 在港股收盘前为美股释放资金，美股收盘前为港股释放资金
+    # - 自动识别弱势持仓并生成卖出信号
+    # - 优先级策略：优先满足高分信号（≥70），不限市场
+    # ============================================================
+
+    # 启用时区轮动（默认启用）
+    timezone_rotation_enabled: bool = Field(True, alias="TIMEZONE_ROTATION_ENABLED")
+
+    # 弱势持仓评分阈值（低于此值视为弱势，可轮换）
+    timezone_weak_threshold: int = Field(40, alias="TIMEZONE_WEAK_THRESHOLD")
+
+    # 单次最大轮换比例（防止过度卖出）
+    timezone_max_rotation: float = Field(0.30, alias="TIMEZONE_MAX_ROTATION")
+
+    # 亏损超过此值优先轮换（-0.10 = -10%）
+    timezone_min_profit_rotation: float = Field(-0.10, alias="TIMEZONE_MIN_PROFIT_ROTATION")
+
+    # 强势持仓保护阈值（高于此值不轮换）
+    timezone_strong_threshold: int = Field(70, alias="TIMEZONE_STRONG_THRESHOLD")
+
+    # 最短持有时间（避免频繁交易，单位：小时）
+    timezone_min_holding_hours: float = Field(0.5, alias="TIMEZONE_MIN_HOLDING_HOURS")
+
+    # 港股收盘前强制轮换（即使持仓健康）
+    hk_force_rotation_enabled: bool = Field(False, alias="HK_FORCE_ROTATION_ENABLED")
+
+    # 港股收盘前最多轮换几个持仓
+    hk_force_rotation_max: int = Field(2, alias="HK_FORCE_ROTATION_MAX")
+
+    # ============================================================
+    # VIXY 恐慌指数监控（Panic Index Monitoring）
+    # ============================================================
+    # 说明：
+    # - VIXY.US: 跟踪 VIX 短期期货的 ETF
+    # - 实时监控市场恐慌水平，超过阈值自动停止买入
+    # - 市场恢复平静后自动解除
+    # ============================================================
+
+    # VIXY 恐慌阈值（超过此值视为市场恐慌）
+    vixy_panic_threshold: float = Field(30.0, alias="VIXY_PANIC_THRESHOLD")
+
+    # 启用恐慌告警通知
+    vixy_alert_enabled: bool = Field(True, alias="VIXY_ALERT_ENABLED")
+
+    # ============================================================
     # 盘后交易配置（After-Hours Trading）
     # ============================================================
     # 说明：
