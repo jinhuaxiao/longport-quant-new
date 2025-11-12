@@ -42,7 +42,7 @@ async def test_async_redis():
 
         result = await r.ping()
         print(f"✅ 异步连接成功: {result}")
-        await r.close()
+        await r.aclose()
         return True
     except Exception as e:
         print(f"❌ 异步连接失败: {type(e).__name__}: {e}")
@@ -69,7 +69,7 @@ async def test_config_redis():
 
         result = await r.ping()
         print(f"✅ 配置连接成功: {result}")
-        await r.close()
+        await r.aclose()
         return True
     except Exception as e:
         print(f"❌ 配置连接失败: {type(e).__name__}: {e}")

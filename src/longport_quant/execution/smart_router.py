@@ -194,13 +194,26 @@ class SmartOrderRouter:
                         self._lot_size_cache[symbol] = lot_size
                         logger.debug(f"  📊 {symbol} 手数: {lot_size}股/手 (来自API)")
                         return lot_size
+                    else:
+                        # 🔥 API返回但board_lot为空或无效
+                        logger.warning(f"⚠️ {symbol} API返回static_info但board_lot无效: {lot_size}")
+                else:
+                    # 🔥 API返回空列表
+                    logger.warning(f"⚠️ {symbol} API返回空static_info列表")
             except Exception as e:
-                logger.warning(f"Failed to get lot size for {symbol}: {e}")
+                # 🔥 API调用失败，记录详细错误
+                logger.warning(f"⚠️ {symbol} 获取手数API调用失败: {type(e).__name__}: {e}")
+        else:
+            # 🔥 没有配置quote_client
+            logger.warning(f"⚠️ SmartOrderRouter未配置quote_client，无法获取{symbol}的准确手数")
 
-        # 使用默认值
+        # 使用默认值（但这可能导致订单失败！）
         default_lot_size = 1 if ".US" in symbol else 100
         self._lot_size_cache[symbol] = default_lot_size
-        logger.debug(f"  📊 {symbol} 手数: {default_lot_size}股/手 (默认值)")
+        logger.warning(
+            f"⚠️ {symbol} 使用默认手数: {default_lot_size}股/手 "
+            f"(这可能与实际手数不符，可能导致订单失败！)"
+        )
         return default_lot_size
 
     async def _validate_and_adjust_quantity(self, symbol: str, quantity: int) -> int:

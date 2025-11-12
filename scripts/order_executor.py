@@ -168,8 +168,8 @@ class OrderExecutor:
                 # 🔥 初始化SmartOrderRouter（用于TWAP/VWAP算法订单）
                 db_manager = DatabaseSessionManager(self.settings.database_dsn, auto_init=True)
                 trade_ctx = await trade_client.get_trade_context()
-                self.smart_router = SmartOrderRouter(trade_ctx, db_manager)
-                logger.info("✅ SmartOrderRouter已初始化（支持TWAP/VWAP算法订单）")
+                self.smart_router = SmartOrderRouter(trade_ctx, db_manager, quote_client=quote_client, settings=self.settings)
+                logger.info("✅ SmartOrderRouter已初始化（支持TWAP/VWAP算法订单，使用QuoteClient获取手数）")
 
                 # 🔥 启动Regime状态更新任务（可选）
                 if getattr(self.settings, 'regime_enabled', False):
@@ -197,6 +197,13 @@ class OrderExecutor:
                     logger.info("✅ 队列状态通知已启动（每小时汇报）")
                 except Exception as e:
                     logger.warning(f"⚠️ 启动队列状态通知失败: {e}")
+
+                # 🔥 启动延迟信号清理任务（每10分钟）
+                try:
+                    self._delayed_signal_cleaner_task = asyncio.create_task(self._delayed_signal_cleaner())
+                    logger.info("✅ 延迟信号清理已启动（每10分钟自动清理超时信号）")
+                except Exception as e:
+                    logger.warning(f"⚠️ 启动延迟信号清理失败: {e}")
 
                 logger.info("✅ 订单执行器初始化完成")
 
@@ -1485,6 +1492,54 @@ class OrderExecutor:
                     account=self.settings.account_id
                 )
 
+                # 🔥 获取延迟信号详情（用于监控）
+                delayed_signals_info = ""
+                if delayed_count > 0:
+                    try:
+                        delayed_signals = await self.signal_queue.get_delayed_signals(
+                            account=self.settings.account_id
+                        )
+
+                        if delayed_signals:
+                            now = time.time()
+                            remaining_delays = []
+                            total_ages = []
+
+                            for sig in delayed_signals:
+                                retry_after = sig.get('retry_after', 0)
+                                remaining = max(0, retry_after - now) / 60
+                                remaining_delays.append(remaining)
+
+                                # 计算信号总存在时间
+                                queued_at_str = sig.get('queued_at')
+                                if queued_at_str:
+                                    try:
+                                        queued_at = datetime.fromisoformat(queued_at_str)
+                                        total_age = (datetime.now() - queued_at).total_seconds() / 60
+                                        total_ages.append(total_age)
+                                    except:
+                                        pass
+
+                            if remaining_delays:
+                                avg_remaining = sum(remaining_delays) / len(remaining_delays)
+                                max_remaining = max(remaining_delays)
+                                avg_age = sum(total_ages) / len(total_ages) if total_ages else 0
+                                max_age = max(total_ages) if total_ages else 0
+
+                                delayed_signals_info = (
+                                    f"   • 剩余延迟时间：平均{avg_remaining:.1f}分钟，最长{max_remaining:.1f}分钟\n"
+                                    f"   • 信号存在时间：平均{avg_age:.1f}分钟，最长{max_age:.1f}分钟"
+                                )
+
+                                # 🔥 如果有信号存在时间过长（>30分钟），记录警告
+                                if max_age > 30:
+                                    logger.warning(
+                                        f"⚠️ 发现长时间延迟信号：已存在{max_age:.1f}分钟，"
+                                        f"还需等待{max_remaining:.1f}分钟"
+                                    )
+                    except Exception as e:
+                        logger.debug(f"  获取延迟信号详情失败: {e}")
+
                 # 获取账户信息
                 try:
                     account = await self.trade_client.get_account()
@@ -1499,16 +1554,43 @@ class OrderExecutor:
                 if queue_size == 0:
                     consecutive_empty_count += 1
                     if consecutive_empty_count >= 3 and (time.time() - last_empty_alert_time) > 10800:
-                        # 3小时警告
-                        message = (
-                            f"⚠️ **队列长时间为空警告**\n\n"
-                            f"📊 队列已连续 {consecutive_empty_count} 小时为空\n\n"
-                            f"可能原因：\n"
-                            f"   • 信号生成器未运行\n"
-                            f"   • 市场无交易机会\n"
-                            f"   • 所有策略已关闭\n\n"
-                            f"💡 建议检查信号生成器和策略配置"
-                        )
+                        # 检查 VIXY 恐慌状态
+                        vixy_status = await self._get_vixy_status_from_redis()
+
+                        # 根据 VIXY 状态生成不同的警告消息
+                        if vixy_status and vixy_status.get('panic'):
+                            # VIXY 恐慌模式导致的队列为空
+                            vixy_price = vixy_status.get('price', 0)
+                            vixy_threshold = vixy_status.get('threshold', 30.0)
+                            vixy_ma200 = vixy_status.get('ma200', '')
+
+                            message = (
+                                f"🚨 **队列长时间为空警告**\n\n"
+                                f"📊 队列已连续 {consecutive_empty_count} 小时为空\n\n"
+                                f"**主要原因：VIXY 恐慌模式已触发**\n\n"
+                                f"📉 **VIXY 恐慌指数状态：**\n"
+                                f"   • 当前价格: **${vixy_price:.2f}**\n"
+                                f"   • 恐慌阈值: ${vixy_threshold:.2f}\n"
+                            )
+                            if vixy_ma200:
+                                message += f"   • MA200: ${vixy_ma200}\n"
+                            message += (
+                                f"\n⚠️  **已自动停止生成买入信号**\n"
+                                f"当 VIXY 降至 ${vixy_threshold:.2f} 以下时将自动恢复\n\n"
+                                f"💡 如需调整阈值，请修改环境变量 `VIXY_PANIC_THRESHOLD`"
+                            )
+                        else:
+                            # 其他原因导致的队列为空
+                            message = (
+                                f"⚠️ **队列长时间为空警告**\n\n"
+                                f"📊 队列已连续 {consecutive_empty_count} 小时为空\n\n"
+                                f"可能原因：\n"
+                                f"   • 信号生成器未运行\n"
+                                f"   • 市场无交易机会\n"
+                                f"   • 所有策略已关闭\n\n"
+                                f"💡 建议检查信号生成器和策略配置"
+                            )
+
                         if self.slack:
                             await self.slack.send(message)
                         last_empty_alert_time = time.time()
@@ -1534,6 +1616,8 @@ class OrderExecutor:
 
                     if delayed_count > 0:
                         message += f"\n\n💡 **提示:** 有{delayed_count}个信号因资金不足延迟处理"
+                        if delayed_signals_info:
+                            message += f"\n\n📊 **延迟信号详情：**\n{delayed_signals_info}"
 
                     if self.slack:
                         await self.slack.send(message)
@@ -1542,6 +1626,114 @@ class OrderExecutor:
 
             except Exception as e:
                 logger.warning(f"⚠️ 发送队列状态摘要失败: {e}")
+
+    async def _delayed_signal_cleaner(self):
+        """周期性清理超时的延迟信号（每10分钟）"""
+        interval = 600  # 10分钟
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+
+                # 获取所有延迟信号
+                delayed_signals = await self.signal_queue.get_delayed_signals(
+                    account=self.settings.account_id
+                )
+
+                if not delayed_signals:
+                    continue
+
+                # 检查每个延迟信号是否超时
+                now = time.time()
+                max_total_age = self.settings.signal_ttl_seconds  # 使用信号TTL作为最大存在时间
+                cleaned_count = 0
+
+                for signal in delayed_signals:
+                    try:
+                        # 检查信号总存在时间
+                        queued_at_str = signal.get('queued_at')
+                        if not queued_at_str:
+                            continue
+
+                        queued_at = datetime.fromisoformat(queued_at_str)
+                        total_age = (datetime.now() - queued_at).total_seconds()
+
+                        # 如果信号存在时间超过TTL，强制删除
+                        if total_age > max_total_age:
+                            symbol = signal.get('symbol')
+                            retry_after = signal.get('retry_after', 0)
+                            remaining_delay = max(0, retry_after - now) / 60
+
+                            logger.warning(
+                                f"🗑️ 清理超时延迟信号: {symbol}, "
+                                f"已存在{total_age/60:.1f}分钟 (> {max_total_age/60:.1f}分钟), "
+                                f"retry_after还剩{remaining_delay:.1f}分钟"
+                            )
+
+                            # 标记为失败并删除
+                            await self.signal_queue.mark_failed(
+                                signal,
+                                error_message=f"延迟信号超时（存在{total_age/60:.1f}分钟）"
+                            )
+                            cleaned_count += 1
+
+                    except Exception as e:
+                        logger.warning(f"⚠️ 检查延迟信号失败: {e}")
+                        continue
+
+                if cleaned_count > 0:
+                    logger.info(f"✅ 已清理{cleaned_count}个超时延迟信号")
+
+            except Exception as e:
+                logger.warning(f"⚠️ 延迟信号清理任务失败: {e}")
+
+    async def _get_vixy_status_from_redis(self) -> Optional[Dict]:
+        """
+        从 Redis 读取 VIXY 恐慌指数状态
+
+        Returns:
+            Dict: VIXY状态字典，包含：
+                - price: float - 当前价格
+                - panic: bool - 是否处于恐慌模式
+                - threshold: float - 恐慌阈值
+                - ma200: str - MA200值
+                - updated_at: str - 更新时间
+            如果读取失败返回 None
+        """
+        try:
+            import redis.asyncio as aioredis
+
+            redis_client = aioredis.from_url(self.settings.redis_url)
+
+            # 批量读取 VIXY 状态
+            pipe = redis_client.pipeline()
+            pipe.get("market:vixy:price")
+            pipe.get("market:vixy:panic")
+            pipe.get("market:vixy:threshold")
+            pipe.get("market:vixy:ma200")
+            pipe.get("market:vixy:updated_at")
+
+            results = await pipe.execute()
+            await redis_client.aclose()
+
+            # 解析结果
+            price_str, panic_str, threshold_str, ma200_str, updated_at_str = results
+
+            if not price_str:
+                # VIXY 状态不存在（可能信号生成器未运行）
+                return None
+
+            return {
+                'price': float(price_str.decode('utf-8') if isinstance(price_str, bytes) else price_str),
+                'panic': (panic_str.decode('utf-8') if isinstance(panic_str, bytes) else panic_str) == "1",
+                'threshold': float(threshold_str.decode('utf-8') if isinstance(threshold_str, bytes) else threshold_str) if threshold_str else 30.0,
+                'ma200': (ma200_str.decode('utf-8') if isinstance(ma200_str, bytes) else ma200_str) if ma200_str else '',
+                'updated_at': (updated_at_str.decode('utf-8') if isinstance(updated_at_str, bytes) else updated_at_str) if updated_at_str else ''
+            }
+
+        except Exception as e:
+            logger.debug(f"从 Redis 读取 VIXY 状态失败: {e}")
+            return None
 
     async def _send_regime_notification(self, res):
         emoji = {'BULL': '🟢', 'RANGE': '🟡', 'BEAR': '🔴'}.get(res.regime, '🔘')

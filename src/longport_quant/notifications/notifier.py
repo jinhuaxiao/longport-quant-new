@@ -8,7 +8,7 @@ from typing import Any
 from loguru import logger
 
 from .discord import DiscordNotifier
-from .slack import SlackNotifier
+from .slack import SlackNotifier, SlackRateLimitError
 
 
 class MultiChannelNotifier:
@@ -57,6 +57,8 @@ class MultiChannelNotifier:
         """
         Send a message to all configured notification channels.
 
+        自动故障转移：如果Slack遇到429限流，自动切换到Discord。
+
         Args:
             message: The message text to send
             **kwargs: Additional parameters (channel-specific formatting)
@@ -65,20 +67,34 @@ class MultiChannelNotifier:
             logger.debug("No notification channels configured; skipping message: {}", message)
             return
 
-        tasks = []
+        # 🔥 尝试Slack，遇到429自动切换到Discord
+        slack_failed = False
+        slack_rate_limited = False
+
         if self._slack:
-            tasks.append(self._slack.send(message, **kwargs))
+            try:
+                await self._slack.send(message, **kwargs)
+                logger.debug("✅ 消息已发送到 Slack")
+                return  # 🔥 成功发送，直接返回
+            except SlackRateLimitError as e:
+                # 🔥 Slack限流，记录并切换到Discord
+                slack_rate_limited = True
+                slack_failed = True
+                logger.info("⚠️ Slack限流，自动切换到Discord")
+            except Exception as e:
+                # 🔥 其他Slack错误
+                slack_failed = True
+                logger.warning(f"⚠️ Slack发送失败: {e}")
+
+        # 🔥 如果Slack失败/限流/未配置，使用Discord作为备用
         if self._discord:
-            tasks.append(self._discord.send(message, **kwargs))
-
-        # Send to all channels concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Log any errors
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                channel = "Slack" if i == 0 and self._slack else "Discord"
-                logger.error(f"{channel} notification failed: {result}")
+            try:
+                # 🔥 如果是Slack限流，在Discord消息中标注
+                prefix = "⚠️ [Slack限流，使用Discord备用通道]\n\n" if slack_rate_limited else ""
+                await self._discord.send(prefix + message, **kwargs)
+                logger.debug("✅ 消息已发送到 Discord")
+            except Exception as e:
+                logger.error(f"❌ Discord发送失败: {e}")
 
 
 __all__ = ["MultiChannelNotifier"]

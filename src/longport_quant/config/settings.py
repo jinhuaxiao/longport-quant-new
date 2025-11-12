@@ -257,6 +257,33 @@ class Settings(BaseSettings):
     hk_force_rotation_max: int = Field(2, alias="HK_FORCE_ROTATION_MAX")
 
     # ============================================================
+    # 实时挪仓配置（资金不足时主动卖出弱势持仓）
+    # ============================================================
+    # 启用实时挪仓
+    realtime_rotation_enabled: bool = Field(True, alias="REALTIME_ROTATION_ENABLED")
+
+    # 触发实时挪仓的最低信号评分
+    realtime_rotation_min_signal_score: int = Field(60, alias="REALTIME_ROTATION_MIN_SIGNAL_SCORE")
+
+    # 新信号需高出持仓的最小分数差
+    realtime_rotation_min_score_diff: int = Field(10, alias="REALTIME_ROTATION_MIN_SCORE_DIFF")
+
+    # 单次实时挪仓最多卖出几个持仓
+    realtime_rotation_max_positions: int = Field(1, alias="REALTIME_ROTATION_MAX_POSITIONS")
+
+    # ============================================================
+    # 紧急度自动卖出配置（主动风险管理）
+    # ============================================================
+    # 启用紧急度自动卖出
+    urgent_sell_enabled: bool = Field(True, alias="URGENT_SELL_ENABLED")
+
+    # 紧急度阈值
+    urgent_sell_threshold: int = Field(60, alias="URGENT_SELL_THRESHOLD")
+
+    # 检查冷却期（秒）
+    urgent_sell_cooldown: int = Field(300, alias="URGENT_SELL_COOLDOWN")
+
+    # ============================================================
     # VIXY 恐慌指数监控（Panic Index Monitoring）
     # ============================================================
     # 说明：
@@ -270,6 +297,21 @@ class Settings(BaseSettings):
 
     # 启用恐慌告警通知
     vixy_alert_enabled: bool = Field(True, alias="VIXY_ALERT_ENABLED")
+
+    # ============================================================
+    # 盘前交易配置（Pre-Market Trading）
+    # ============================================================
+    # 说明：
+    # - 支持美股盘前时段（16:00-21:30 北京时间）的买入信号生成
+    # - 盘前信号评分自动降权，降低风险
+    # - 保留所有技术指标分析，但权重调整
+    # ============================================================
+
+    # 启用美股盘前买入信号（默认启用）
+    enable_us_premarket_signals: bool = Field(True, alias="ENABLE_US_PREMARKET_SIGNALS")
+
+    # 盘前信号评分权重（0.8 = 80%，降低20%风险）
+    us_premarket_signal_weight: float = Field(0.8, alias="US_PREMARKET_SIGNAL_WEIGHT")
 
     # ============================================================
     # 盘后交易配置（After-Hours Trading）
@@ -341,6 +383,18 @@ class Settings(BaseSettings):
     profit_aggressive_threshold: float = Field(5.0, alias="PROFIT_AGGRESSIVE_THRESHOLD")  # 盈利超过5%时激进止损
     profit_trailing_threshold: float = Field(10.0, alias="PROFIT_TRAILING_THRESHOLD")  # 盈利超过10%时启用Trailing Stop
     loss_conservative_mode: bool = Field(True, alias="LOSS_CONSERVATIVE_MODE")  # 亏损时启用保守模式（需多信号确认）
+
+    # ============================================================
+    # K线数据获取优化（混合模式：数据库 + API）
+    # ============================================================
+    # 启用数据库K线混合模式（减少API调用80%+）
+    use_db_klines: bool = Field(True, alias="USE_DB_KLINES")
+
+    # 从数据库读取的历史天数（推荐90天，足够计算技术指标）
+    db_klines_history_days: int = Field(90, alias="DB_KLINES_HISTORY_DAYS")
+
+    # 从API获取的最新天数（推荐3天，确保实时性）
+    api_klines_latest_days: int = Field(3, alias="API_KLINES_LATEST_DAYS")
 
     model_config = SettingsConfigDict(
         env_file=".env",

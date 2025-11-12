@@ -44,6 +44,11 @@ from longport_quant.risk.regime import RegimeClassifier
 from longport_quant.risk.kelly import KellyCalculator
 from longport_quant.risk.timezone_capital import TimeZoneCapitalManager
 from longport_quant.notifications.notifier import MultiChannelNotifier
+from longport_quant.persistence.db import DatabaseSessionManager
+from longport_quant.persistence.models import KlineDaily
+from longport_quant.data.kline_sync import KlineDataService
+from sqlalchemy import select, and_
+from datetime import date
 
 
 def sanitize_unicode(text: str) -> str:
@@ -258,6 +263,45 @@ class SignalGenerator:
         # 🔄 港股收盘前强制轮换配置
         self.hk_force_rotation_enabled = bool(getattr(self.settings, 'hk_force_rotation_enabled', False))
         self.hk_force_rotation_max = int(getattr(self.settings, 'hk_force_rotation_max', 2))
+
+        # 🚨 紧急度自动卖出配置
+        self.urgent_sell_enabled = bool(getattr(self.settings, 'urgent_sell_enabled', True))
+        self.urgent_sell_threshold = int(getattr(self.settings, 'urgent_sell_threshold', 60))
+        self.urgent_sell_cooldown = int(getattr(self.settings, 'urgent_sell_cooldown', 300))
+        self.urgent_sell_last_check = {}  # {symbol: timestamp} 记录上次检查时间
+
+        # 📊 K线数据混合模式配置（数据库 + API）
+        self.use_db_klines = bool(getattr(self.settings, 'use_db_klines', True))
+        self.db_klines_history_days = int(getattr(self.settings, 'db_klines_history_days', 90))
+        self.api_klines_latest_days = int(getattr(self.settings, 'api_klines_latest_days', 3))
+
+        # 数据库连接管理器（用于K线数据查询）
+        self.db = None  # 延迟初始化（在 run() 方法中）
+        self.kline_service = None  # K线同步服务（延迟初始化）
+        if self.use_db_klines:
+            logger.info(
+                f"✅ K线混合模式已启用: 数据库{self.db_klines_history_days}天 + API{self.api_klines_latest_days}天"
+            )
+
+        # 🔄 实时挪仓和紧急卖出后台任务
+        self._rotation_task = None
+        self._rotation_check_interval = 30  # 每30秒检查一次
+
+        # 🔔 Slack通知限流（防止429错误）
+        self.slack_notification_cooldown = {}  # {notification_key: last_sent_timestamp}
+        self.slack_cooldown_period = int(getattr(self.settings, 'slack_cooldown_seconds', 3600))  # 默认1小时
+
+        # 🛡️ 防御性标的（Consumer Staples）- 恐慌期优先监控
+        self.defensive_symbols = {
+            "PG.US": {"name": "宝洁", "sector": "consumer_staples", "type": "defensive"},
+            "KO.US": {"name": "可口可乐", "sector": "consumer_staples", "type": "defensive"},
+            "WMT.US": {"name": "沃尔玛", "sector": "consumer_staples", "type": "defensive"},
+            "COST.US": {"name": "好市多", "sector": "consumer_staples", "type": "defensive"},
+            "MO.US": {"name": "奥驰亚", "sector": "consumer_staples", "type": "defensive"},
+        }
+
+        # 🛡️ 恐慌期动态添加的防御标的集合
+        self.panic_added_symbols = set()
 
     def _is_market_open(self, symbol: str) -> bool:
         """
@@ -607,6 +651,41 @@ class SignalGenerator:
 
         return True, ""
 
+    def _should_send_slack_notification(self, notification_key: str) -> tuple[bool, str]:
+        """
+        检查是否应该发送Slack通知（限流机制，防止429错误）
+
+        Args:
+            notification_key: 通知唯一标识（如 "buying_power:941.HK"）
+
+        Returns:
+            (bool, str): (是否应该发送, 跳过原因)
+        """
+        now_ts = datetime.now(self.beijing_tz).timestamp()
+
+        # 检查是否在冷却期内
+        if notification_key in self.slack_notification_cooldown:
+            last_sent = self.slack_notification_cooldown[notification_key]
+            elapsed = now_ts - last_sent
+
+            if elapsed < self.slack_cooldown_period:
+                remaining = self.slack_cooldown_period - elapsed
+                remaining_min = remaining / 60
+                return False, f"Slack通知冷却期内（还需{remaining_min:.0f}分钟）"
+
+        # 更新发送时间
+        self.slack_notification_cooldown[notification_key] = now_ts
+
+        # 清理过期记录（1天前的）
+        expired_keys = [
+            k for k, v in self.slack_notification_cooldown.items()
+            if now_ts - v > 86400  # 24小时
+        ]
+        for k in expired_keys:
+            del self.slack_notification_cooldown[k]
+
+        return True, ""
+
     # ==================== WebSocket 实时订阅方法 ====================
 
     async def setup_realtime_subscription(self, symbols):
@@ -684,17 +763,44 @@ class SignalGenerator:
             if not self._should_recalculate(symbol, current_price):
                 return
 
-            # 🔧 市场时间检查（港股和美股都需要在交易时间内才生成买入信号）
+            # 🔧 市场时间检查（区分港股和美股）
+            session_type = None  # 交易时段类型
             if self.check_market_hours:
-                if not self._is_market_open(symbol):
-                    market_name = "港股" if symbol.endswith('.HK') else "美股" if symbol.endswith('.US') else "市场"
-                    logger.debug(f"  ⏭️  {symbol}: {market_name}未开盘，跳过买入信号分析")
-                    # 收盘后仍然检查止损止盈（风险管理优先）
-                    if symbol in self.current_positions:
-                        has_position = await self.position_manager.has_position(symbol)
-                        if has_position:
-                            await self._check_realtime_stop_loss(symbol, current_price, quote)
-                    return
+                # 美股：支持盘前交易
+                if symbol.endswith('.US'):
+                    is_premarket, session_type = self._is_us_premarket(symbol)
+
+                    # 盘前时段：如果启用盘前信号，则继续处理
+                    if is_premarket:
+                        if not getattr(self.settings, 'enable_us_premarket_signals', True):
+                            logger.debug(f"  ⏭️  {symbol}: 美股盘前时段，但盘前信号未启用")
+                            # 仍检查止损
+                            if symbol in self.current_positions:
+                                has_position = await self.position_manager.has_position(symbol)
+                                if has_position:
+                                    await self._check_realtime_stop_loss(symbol, current_price, quote)
+                            return
+                        # 盘前信号启用，继续处理（session_type = 'pre_market'）
+                        logger.debug(f"  🌅 {symbol}: 美股盘前时段，生成盘前信号")
+
+                    # 非常规交易时段：跳过买入信号
+                    elif session_type in ['after_hours', 'closed']:
+                        logger.debug(f"  ⏭️  {symbol}: 美股非交易时段({session_type})，跳过买入信号分析")
+                        if symbol in self.current_positions:
+                            has_position = await self.position_manager.has_position(symbol)
+                            if has_position:
+                                await self._check_realtime_stop_loss(symbol, current_price, quote)
+                        return
+
+                # 港股：收盘后跳过买入信号
+                elif symbol.endswith('.HK'):
+                    if not self._is_market_open(symbol):
+                        logger.debug(f"  ⏭️  {symbol}: 港股未开盘，跳过买入信号分析")
+                        if symbol in self.current_positions:
+                            has_position = await self.position_manager.has_position(symbol)
+                            if has_position:
+                                await self._check_realtime_stop_loss(symbol, current_price, quote)
+                        return
 
             logger.debug(f"⚡ {symbol}: 价格变化触发实时计算 (${current_price:.2f})")
 
@@ -720,6 +826,17 @@ class SignalGenerator:
                 if not should_generate:
                     logger.debug(f"  ⏭️  {symbol}: 跳过信号 - {skip_reason}")
                     return
+
+                # 🌅 盘前信号降权处理
+                if session_type == 'pre_market':
+                    original_score = signal['score']
+                    weight = getattr(self.settings, 'us_premarket_signal_weight', 0.8)
+                    signal['score'] = int(original_score * weight)
+                    signal['session_type'] = 'pre_market'
+                    logger.info(
+                        f"  🌅 盘前信号降权: {symbol} 评分 {original_score} → {signal['score']} "
+                        f"(权重={weight})"
+                    )
 
                 # 发送信号到Redis队列
                 success = await self.signal_queue.publish_signal(signal)
@@ -765,6 +882,9 @@ class SignalGenerator:
                     )
                     self.market_panic = True
 
+                    # 🛡️ 激活防御标的监控
+                    await self._activate_defensive_watchlist()
+
                 # 发送告警（5分钟内只发一次）
                 if self.vixy_alert_enabled:
                     await self._send_vixy_panic_alert(current_price)
@@ -779,7 +899,18 @@ class SignalGenerator:
                     )
                     self.market_panic = False
 
-                logger.debug(f"📊 VIXY={current_price:.2f}, MA200={self.vixy_ma200:.2f if self.vixy_ma200 else 'N/A'}")
+                    # 🛡️ 保留防御标的继续监控（推荐）
+                    if self.panic_added_symbols:
+                        logger.info(
+                            f"✅ 保留 {len(self.panic_added_symbols)} 个防御标的继续监控: "
+                            f"{', '.join(self.panic_added_symbols)}"
+                        )
+
+                ma200_str = f"{self.vixy_ma200:.2f}" if self.vixy_ma200 else "N/A"
+                logger.debug(f"📊 VIXY={current_price:.2f}, MA200={ma200_str}")
+
+            # 将 VIXY 状态写入 Redis，供其他组件（如订单执行器）读取
+            await self._save_vixy_status_to_redis(current_price)
 
         except Exception as e:
             logger.error(f"处理 VIXY 更新失败: {e}")
@@ -802,7 +933,8 @@ class SignalGenerator:
             bars = await self.quote_client.get_candlesticks(
                 self.vixy_symbol,
                 period=openapi.Period.Day,
-                count=200
+                count=200,
+                adjust_type=openapi.AdjustType.NoAdjust
             )
 
             if bars and len(bars) >= 200:
@@ -848,7 +980,7 @@ class SignalGenerator:
                     f"市场恢复平静后将自动解除"
                 )
 
-                await self.slack.send_message(message, is_urgent=True)
+                await self.slack.send(message)
                 logger.success("✅ 恐慌告警已发送")
 
             # 更新告警时间
@@ -856,6 +988,102 @@ class SignalGenerator:
 
         except Exception as e:
             logger.error(f"发送恐慌告警失败: {e}")
+
+    async def _save_vixy_status_to_redis(self, current_price: float):
+        """
+        将 VIXY 状态保存到 Redis，供其他组件读取
+
+        保存的信息：
+        - market:vixy:price - 当前价格
+        - market:vixy:panic - 是否处于恐慌模式
+        - market:vixy:threshold - 恐慌阈值
+        - market:vixy:ma200 - MA200 值
+        - market:vixy:updated_at - 更新时间
+
+        Args:
+            current_price: VIXY 当前价格
+        """
+        try:
+            import redis.asyncio as aioredis
+            from datetime import datetime
+
+            redis_client = aioredis.from_url(self.settings.redis_url)
+
+            # 使用 pipeline 批量写入
+            pipe = redis_client.pipeline()
+            pipe.set("market:vixy:price", str(current_price))
+            pipe.set("market:vixy:panic", "1" if self.market_panic else "0")
+            pipe.set("market:vixy:threshold", str(self.vixy_panic_threshold))
+            pipe.set("market:vixy:ma200", str(self.vixy_ma200) if self.vixy_ma200 else "")
+            pipe.set("market:vixy:updated_at", datetime.now(self.beijing_tz).isoformat())
+
+            # 设置过期时间为10分钟（如果信号生成器停止，状态会自动失效）
+            pipe.expire("market:vixy:price", 600)
+            pipe.expire("market:vixy:panic", 600)
+            pipe.expire("market:vixy:threshold", 600)
+            pipe.expire("market:vixy:ma200", 600)
+            pipe.expire("market:vixy:updated_at", 600)
+
+            await pipe.execute()
+            await redis_client.aclose()
+
+            logger.info(f"✅ VIXY 状态已保存: ${current_price:.2f}, 恐慌={self.market_panic}")
+
+        except Exception as e:
+            logger.error(f"❌ 保存 VIXY 状态到 Redis 失败: {e}", exc_info=True)
+
+    async def _activate_defensive_watchlist(self):
+        """
+        激活防御标的监控
+        当VIXY触发恐慌时，动态添加防御性标的到监控列表
+        """
+        try:
+            # 找出未订阅的防御标的
+            new_symbols = []
+            for symbol in self.defensive_symbols.keys():
+                if symbol not in self.subscribed_symbols:
+                    new_symbols.append(symbol)
+                    self.panic_added_symbols.add(symbol)
+
+            if new_symbols:
+                logger.success(
+                    f"🛡️ **防御模式激活**\n"
+                    f"   添加 {len(new_symbols)} 个防御性标的到监控列表:\n"
+                    f"   {', '.join(new_symbols)}"
+                )
+
+                # WebSocket动态订阅
+                if self.websocket_enabled:
+                    await self.quote_client.subscribe(
+                        symbols=new_symbols,
+                        sub_types=[openapi.SubType.Quote],
+                        is_first_push=True
+                    )
+
+                    self.subscribed_symbols.update(new_symbols)
+                    logger.success(f"✅ 成功订阅 {len(new_symbols)} 个防御标的")
+
+                # 发送Slack通知
+                if hasattr(self, 'slack') and self.slack:
+                    symbol_list = '\n'.join([
+                        f"- {s}: {info['name']}"
+                        for s, info in self.defensive_symbols.items()
+                        if s in new_symbols
+                    ])
+
+                    message = (
+                        f"🛡️ **防御模式激活**\n\n"
+                        f"VIXY: **${self.vixy_current_price:.2f}** > {self.vixy_panic_threshold:.2f}\n\n"
+                        f"已添加 {len(new_symbols)} 个防御性标的：\n"
+                        f"{symbol_list}\n\n"
+                        f"这些标的将在恐慌期继续生成买入信号"
+                    )
+                    await self.slack.send(message)
+            else:
+                logger.info("ℹ️ 所有防御标的已在监控列表中")
+
+        except Exception as e:
+            logger.error(f"❌ 激活防御监控列表失败: {e}")
 
     def _should_recalculate(self, symbol: str, current_price: float) -> bool:
         """
@@ -1172,8 +1400,88 @@ class SignalGenerator:
                 self.subscribed_symbols.update(unsubscribed)
                 logger.success(f"✅ 成功新增订阅 {len(unsubscribed)} 个持仓股票")
 
+                # 🔄 自动同步新持仓的历史K线数据
+                await self._auto_sync_position_klines(unsubscribed)
+
         except Exception as e:
             logger.warning(f"⚠️ 动态订阅失败: {e}")
+
+    async def _auto_sync_position_klines(self, symbols: List[str]):
+        """
+        自动同步新持仓标的的历史K线数据
+
+        当检测到新持仓时，如果数据库中没有该标的的历史数据，
+        自动触发同步，确保后续可以使用混合模式
+
+        Args:
+            symbols: 需要检查和同步的标的列表
+        """
+        if not self.use_db_klines or not self.db or not self.kline_service:
+            return  # 混合模式未启用，跳过
+
+        try:
+            symbols_to_sync = []
+
+            # 检查每个标的的数据库数据
+            for symbol in symbols:
+                try:
+                    # 检查数据库中是否有该标的的数据
+                    end_date = date.today()
+                    start_date = end_date - timedelta(days=30)  # 检查最近30天
+
+                    async with self.db.session() as session:
+                        stmt = select(KlineDaily).where(
+                            and_(
+                                KlineDaily.symbol == symbol,
+                                KlineDaily.trade_date >= start_date,
+                                KlineDaily.trade_date <= end_date
+                            )
+                        ).limit(1)  # 只需要检查是否存在
+
+                        result = await session.execute(stmt)
+                        existing_klines = result.scalar_one_or_none()
+
+                        # 如果数据库中没有数据，标记为需要同步
+                        if not existing_klines:
+                            symbols_to_sync.append(symbol)
+                            logger.info(f"  📊 {symbol}: 数据库无历史数据，将自动同步")
+                        else:
+                            logger.debug(f"  ✅ {symbol}: 数据库已有数据，跳过同步")
+
+                except Exception as e:
+                    logger.debug(f"  ⚠️ {symbol}: 检查数据库失败 - {e}")
+                    symbols_to_sync.append(symbol)  # 失败也尝试同步
+
+            # 批量同步需要的标的
+            if symbols_to_sync:
+                logger.info(f"🔄 开始自动同步 {len(symbols_to_sync)} 个新持仓标的的历史K线...")
+
+                # 计算同步日期范围（同步100天历史）
+                sync_end_date = date.today()
+                sync_start_date = sync_end_date - timedelta(days=100)
+
+                # 调用同步服务
+                results = await self.kline_service.sync_daily_klines(
+                    symbols=symbols_to_sync,
+                    start_date=sync_start_date,
+                    end_date=sync_end_date
+                )
+
+                # 统计结果
+                success_count = sum(1 for count in results.values() if count > 0)
+                total_records = sum(count for count in results.values() if count > 0)
+
+                if success_count > 0:
+                    logger.success(
+                        f"✅ 自动同步完成: {success_count}/{len(symbols_to_sync)} 个标的，"
+                        f"共 {total_records} 条K线记录"
+                    )
+                else:
+                    logger.warning(f"⚠️ K线自动同步未成功，将继续使用API模式")
+
+        except Exception as e:
+            logger.warning(f"⚠️ 自动同步K线失败: {e}")
+            logger.debug("  系统将自动回退到API模式")
 
     # ==================== 主循环 ====================
 
@@ -1188,6 +1496,14 @@ class SignalGenerator:
             await self.position_manager.connect()
             logger.info("✅ Redis持仓管理器已连接")
 
+            # 📊 初始化数据库连接（用于K线混合模式）
+            if self.use_db_klines:
+                self.db = DatabaseSessionManager(
+                    dsn=self.settings.database_dsn,
+                    auto_init=True
+                )
+                logger.info("✅ 数据库连接已初始化（K线混合模式）")
+
             # 使用async with正确初始化客户端
             # 初始化通知（支持Slack和Discord）
             slack_url = str(self.settings.slack_webhook_url) if self.settings.slack_webhook_url else None
@@ -1201,6 +1517,15 @@ class SignalGenerator:
                 self.quote_client = quote_client
                 self.trade_client = trade_client
                 self.slack = slack
+
+                # 📊 初始化K线同步服务（用于自动同步新持仓的历史数据）
+                if self.use_db_klines and self.db:
+                    self.kline_service = KlineDataService(
+                        settings=self.settings,
+                        db=self.db,
+                        quote_client=self.quote_client
+                    )
+                    logger.info("✅ K线同步服务已初始化")
 
                 # 🔥 保存主事件循环引用（供WebSocket回调使用）
                 self._main_loop = asyncio.get_event_loop()
@@ -1241,6 +1566,10 @@ class SignalGenerator:
                     # 轮询模式：保持60秒间隔
                     actual_poll_interval = self.poll_interval
                     logger.info("   🎯 模式: 60秒轮询扫描")
+
+                # 🔄 启动实时挪仓和紧急卖出后台任务
+                self._rotation_task = asyncio.create_task(self._rotation_checker_loop())
+                logger.info("✅ 实时挪仓后台任务已启动（独立于主循环，每30秒检查）")
 
                 iteration = 0
                 while True:
@@ -1374,6 +1703,14 @@ class SignalGenerator:
                         except Exception as e:
                             logger.error(f"⚠️ 收盘前轮换检查失败: {e}")
 
+                        # 6.5. 🔄 实时挪仓检查 - 已移至后台任务（每30秒独立检查）
+                        # 实时挪仓和紧急卖出现在由 _rotation_checker_loop() 后台任务处理
+                        # 这样可以更快速地响应资金不足的情况，不受主循环间隔限制
+                        pass
+
+                        # 6.6. 🚨 紧急度自动卖出检查 - 已移至后台任务（每30秒独立检查）
+                        pass
+
                         # 7. 检查现有持仓的止损止盈（生成平仓信号）
                         try:
                             if account:
@@ -1458,6 +1795,16 @@ class SignalGenerator:
         except KeyboardInterrupt:
             logger.info("\n⚠️ 收到中断信号，正在退出...")
         finally:
+            # 取消后台任务
+            if self._rotation_task and not self._rotation_task.done():
+                logger.info("🛑 停止实时挪仓后台任务...")
+                self._rotation_task.cancel()
+                try:
+                    await self._rotation_task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("✅ 实时挪仓后台任务已停止")
+
             # 关闭Redis连接
             await self.signal_queue.close()
             await self.position_manager.close()
@@ -1476,13 +1823,23 @@ class SignalGenerator:
             Dict: 信号数据，如果不生成信号则返回None
         """
         try:
-            # 🚨 恐慌断路器：市场恐慌时停止买入信号生成
+            # 🚨 恐慌断路器：市场恐慌时的分级响应
             if self.market_panic:
-                logger.warning(
-                    f"🚨 {symbol}: 市场恐慌 (VIXY={self.vixy_current_price:.2f}), "
-                    f"暂停买入信号生成"
-                )
-                return None
+                # 检查是否为防御性标的
+                is_defensive = symbol in self.defensive_symbols
+
+                if is_defensive:
+                    logger.info(
+                        f"🛡️ {symbol}: 防御性标的，恐慌期间继续监控 "
+                        f"(VIXY={self.vixy_current_price:.2f})"
+                    )
+                    # 继续执行信号生成逻辑
+                else:
+                    logger.warning(
+                        f"🚨 {symbol}: 市场恐慌 (VIXY={self.vixy_current_price:.2f}), "
+                        f"暂停买入信号生成"
+                    )
+                    return None
 
             # 获取历史K线数据
             end_date = datetime.now()
@@ -1814,6 +2171,13 @@ class SignalGenerator:
             score = max(0, score - cost_penalty)
             logger.info(f"    💰 交易成本惩罚: -{cost_penalty}分 (成本比例: {self.settings.transaction_cost_pct*100:.2f}%)")
 
+        # 🛡️ 防御标的恐慌期加分
+        if self.market_panic and symbol in self.defensive_symbols:
+            defensive_bonus = 15  # 恐慌期给予15分额外加分
+            score += defensive_bonus
+            reasons.append("🛡️ 防御标的恐慌期加分")
+            logger.info(f"    🛡️ 防御标的恐慌期加分: +{defensive_bonus}分 (VIXY={self.vixy_current_price:.2f})")
+
         # 总分和决策
         logger.info(
             f"\n  📈 综合评分: {score}/100"
@@ -1894,6 +2258,118 @@ class SignalGenerator:
             logger.info(f"  ⏭️  不生成信号 (得分{score} < 30)")
             return None
 
+    async def _load_klines_from_db(self, symbol: str, days: int = 90) -> List[KlineDaily]:
+        """
+        从数据库加载历史K线数据
+
+        Args:
+            symbol: 标的代码
+            days: 需要的天数
+
+        Returns:
+            K线列表（按日期升序）
+        """
+        try:
+            from datetime import date as datetime_date
+
+            end_date = datetime_date.today()
+            start_date = end_date - timedelta(days=days)
+
+            async with self.db.session() as session:
+                stmt = select(KlineDaily).where(
+                    and_(
+                        KlineDaily.symbol == symbol,
+                        KlineDaily.trade_date >= start_date,
+                        KlineDaily.trade_date <= end_date
+                    )
+                ).order_by(KlineDaily.trade_date.asc())  # 升序，与API一致
+
+                result = await session.execute(stmt)
+                klines = result.scalars().all()
+
+                logger.debug(
+                    f"  📊 {symbol}: 从数据库读取 {len(klines)} 根K线 "
+                    f"({start_date} ~ {end_date})"
+                )
+                return list(klines)
+
+        except Exception as e:
+            logger.warning(f"  ⚠️ {symbol}: 数据库查询失败 - {e}")
+            return []
+
+    def _merge_klines(self, db_klines: List[KlineDaily], api_candles: List) -> List:
+        """
+        合并数据库K线和API K线，去重
+
+        逻辑：
+        1. 按日期去重（API数据优先，因为更准确）
+        2. 按日期升序排序
+        3. 返回统一格式
+
+        Args:
+            db_klines: 数据库K线列表
+            api_candles: API K线列表
+
+        Returns:
+            合并后的K线列表（统一为API格式）
+        """
+        try:
+            from datetime import date as datetime_date
+
+            # 转换数据库K线为字典 {date: kline}
+            db_dict = {}
+            for kline in db_klines:
+                db_dict[kline.trade_date] = kline
+
+            # 转换API K线为字典（API数据优先）
+            api_dict = {}
+            for candle in (api_candles or []):
+                # API candle 通常有 timestamp 属性
+                if hasattr(candle, 'timestamp'):
+                    trade_date = candle.timestamp.date()
+                elif hasattr(candle, 'date'):
+                    trade_date = candle.date if isinstance(candle.date, datetime_date) else candle.date.date()
+                else:
+                    continue
+                api_dict[trade_date] = candle
+
+            # 创建统一格式的K线列表
+            # 需要将数据库K线转换为类似API candle的格式
+            class CandleWrapper:
+                """包装数据库K线，使其接口与API一致"""
+                def __init__(self, kline):
+                    self.close = kline.close
+                    self.open = kline.open
+                    self.high = kline.high
+                    self.low = kline.low
+                    self.volume = kline.volume
+                    self.timestamp = datetime.combine(kline.trade_date, datetime.min.time())
+                    self.trade_date = kline.trade_date
+
+            # 合并（先用数据库数据，再用API数据覆盖）
+            all_dates = set(db_dict.keys()) | set(api_dict.keys())
+
+            merged_list = []
+            for trade_date in sorted(all_dates):
+                if trade_date in api_dict:
+                    # API数据优先
+                    merged_list.append(api_dict[trade_date])
+                elif trade_date in db_dict:
+                    # 使用数据库数据（包装为API格式）
+                    merged_list.append(CandleWrapper(db_dict[trade_date]))
+
+            logger.debug(
+                f"  🔗 合并K线: 数据库{len(db_klines)}根 + API{len(api_candles or [])}根 "
+                f"→ 总计{len(merged_list)}根（去重后）"
+            )
+
+            return merged_list
+
+        except Exception as e:
+            logger.error(f"  ❌ K线合并失败: {e}")
+            # 回退：只返回API数据
+            return api_candles or []
+
     async def _fetch_current_indicators(self, symbol: str, quote) -> Optional[Dict]:
         """
         获取标的当前的技术指标（用于退出决策）
@@ -1906,18 +2382,63 @@ class SignalGenerator:
             指标字典，如果获取失败返回None
         """
         try:
-            # 获取历史K线数据
-            end_date = datetime.now()
-            days_to_fetch = 100
-            start_date = end_date - timedelta(days=days_to_fetch)
+            # 🔥 混合模式：数据库 + API
+            candles = []
 
-            candles = await self.quote_client.get_history_candles(
-                symbol=symbol,
-                period=openapi.Period.Day,
-                adjust_type=openapi.AdjustType.NoAdjust,
-                start=start_date,
-                end=end_date
-            )
+            if self.use_db_klines and self.db:
+                # 1️⃣ 从数据库获取历史数据
+                db_klines = await self._load_klines_from_db(
+                    symbol=symbol,
+                    days=self.db_klines_history_days
+                )
+
+                # 2️⃣ 从API获取最新数据
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=self.api_klines_latest_days)
+
+                api_candles = await self.quote_client.get_history_candles(
+                    symbol=symbol,
+                    period=openapi.Period.Day,
+                    adjust_type=openapi.AdjustType.NoAdjust,
+                    start=start_date,
+                    end=end_date
+                )
+
+                # 3️⃣ 合并数据
+                if db_klines and len(db_klines) >= 30:
+                    # 数据库数据充足，使用混合模式
+                    candles = self._merge_klines(db_klines, api_candles)
+                    logger.debug(
+                        f"  ✅ {symbol}: 混合模式 - "
+                        f"数据库{len(db_klines)}根 + API{len(api_candles or [])}根"
+                    )
+                else:
+                    # 数据库数据不足，回退到纯API模式
+                    logger.debug(
+                        f"  ⚠️ {symbol}: 数据库数据不足({len(db_klines)}根)，"
+                        f"回退到API模式"
+                    )
+                    # 回退：从API获取完整的100天数据
+                    end_date = datetime.now()
+                    start_date = end_date - timedelta(days=100)
+                    candles = await self.quote_client.get_history_candles(
+                        symbol=symbol,
+                        period=openapi.Period.Day,
+                        adjust_type=openapi.AdjustType.NoAdjust,
+                        start=start_date,
+                        end=end_date
+                    )
+            else:
+                # 纯API模式（混合模式未启用）
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=100)
+                candles = await self.quote_client.get_history_candles(
+                    symbol=symbol,
+                    period=openapi.Period.Day,
+                    adjust_type=openapi.AdjustType.NoAdjust,
+                    start=start_date,
+                    end=end_date
+                )
 
             if not candles or len(candles) < 30:
                 logger.debug(f"  ⚠️ {symbol}: 历史数据不足，无法计算指标")
@@ -2436,7 +2957,7 @@ class SignalGenerator:
 
                     elif action == "PARTIAL_EXIT":
                         # 🔥 分批止损：先卖出50%仓位
-                        partial_qty = int(quantity * self.settings.partial_exit_pct)
+                        partial_qty = int(float(quantity) * self.settings.partial_exit_pct)
                         if partial_qty > 0:
                             logger.warning(
                                 f"⚠️  {symbol}: 分批止损 - 先减{int(self.settings.partial_exit_pct*100)}%仓位 (评分={score:+d})\n"
@@ -2461,7 +2982,7 @@ class SignalGenerator:
                                 'indicators': indicators,  # 完整的技术指标
                                 'exit_score_details': reasons,  # 卖出评分详情
                                 'is_partial': True,  # 标记为部分平仓
-                                'remaining_qty': quantity - partial_qty,
+                                'remaining_qty': int(float(quantity)) - partial_qty,
                             })
 
                             # 🔥 记录部分平仓状态到Redis（用于观察期判断）
@@ -2471,9 +2992,9 @@ class SignalGenerator:
                                 partial_exit_data = {
                                     'timestamp': datetime.now(self.beijing_tz).isoformat(),
                                     'partial_qty': partial_qty,
-                                    'remaining_qty': quantity - partial_qty,
+                                    'remaining_qty': int(float(quantity)) - partial_qty,
                                     'exit_score': score,
-                                    'price': current_price,
+                                    'price': float(current_price),
                                 }
                                 await self.position_manager._redis.setex(
                                     partial_exit_key,
@@ -2971,6 +3492,13 @@ class SignalGenerator:
             volumes = np.array([c.volume for c in candles])
 
             # 计算指标
+            # 注意：_calculate_all_indicators 返回的是单个值，不是数组
+            # 所以我们需要直接使用这些值，而不是取[-1]
+
+            # 计算EMA（需要完整数组）
+            ema_short = TechnicalIndicators.ema(closes, 12)
+            ema_long = TechnicalIndicators.ema(closes, 26)
+
             indicators = self._calculate_all_indicators(closes, highs, lows, volumes)
 
             # 卖出信号分析
@@ -2978,24 +3506,28 @@ class SignalGenerator:
             sell_score = 0
 
             # 1. 趋势反转（下跌趋势）
-            if indicators['ema_short'][-1] < indicators['ema_long'][-1]:
-                sell_signals.append('短期均线跌破长期均线')
-                sell_score += 20
+            if len(ema_short) > 0 and len(ema_long) > 0:
+                if ema_short[-1] < ema_long[-1]:
+                    sell_signals.append('短期均线跌破长期均线')
+                    sell_score += 20
 
             # 2. MACD死叉
-            if indicators['macd'][-1] < indicators['macd_signal'][-1]:
-                sell_signals.append('MACD死叉')
-                sell_score += 15
+            if not np.isnan(indicators['macd']) and not np.isnan(indicators['macd_signal']):
+                if indicators['macd'] < indicators['macd_signal']:
+                    sell_signals.append('MACD死叉')
+                    sell_score += 15
 
             # 3. RSI超买
-            if indicators['rsi'][-1] > 70:
-                sell_signals.append(f'RSI超买({indicators["rsi"][-1]:.0f})')
-                sell_score += 10
+            if not np.isnan(indicators['rsi']):
+                if indicators['rsi'] > 70:
+                    sell_signals.append(f'RSI超买({indicators["rsi"]:.0f})')
+                    sell_score += 10
 
             # 4. 跌破布林下轨
-            if current_price < indicators['bb_lower'][-1]:
-                sell_signals.append('跌破布林下轨')
-                sell_score += 15
+            if not np.isnan(indicators['bb_lower']):
+                if current_price < indicators['bb_lower']:
+                    sell_signals.append('跌破布林下轨')
+                    sell_score += 15
 
             # 5. 成交量放大+价格下跌
             if volumes[-1] > np.mean(volumes[-20:]) * 1.5 and closes[-1] < closes[-2]:
@@ -3115,7 +3647,7 @@ class SignalGenerator:
                 # 获取所有持仓的实时价格和技术分析
                 symbols = [p['symbol'] for p in filtered_positions]
                 try:
-                    quotes = await self.quote_client.get_realtime_quotes(symbols)
+                    quotes = await self.quote_client.get_realtime_quote(symbols)
                     quote_dict = {q.symbol: q for q in quotes}
                 except Exception as e:
                     logger.warning(f"获取持仓行情失败: {e}")
@@ -3219,13 +3751,19 @@ class SignalGenerator:
 
                     analysis_msg = "\n".join(simple_lines)
 
-                    # 发送简化通知
+                    # 发送简化通知（添加限流检查）
                     if hasattr(self, 'slack') and self.slack:
-                        try:
-                            await self.slack.send(analysis_msg)
-                            logger.info(f"  ✅ 简化通知已发送到 Slack")
-                        except Exception as e:
-                            logger.warning(f"  ⚠️ 发送 Slack 通知失败: {e}")
+                        notification_key = f"buying_power_insufficient:{symbol}"
+                        should_send, skip_reason = self._should_send_slack_notification(notification_key)
+
+                        if should_send:
+                            try:
+                                await self.slack.send(analysis_msg)
+                                logger.info(f"  ✅ 简化通知已发送到 Slack")
+                            except Exception as e:
+                                logger.warning(f"  ⚠️ 发送 Slack 通知失败: {e}")
+                        else:
+                            logger.debug(f"  ⏭️ 跳过Slack通知: {skip_reason}")
 
                     return analysis_msg
 
@@ -3297,13 +3835,19 @@ class SignalGenerator:
 
                 analysis_msg = "\n".join(simple_lines)
 
-                # 发送简化通知
+                # 发送简化通知（添加限流检查）
                 if hasattr(self, 'slack') and self.slack:
-                    try:
-                        await self.slack.send(analysis_msg)
-                        logger.info(f"  ✅ 简化通知已发送到 Slack")
-                    except Exception as e:
-                        logger.warning(f"  ⚠️ 发送 Slack 通知失败: {e}")
+                    notification_key = f"buying_power_insufficient:{symbol}"
+                    should_send, skip_reason = self._should_send_slack_notification(notification_key)
+
+                    if should_send:
+                        try:
+                            await self.slack.send(analysis_msg)
+                            logger.info(f"  ✅ 简化通知已发送到 Slack")
+                        except Exception as e:
+                            logger.warning(f"  ⚠️ 发送 Slack 通知失败: {e}")
+                    else:
+                        logger.debug(f"  ⏭️ 跳过Slack通知: {skip_reason}")
 
                 return analysis_msg
 
@@ -3447,13 +3991,21 @@ class SignalGenerator:
             for pos in target_positions:
                 symbol = pos.get("symbol")
                 try:
-                    # 获取当前价格
+                    # 获取当前价格（优先使用实时行情，否则使用持仓价格）
                     quote = quote_dict.get(symbol)
-                    if not quote:
-                        logger.debug(f"    {symbol}: 无行情数据，跳过")
+                    current_price = 0
+
+                    if quote and quote.last_done:
+                        current_price = float(quote.last_done)
+                        logger.debug(f"    {symbol}: 使用实时行情价格 ${current_price:.2f}")
+                    elif pos.get("market_price"):
+                        # 🔥 Fallback: 使用持仓中的市场价格（收盘后仍可用）
+                        current_price = float(pos.get("market_price"))
+                        logger.debug(f"    {symbol}: 使用持仓市场价格 ${current_price:.2f} (无实时行情)")
+                    else:
+                        logger.warning(f"    {symbol}: 无法获取价格，跳过")
                         continue
 
-                    current_price = float(quote.last_done) if quote.last_done else 0
                     if current_price <= 0:
                         logger.debug(f"    {symbol}: 价格无效，跳过")
                         continue
@@ -3506,13 +4058,25 @@ class SignalGenerator:
                 for pos in target_positions:
                     symbol = pos.get("symbol")
                     try:
+                        # 🔥 获取当前价格（优先使用实时行情，否则使用持仓价格）
                         quote = quote_dict.get(symbol)
-                        if not quote or not quote.last_done:
+                        current_price = 0
+
+                        if quote and quote.last_done:
+                            current_price = float(quote.last_done)
+                        elif pos.get("market_price"):
+                            # Fallback: 使用持仓中的市场价格（收盘后仍可用）
+                            current_price = float(pos.get("market_price"))
+                            logger.debug(f"      {symbol}: 使用持仓价格 ${current_price:.2f} (无实时行情)")
+                        else:
+                            logger.warning(f"      {symbol}: 无法获取价格，跳过评分")
                             continue
 
-                        current_price = float(quote.last_done)
-                        cost_price = pos.get('avg_cost', current_price)
-                        quantity = pos.get('quantity', 0)
+                        if current_price <= 0:
+                            continue
+
+                        cost_price = float(pos.get('avg_cost', current_price))
+                        quantity = float(pos.get('quantity', 0))
                         market_value = current_price * quantity
                         profit_pct = (current_price - cost_price) / cost_price if cost_price > 0 else 0
 
@@ -3700,6 +4264,689 @@ class SignalGenerator:
             import traceback
             logger.debug(traceback.format_exc())
             return []
+
+    async def check_realtime_rotation(
+        self,
+        quotes,
+        account,
+        regime: str = "RANGE"
+    ) -> List[Dict]:
+        """
+        实时挪仓检查：当有高分信号但资金不足时，立即评估并卖出弱势持仓
+
+        与收盘前轮换的区别：
+        - 收盘前轮换：定时触发（15:30-16:00 或 22:00-23:59）
+        - 实时轮换：事件触发（出现高分信号但资金不足时）
+
+        Args:
+            quotes: 实时行情列表
+            account: 账户信息
+            regime: 市场状态
+
+        Returns:
+            卖出信号列表
+        """
+        rotation_signals = []
+
+        try:
+            # 检查是否启用实时挪仓
+            if not getattr(self.settings, 'realtime_rotation_enabled', True):
+                logger.debug("  ⏭️  实时挪仓未启用，跳过检查")
+                return []
+
+            # 🔥 从Redis检查是否有高分信号因资金不足而延迟或失败
+            try:
+                # 1. 获取延迟信号列表（重试队列）
+                delayed_signals = await self.signal_queue.get_delayed_signals(
+                    account=self.settings.account_id
+                )
+
+                # 2. 获取失败信号列表（失败队列中5分钟内的高分信号）
+                failed_signals = await self.signal_queue.get_failed_signals(
+                    account=self.settings.account_id,
+                    min_score=getattr(self.settings, 'realtime_rotation_min_signal_score', 60),
+                    max_age_seconds=300  # 只考虑5分钟内失败的信号
+                )
+
+                # 合并延迟信号和失败信号
+                all_pending_signals = delayed_signals + failed_signals
+
+                if not all_pending_signals:
+                    logger.debug("  ⏭️  无延迟或失败的高分信号，跳过实时挪仓检查")
+                    return []
+
+                # 筛选高分买入信号
+                high_score_pending = [
+                    s for s in all_pending_signals
+                    if s.get('score', 0) >= getattr(self.settings, 'realtime_rotation_min_signal_score', 60)
+                    and s.get('side') == 'BUY'
+                ]
+
+                if not high_score_pending:
+                    logger.debug("  ⏭️  待处理信号评分不够高，跳过实时挪仓检查")
+                    return []
+
+                # 记录信号来源
+                delayed_count = len([s for s in high_score_pending if 'retry_after' in s])
+                failed_count = len([s for s in high_score_pending if 'failed_at' in s])
+
+                logger.info(
+                    f"🔔 检测到 {len(high_score_pending)} 个高分信号因资金不足无法买入 "
+                    f"(延迟重试: {delayed_count}, 已失败: {failed_count})"
+                )
+
+                # 保存待处理信号以便后续恢复
+                self._pending_rotation_signals = high_score_pending
+
+            except Exception as e:
+                logger.debug(f"  ⚠️  检查待处理信号失败: {e}")
+                return []
+
+            # 获取持仓
+            positions = account.get("positions", [])
+            if not positions:
+                logger.info("  ℹ️  当前无持仓，无法实时挪仓")
+                return []
+
+            # 构建行情字典
+            quote_dict = {q.symbol: q for q in quotes}
+
+            # 准备技术指标数据
+            technical_data = {}
+
+            for pos in positions:
+                symbol = pos.get("symbol")
+                try:
+                    quote = quote_dict.get(symbol)
+                    if not quote or not quote.last_done:
+                        continue
+
+                    # 获取技术指标（尝试从缓存或快速计算）
+                    indicators = await self._fetch_current_indicators(symbol, quote)
+                    if indicators:
+                        technical_data[symbol] = indicators
+                    else:
+                        technical_data[symbol] = {}
+
+                except Exception as e:
+                    logger.debug(f"    {symbol}: 获取数据失败 - {e}")
+                    continue
+
+            # 分析每个延迟的高分信号
+            for delayed_signal in high_score_pending:
+                signal_symbol = delayed_signal.get('symbol')
+                signal_score = delayed_signal.get('score', 0)
+                signal_market = "HK" if signal_symbol.endswith(".HK") else "US" if signal_symbol.endswith(".US") else "A"
+
+                logger.info(f"\n🎯 分析高分延迟信号: {signal_symbol} (评分={signal_score})")
+
+                # 只检查同市场的持仓（释放同币种资金）
+                same_market_positions = [
+                    p for p in positions
+                    if (signal_market == "HK" and p.get("symbol", "").endswith(".HK"))
+                    or (signal_market == "US" and p.get("symbol", "").endswith(".US"))
+                    or (signal_market == "A" and p.get("symbol", "").endswith(".SH") or p.get("symbol", "").endswith(".SZ"))
+                ]
+
+                if not same_market_positions:
+                    logger.info(f"  ℹ️  {signal_market}市场无持仓，无法挪仓")
+                    continue
+
+                logger.info(f"  📊 {signal_market}市场持仓: {len(same_market_positions)}个")
+
+                # 评估持仓质量（使用简化评分逻辑）
+                from dataclasses import dataclass
+
+                @dataclass
+                class PositionScore:
+                    symbol: str
+                    rotation_score: float
+                    profit_pct: float
+                    market_value: float
+                    reason: str
+                    quantity: int
+
+                scored_positions = []
+
+                for pos in same_market_positions:
+                    symbol = pos.get("symbol")
+                    try:
+                        quote = quote_dict.get(symbol)
+                        if not quote or not quote.last_done:
+                            continue
+
+                        current_price = float(quote.last_done)
+                        cost_price = float(pos.get('avg_cost', current_price))
+                        quantity = float(pos.get('quantity', 0))
+                        market_value = current_price * quantity
+                        profit_pct = (current_price - cost_price) / cost_price if cost_price > 0 else 0
+
+                        # 计算评分（使用与check_pre_close_rotation相同的逻辑）
+                        indicators = technical_data.get(symbol, {})
+
+                        score = 50  # 基准分
+
+                        # 盈亏调整
+                        if profit_pct < -0.10:
+                            score += 30  # 大幅亏损
+                        elif profit_pct < -0.05:
+                            score += 20
+                        elif profit_pct < 0:
+                            score += 10
+                        elif profit_pct > 0.15:
+                            score -= 30  # 高盈利
+                        elif profit_pct > 0.10:
+                            score -= 20
+                        elif profit_pct > 0.05:
+                            score -= 10
+
+                        # 技术指标调整
+                        if indicators.get('trend') == 'down':
+                            score += 20
+                        elif indicators.get('trend') == 'up':
+                            score -= 20
+
+                        if indicators.get('macd_signal') == 'bearish':
+                            score += 15
+                        elif indicators.get('macd_signal') == 'bullish':
+                            score -= 15
+
+                        reason_parts = []
+                        if profit_pct < 0:
+                            reason_parts.append(f"亏损{profit_pct:.1%}")
+                        else:
+                            reason_parts.append(f"盈利{profit_pct:.1%}")
+
+                        if indicators.get('trend'):
+                            reason_parts.append(f"{indicators['trend']}趋势")
+
+                        reason = ", ".join(reason_parts) if reason_parts else "实时挪仓"
+
+                        scored_positions.append(PositionScore(
+                            symbol=symbol,
+                            rotation_score=score,
+                            profit_pct=profit_pct,
+                            market_value=market_value,
+                            reason=reason,
+                            quantity=quantity
+                        ))
+
+                    except Exception as e:
+                        logger.debug(f"    {symbol}: 评分计算失败 - {e}")
+                        continue
+
+                if not scored_positions:
+                    logger.info(f"  ℹ️  无法评估持仓，跳过挪仓")
+                    continue
+
+                # 按评分排序（评分越高越弱）
+                scored_positions.sort(key=lambda x: x.rotation_score, reverse=True)
+
+                # 🔥 只卖出评分显著低于新信号的持仓
+                min_score_diff = getattr(self.settings, 'realtime_rotation_min_score_diff', 10)
+                max_rotations = getattr(self.settings, 'realtime_rotation_max_positions', 1)  # 默认每次只卖1个
+
+                weak_positions = [
+                    p for p in scored_positions
+                    if (signal_score - p.rotation_score) >= min_score_diff
+                ]
+
+                if not weak_positions:
+                    logger.info(
+                        f"  ✅ 无弱势持仓（需新信号评分高出持仓至少{min_score_diff}分）"
+                    )
+                    logger.info(f"  📊 最弱持仓评分: {scored_positions[0].rotation_score:.0f} vs 新信号: {signal_score}")
+                    continue
+
+                # 取最弱的N个持仓
+                positions_to_sell = weak_positions[:max_rotations]
+
+                logger.info(
+                    f"  🎯 找到 {len(positions_to_sell)} 个弱势持仓可挪仓 "
+                    f"(新信号{signal_score}分 vs 持仓{positions_to_sell[0].rotation_score:.0f}分)"
+                )
+
+                # 生成卖出信号
+                for rot_pos in positions_to_sell:
+                    # 检查是否已有卖出订单（避免重复）
+                    if rot_pos.symbol in self.sold_today:
+                        logger.debug(f"    {rot_pos.symbol}: 今日已有卖出订单，跳过")
+                        continue
+
+                    # 获取当前价格
+                    quote = quote_dict.get(rot_pos.symbol)
+                    current_price = float(quote.last_done) if quote and quote.last_done else 0
+
+                    if current_price <= 0:
+                        logger.debug(f"    {rot_pos.symbol}: 价格无效，跳过")
+                        continue
+
+                    # 构建卖出信号
+                    rotation_signal = {
+                        'symbol': rot_pos.symbol,
+                        'type': 'REALTIME_ROTATION_SELL',  # 标记为实时轮换卖出
+                        'side': 'SELL',
+                        'price': current_price,
+                        'quantity': rot_pos.quantity,
+                        'reason': f"实时挪仓释放资金 (为{signal_symbol}腾出资金, 评分{rot_pos.rotation_score:.0f}<{signal_score}, {rot_pos.reason})",
+                        'score': 95,  # 实时轮换优先级更高
+                        'priority': 95,
+                        'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                        'metadata': {
+                            'rotation_score': rot_pos.rotation_score,
+                            'profit_pct': rot_pos.profit_pct,
+                            'market_value': rot_pos.market_value,
+                            'rotation_reason': rot_pos.reason,
+                            'auto_rotation': True,
+                            'realtime_rotation': True,  # 标记为实时轮换
+                            'target_signal': signal_symbol,  # 为哪个信号释放资金
+                            'target_score': signal_score
+                        }
+                    }
+
+                    rotation_signals.append(rotation_signal)
+
+                    logger.success(
+                        f"    ✅ {rot_pos.symbol}: 生成实时挪仓信号 "
+                        f"(评分={rot_pos.rotation_score:.0f}, 盈亏={rot_pos.profit_pct:+.1%}, "
+                        f"市值=${rot_pos.market_value:,.0f})"
+                    )
+
+            # 发送通知
+            if rotation_signals and hasattr(self, 'slack') and self.slack:
+                notification_lines = [
+                    f"🔄 **实时挪仓触发**",
+                    f"",
+                    f"检测到高分信号因资金不足延迟，立即释放资金：",
+                    f""
+                ]
+
+                for i, signal in enumerate(rotation_signals[:3], 1):
+                    metadata = signal.get('metadata', {})
+                    profit_pct = metadata.get('profit_pct', 0)
+                    market_value = metadata.get('market_value', 0)
+                    target_signal = metadata.get('target_signal', 'N/A')
+
+                    profit_emoji = "🟢" if profit_pct > 0 else "🔴"
+
+                    notification_lines.append(
+                        f"{i}. 卖出 {signal['symbol']} - ${signal['price']:.2f} "
+                        f"{profit_emoji} {profit_pct:+.1%} "
+                        f"(市值${market_value:,.0f})"
+                    )
+                    notification_lines.append(f"   → 为 {target_signal} 释放资金")
+
+                if len(rotation_signals) > 3:
+                    notification_lines.append(f"   ... 还有 {len(rotation_signals)-3} 个")
+
+                notification_lines.extend([
+                    f"",
+                    f"⏰ 触发时间: {datetime.now(self.beijing_tz).strftime('%H:%M:%S')}"
+                ])
+
+                try:
+                    await self.slack.send("\n".join(notification_lines))
+                    logger.info("  ✅ 实时挪仓通知已发送")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ 发送通知失败: {e}")
+
+            # 🔥 如果生成了挪仓信号，尝试恢复失败队列中的高分信号
+            if rotation_signals and hasattr(self, '_pending_rotation_signals'):
+                recovered_count = 0
+                for signal in self._pending_rotation_signals:
+                    # 只恢复来自失败队列的信号
+                    if 'failed_at' in signal:
+                        try:
+                            success = await self.signal_queue.recover_failed_signal(signal)
+                            if success:
+                                recovered_count += 1
+                        except Exception as e:
+                            logger.warning(f"  ⚠️ 恢复失败信号 {signal.get('symbol')} 失败: {e}")
+
+                if recovered_count > 0:
+                    logger.success(f"  ✅ 已恢复 {recovered_count} 个失败信号到队列，等待重新执行")
+
+            return rotation_signals
+
+        except Exception as e:
+            logger.error(f"❌ 实时挪仓检查失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return []
+
+    async def check_urgent_sells(
+        self,
+        quotes,
+        account
+    ) -> List[Dict]:
+        """
+        检查持仓紧急度并生成自动卖出信号
+
+        当持仓技术面严重恶化（紧急度≥阈值）时，主动生成卖出信号
+
+        Args:
+            quotes: 实时行情列表
+            account: 账户信息
+
+        Returns:
+            卖出信号列表
+        """
+        urgent_signals = []
+
+        try:
+            # 检查是否启用紧急卖出
+            if not self.urgent_sell_enabled:
+                logger.debug("  ⏭️  紧急卖出未启用，跳过检查")
+                return []
+
+            # 获取持仓
+            positions = account.get("positions", [])
+            if not positions:
+                logger.debug("  ℹ️  当前无持仓，跳过紧急卖出检查")
+                return []
+
+            # 构建行情字典
+            quote_dict = {q.symbol: q for q in quotes}
+
+            # 当前时间戳（秒）
+            now_ts = datetime.now().timestamp()
+
+            logger.info(f"🚨 检查 {len(positions)} 个持仓的紧急度...")
+
+            for pos in positions:
+                symbol = pos.get("symbol")
+                try:
+                    # 检查冷却期
+                    last_check = self.urgent_sell_last_check.get(symbol, 0)
+                    if (now_ts - last_check) < self.urgent_sell_cooldown:
+                        logger.debug(f"    {symbol}: 冷却期内，跳过")
+                        continue
+
+                    # 检查是否已有卖出订单
+                    if symbol in self.sold_today:
+                        logger.debug(f"    {symbol}: 今日已卖出，跳过")
+                        continue
+
+                    # 获取当前价格
+                    quote = quote_dict.get(symbol)
+                    if not quote or not quote.last_done:
+                        logger.debug(f"    {symbol}: 无行情数据，跳过")
+                        continue
+
+                    current_price = float(quote.last_done)
+                    if current_price <= 0:
+                        logger.debug(f"    {symbol}: 价格无效，跳过")
+                        continue
+
+                    # 分析持仓技术面
+                    tech_analysis = await self._analyze_position_technical(symbol, current_price)
+
+                    # 更新检查时间
+                    self.urgent_sell_last_check[symbol] = now_ts
+
+                    # 检查紧急度
+                    urgency_score = tech_analysis.get('score', 0)
+                    action = tech_analysis.get('action', 'HOLD')
+
+                    if urgency_score >= self.urgent_sell_threshold:
+                        logger.warning(
+                            f"  🚨 {symbol}: 紧急度 {urgency_score} 分≥阈值 {self.urgent_sell_threshold}，"
+                            f"建议={action}"
+                        )
+
+                        # 获取持仓信息
+                        quantity = pos.get('quantity', 0)
+                        if quantity <= 0:
+                            logger.warning(f"    {symbol}: 持仓数量无效 ({quantity})，跳过")
+                            continue
+
+                        # 构建紧急卖出信号
+                        sell_signals = tech_analysis.get('signals', [])
+                        reason = f"技术面恶化（紧急度{urgency_score}分）: {', '.join(sell_signals[:3])}"
+
+                        urgent_signal = {
+                            'symbol': symbol,
+                            'type': 'URGENT_SELL',  # 标记为紧急卖出
+                            'side': 'SELL',
+                            'price': current_price,
+                            'quantity': quantity,
+                            'reason': reason,
+                            'score': 95,  # 紧急卖出优先级很高
+                            'priority': 95,
+                            'timestamp': datetime.now(self.beijing_tz).isoformat(),
+                            'metadata': {
+                                'urgency_score': urgency_score,
+                                'technical_signals': sell_signals,
+                                'auto_urgent_sell': True
+                            }
+                        }
+
+                        urgent_signals.append(urgent_signal)
+
+                        logger.success(
+                            f"    ✅ {symbol}: 生成紧急卖出信号 "
+                            f"(数量={quantity}, 紧急度={urgency_score})"
+                        )
+                    else:
+                        logger.debug(
+                            f"    {symbol}: 紧急度 {urgency_score} 分 < 阈值 {self.urgent_sell_threshold}，继续持有"
+                        )
+
+                except Exception as e:
+                    logger.debug(f"    {symbol}: 紧急度检查失败 - {e}")
+                    continue
+
+            # 发送通知
+            if urgent_signals and hasattr(self, 'slack') and self.slack:
+                notification_lines = [
+                    f"🚨 **紧急卖出触发**",
+                    f"",
+                    f"以下持仓技术面严重恶化，建议立即卖出：",
+                    f""
+                ]
+
+                for i, signal in enumerate(urgent_signals[:5], 1):
+                    metadata = signal.get('metadata', {})
+                    urgency = metadata.get('urgency_score', 0)
+                    signals_list = metadata.get('technical_signals', [])
+
+                    notification_lines.append(
+                        f"{i}. **{signal['symbol']}** - ${signal['price']:.2f}"
+                    )
+                    notification_lines.append(
+                        f"   紧急度: {urgency}分 | 数量: {signal['quantity']}"
+                    )
+                    notification_lines.append(
+                        f"   原因: {', '.join(signals_list[:2])}"
+                    )
+
+                if len(urgent_signals) > 5:
+                    notification_lines.append(f"   ... 还有 {len(urgent_signals)-5} 个")
+
+                notification_lines.extend([
+                    f"",
+                    f"⏰ 触发时间: {datetime.now(self.beijing_tz).strftime('%H:%M:%S')}"
+                ])
+
+                try:
+                    await self.slack.send("\n".join(notification_lines))
+                    logger.info("  ✅ 紧急卖出通知已发送")
+                except Exception as e:
+                    logger.warning(f"  ⚠️  发送通知失败: {e}")
+
+            return urgent_signals
+
+        except Exception as e:
+            logger.error(f"❌ 紧急卖出检查失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return []
+
+    async def _rotation_checker_loop(self):
+        """
+        实时挪仓和紧急卖出后台检查任务
+        每30秒检查一次，独立于主循环运行
+        """
+        logger.info("🔄 启动实时挪仓和紧急卖出后台检查任务（间隔: 30秒）")
+
+        while True:
+            try:
+                await asyncio.sleep(self._rotation_check_interval)
+
+                # 只在交易时间内检查
+                now = datetime.now(self.beijing_tz)
+
+                # 检查是否有任何市场开盘
+                hk_open = self._is_market_open_time('HK')
+                us_open = self._is_market_open_time('US')
+
+                if not (hk_open or us_open):
+                    logger.debug("⏭️  所有市场休市，跳过实时挪仓检查")
+                    continue
+
+                # 获取账户信息和实时行情
+                try:
+                    account = await self.trade_client.get_account()
+                except Exception as e:
+                    logger.debug(f"⏭️  无法获取账户信息，跳过实时挪仓检查: {e}")
+                    account = None
+
+                if not account:
+                    continue
+
+                # 获取所有持仓的实时行情
+                positions = account.get('positions', [])
+                if positions:
+                    symbols = [p['symbol'] for p in positions]
+                    quotes = await self.quote_client.get_realtime_quote(symbols)
+                else:
+                    quotes = []
+
+                cash_total = sum(float(v) if isinstance(v, (int, float)) else 0 for v in account.get('cash', {}).values()) if isinstance(account.get('cash'), dict) else float(account.get('cash', 0))
+                logger.debug(f"🔍 后台检查: 账户余额=${cash_total:,.2f}, 持仓数={len(positions)}")
+
+                # 1. 实时挪仓检查
+                rotation_signals = []
+                if getattr(self.settings, 'realtime_rotation_enabled', True):
+                    rotation_signals = await self.check_realtime_rotation(
+                        quotes=quotes,
+                        account=account,
+                        regime=getattr(self, 'current_regime', 'RANGE')
+                    )
+
+                    if rotation_signals:
+                        logger.info(f"🔔 后台检查触发实时挪仓: 生成 {len(rotation_signals)} 个卖出信号")
+                        # 发布到信号队列
+                        for signal in rotation_signals:
+                            await self.signal_queue.publish_signal(signal)
+
+                # 2. 紧急卖出检查
+                urgent_signals = []
+                if getattr(self.settings, 'urgent_sell_enabled', True):
+                    urgent_signals = await self.check_urgent_sells(
+                        quotes=quotes,
+                        account=account
+                    )
+
+                    if urgent_signals:
+                        logger.info(f"🚨 后台检查触发紧急卖出: 生成 {len(urgent_signals)} 个卖出信号")
+                        # 发布到信号队列
+                        for signal in urgent_signals:
+                            await self.signal_queue.publish_signal(signal)
+
+                if rotation_signals or urgent_signals:
+                    logger.success(
+                        f"✅ 后台检查完成: 实时挪仓={len(rotation_signals)}, "
+                        f"紧急卖出={len(urgent_signals)}"
+                    )
+
+            except asyncio.CancelledError:
+                logger.info("🛑 实时挪仓后台任务已停止")
+                break
+            except Exception as e:
+                logger.error(f"❌ 实时挪仓后台检查失败: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                # 继续运行，不中断
+
+    def _is_market_open_time(self, market: str) -> bool:
+        """
+        检查指定市场是否在交易时间
+
+        Args:
+            market: 市场代码 ('HK', 'US', 'SH', 'SZ')
+
+        Returns:
+            bool: 是否在交易时间
+        """
+        now = datetime.now(self.beijing_tz)
+        current_time = now.time()
+        weekday = now.weekday()
+
+        # 周末不交易
+        if weekday >= 5:
+            return False
+
+        if market == 'HK':
+            # 港股: 9:30-12:00, 13:00-16:00 (16:00收盘竞价，实际交易截止15:00)
+            morning = datetime.strptime("09:30", "%H:%M").time() <= current_time <= datetime.strptime("12:00", "%H:%M").time()
+            afternoon = datetime.strptime("13:00", "%H:%M").time() <= current_time <= datetime.strptime("15:00", "%H:%M").time()
+            return morning or afternoon
+        elif market == 'US':
+            # 美股: 21:30-次日4:00 (夏令时) 或 22:30-次日5:00 (冬令时)
+            # 简化处理：21:00-次日6:00
+            return current_time >= datetime.strptime("21:00", "%H:%M").time() or current_time <= datetime.strptime("06:00", "%H:%M").time()
+        elif market in ['SH', 'SZ']:
+            # A股: 9:30-11:30, 13:00-15:00
+            morning = datetime.strptime("09:30", "%H:%M").time() <= current_time <= datetime.strptime("11:30", "%H:%M").time()
+            afternoon = datetime.strptime("13:00", "%H:%M").time() <= current_time <= datetime.strptime("15:00", "%H:%M").time()
+            return morning or afternoon
+
+        return False
+
+    def _is_us_premarket(self, symbol: str) -> tuple[bool, str]:
+        """
+        检查美股是否在盘前时段
+
+        Args:
+            symbol: 股票代码
+
+        Returns:
+            tuple[bool, str]: (是否盘前, 会话类型)
+                会话类型: 'pre_market', 'regular', 'after_hours', 'closed'
+        """
+        if not symbol.endswith('.US'):
+            return False, 'n/a'
+
+        now = datetime.now(self.beijing_tz)
+        current_time = now.time()
+        weekday = now.weekday()
+
+        # 周末不交易
+        if weekday >= 5:
+            return False, 'closed'
+
+        # 美股盘前时段：16:00-21:30 北京时间 (对应美东 04:00-09:30)
+        premarket_start = datetime.strptime("16:00", "%H:%M").time()
+        premarket_end = datetime.strptime("21:30", "%H:%M").time()
+
+        # 美股常规交易：21:30-次日04:00 北京时间 (对应美东 09:30-16:00)
+        regular_start = datetime.strptime("21:30", "%H:%M").time()
+        regular_end = datetime.strptime("04:00", "%H:%M").time()
+
+        # 美股盘后时段：04:00-08:00 北京时间 (对应美东 16:00-20:00)
+        afterhours_start = datetime.strptime("04:00", "%H:%M").time()
+        afterhours_end = datetime.strptime("08:00", "%H:%M").time()
+
+        # 判断时段
+        if premarket_start <= current_time < premarket_end:
+            return True, 'pre_market'
+        elif current_time >= regular_start or current_time < regular_end:
+            return False, 'regular'
+        elif afterhours_start <= current_time < afterhours_end:
+            return False, 'after_hours'
+        else:
+            return False, 'closed'
 
 
 async def main(account_id: str | None = None):

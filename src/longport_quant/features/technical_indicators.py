@@ -10,6 +10,13 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+try:
+    import talib
+    TALIB_AVAILABLE = True
+except ImportError:
+    TALIB_AVAILABLE = False
+    logger.warning("TA-Lib not available, falling back to numpy implementations")
+
 
 @dataclass
 class IndicatorBatchRequest:
@@ -178,6 +185,14 @@ class TechnicalIndicators:
         if len(prices) < period:
             return np.full(len(prices), np.nan)
 
+        # Use TA-Lib if available (faster and more accurate)
+        if TALIB_AVAILABLE:
+            try:
+                return talib.EMA(prices, timeperiod=period)
+            except Exception as e:
+                logger.debug(f"TA-Lib EMA failed, falling back to numpy: {e}")
+
+        # Fallback to numpy implementation
         alpha = 2 / (period + 1)
         ema = np.full(len(prices), np.nan)
 
