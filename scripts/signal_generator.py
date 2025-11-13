@@ -1690,8 +1690,18 @@ class SignalGenerator:
                             if account and getattr(self.settings, 'timezone_rotation_enabled', True):
                                 rotation_signals = await self.check_pre_close_rotation(quotes, account, regime)
 
-                                # 发送轮换信号到队列
+                                # 发送轮换信号到队列（带去重检查）
                                 for rotation_signal in rotation_signals:
+                                    symbol = rotation_signal.get('symbol')
+                                    signal_type = rotation_signal.get('type')
+
+                                    # 🔥 去重检查：避免重复提交相同的收盘轮换信号
+                                    if await self.signal_queue.has_pending_signal(symbol, signal_type):
+                                        logger.debug(
+                                            f"  ⏭️  {symbol}: 队列中已有{signal_type}信号，跳过"
+                                        )
+                                        continue
+
                                     success = await self.signal_queue.publish_signal(rotation_signal)
                                     if success:
                                         logger.success(
@@ -4929,9 +4939,28 @@ class SignalGenerator:
 
                     if rotation_signals:
                         logger.info(f"🔔 后台检查触发实时挪仓: 生成 {len(rotation_signals)} 个卖出信号")
-                        # 发布到信号队列
+                        # 发布到信号队列（带去重检查）
+                        published_count = 0
                         for signal in rotation_signals:
+                            symbol = signal.get('symbol')
+                            signal_type = signal.get('type')
+
+                            # 🔥 去重检查：避免重复提交相同的轮换信号
+                            if await self.signal_queue.has_pending_signal(symbol, signal_type):
+                                logger.debug(
+                                    f"  ⏭️  {symbol}: 队列中已有{signal_type}信号，跳过"
+                                )
+                                continue
+
                             await self.signal_queue.publish_signal(signal)
+                            published_count += 1
+
+                        if published_count > 0:
+                            logger.info(f"  ✅ 已发布 {published_count}/{len(rotation_signals)} 个新信号")
+                        if published_count < len(rotation_signals):
+                            logger.debug(
+                                f"  ⏭️  跳过 {len(rotation_signals) - published_count} 个重复信号"
+                            )
 
                 # 2. 紧急卖出检查
                 urgent_signals = []
@@ -4943,9 +4972,28 @@ class SignalGenerator:
 
                     if urgent_signals:
                         logger.info(f"🚨 后台检查触发紧急卖出: 生成 {len(urgent_signals)} 个卖出信号")
-                        # 发布到信号队列
+                        # 发布到信号队列（带去重检查）
+                        published_count = 0
                         for signal in urgent_signals:
+                            symbol = signal.get('symbol')
+                            signal_type = signal.get('type')
+
+                            # 🔥 去重检查：避免重复提交相同的紧急卖出信号
+                            if await self.signal_queue.has_pending_signal(symbol, signal_type):
+                                logger.debug(
+                                    f"  ⏭️  {symbol}: 队列中已有{signal_type}信号，跳过"
+                                )
+                                continue
+
                             await self.signal_queue.publish_signal(signal)
+                            published_count += 1
+
+                        if published_count > 0:
+                            logger.info(f"  ✅ 已发布 {published_count}/{len(urgent_signals)} 个新信号")
+                        if published_count < len(urgent_signals):
+                            logger.debug(
+                                f"  ⏭️  跳过 {len(urgent_signals) - published_count} 个重复信号"
+                            )
 
                 if rotation_signals or urgent_signals:
                     logger.success(
