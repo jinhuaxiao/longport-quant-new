@@ -3456,6 +3456,42 @@ class SignalGenerator:
             # 出错时继续生成信号
             return True, None
 
+    def _convert_sell_to_holding_score(self, sell_score: int) -> int:
+        """
+        将卖出评分转换为持有评分（改进版）
+
+        核心改进：避免简单的 100-x 反向转换，采用非线性映射
+
+        逻辑：
+        - 卖出评分0-20（无明显卖出信号）→ 持有评分60-80（中性持仓）
+        - 卖出评分20-40（有一些卖出信号）→ 持有评分40-60（中性偏弱）
+        - 卖出评分40-60（达到卖出阈值）→ 持有评分20-40（弱势持仓）
+        - 卖出评分60+（强烈卖出信号）→ 持有评分0-20（极弱持仓）
+
+        设计原则：
+        1. "无卖出信号" ≠ "优质持仓"，最多给到中性偏好(60-80分)
+        2. 与买入评分的量级接近，使两者可比（买入评分主要在30-80区间）
+        3. 非线性映射，避免过度夸大持仓质量
+
+        Args:
+            sell_score: 卖出评分（0-100+）
+
+        Returns:
+            持有评分（0-100）
+        """
+        if sell_score >= 60:
+            # 强烈卖出信号：持有评分0-20
+            return max(0, 20 - (sell_score - 60) // 2)
+        elif sell_score >= 40:
+            # 达到卖出阈值：持有评分20-40
+            return 40 - (sell_score - 40)
+        elif sell_score >= 20:
+            # 有一些卖出信号：持有评分40-60
+            return 60 - (sell_score - 20)
+        else:
+            # 无明显卖出信号：持有评分60-80（中性，不是优质）
+            return 80 - sell_score
+
     async def _analyze_position_technical(self, symbol: str, current_price: float) -> Dict:
         """
         对单个持仓进行技术分析，判断是否应该卖出
@@ -3711,11 +3747,43 @@ class SignalGenerator:
                 # 按卖出紧急度排序（分数高的排前面）
                 positions_sorted = sorted(positions_with_analysis, key=lambda x: x['tech']['score'], reverse=True)
 
-                # 🔥 智能判断：是否有挪仓机会（有建议卖出的持仓）
+                # 🔥 智能判断：是否有挪仓机会
+                # 判断逻辑：
+                # 1. 持仓技术面弱势（action='SELL'，卖出评分≥40）
+                # 2. 账户使用融资 + 新信号评分较高（≥50）+ 有持仓评分可能较低
+
                 sell_positions = [p for p in positions_sorted if p['tech']['action'] == 'SELL']
 
+                # 🔥 新增：融资账户机会成本分析
+                # 如果账户使用了融资（可用资金为负）且有新买入信号，考虑轮换机会
+                buy_power = float(buy_power_info.get(target_currency, 0))
+                using_margin = buy_power < 0 or float(cash_info.get(target_currency, 0)) < 0
+
+                # 机会成本分析：即使持仓技术面良好，但新信号更优，也提示轮换
+                opportunity_cost_positions = []
+                if using_margin and signal_score >= 50:  # 新信号至少50分
+                    # 寻找评分低于新信号的持仓（考虑机会成本）
+                    # 注意：持仓的"卖出评分"高表示更应该卖，我们需要找"持有评分"低的
+                    # 使用改进的持有评分计算（非线性映射，避免过度夸大持仓质量）
+                    for p in positions_with_analysis:
+                        sell_score = p['tech']['score']
+                        holding_score = self._convert_sell_to_holding_score(sell_score)
+
+                        # 记录详细评分对比（用于调试）
+                        logger.debug(
+                            f"    {p['symbol']}: 卖出评分{sell_score} → 持有评分{holding_score} "
+                            f"(vs 新信号{signal_score})"
+                        )
+
+                        # 如果新信号评分高于持有评分20分以上，考虑轮换
+                        if signal_score > holding_score + 20:
+                            opportunity_cost_positions.append(p)
+
+                # 合并两类可卖出持仓
+                potential_sell_positions = list(set(sell_positions + opportunity_cost_positions))
+
                 # 如果没有挪仓机会，生成简化通知
-                if not sell_positions:
+                if not potential_sell_positions:
                     logger.info(f"  💡 {target_currency}持仓技术面良好，无挪仓机会，发送简化通知")
 
                     # 简化通知：只显示信号分析 + 简化账户状态
@@ -3767,8 +3835,13 @@ class SignalGenerator:
 
                     return analysis_msg
 
-                # 有挪仓机会，显示完整分析（保持原逻辑）
-                logger.info(f"  💡 发现{len(sell_positions)}个可挪仓持仓，发送完整分析")
+                # 有挪仓机会，显示完整分析
+                weak_count = len(sell_positions)
+                opportunity_count = len(opportunity_cost_positions)
+                logger.info(
+                    f"  💡 发现{len(potential_sell_positions)}个可挪仓持仓 "
+                    f"(技术面弱势{weak_count}个, 机会成本{opportunity_count}个)"
+                )
 
                 # 显示持仓分析
                 analysis_lines.extend([
@@ -3776,12 +3849,26 @@ class SignalGenerator:
                     f"📦 **{target_currency}持仓分析** ({len(filtered_positions)}个，按卖出紧急度排序):",
                 ])
 
+                # 🔥 优先显示可挪仓持仓
                 for i, pos in enumerate(positions_sorted[:10], 1):
                     position_pct = (pos['market_value'] / total_market_value * 100) if total_market_value > 0 else 0
+                    sell_score = pos['tech']['score']
+                    holding_score = self._convert_sell_to_holding_score(sell_score)
 
-                    # 操作建议emoji
-                    action_emoji = "🔴" if pos['tech']['action'] == 'SELL' else "🟢"
-                    action_text = "建议卖出" if pos['tech']['action'] == 'SELL' else "继续持有"
+                    # 判断是否是建议卖出的持仓
+                    is_weak = pos in sell_positions
+                    is_opportunity = pos in opportunity_cost_positions
+
+                    # 操作建议emoji和文本
+                    if is_weak:
+                        action_emoji = "🔴"
+                        action_text = f"技术面弱势，建议卖出（卖出评分{sell_score}）"
+                    elif is_opportunity:
+                        action_emoji = "🟡"
+                        action_text = f"机会成本：新信号({signal_score}) vs 持仓({holding_score:.0f})"
+                    else:
+                        action_emoji = "🟢"
+                        action_text = f"继续持有（持仓评分{holding_score:.0f}）"
 
                     # 基本信息
                     line = (
