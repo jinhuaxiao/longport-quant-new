@@ -5147,9 +5147,14 @@ class SignalGenerator:
             afternoon = datetime.strptime("13:00", "%H:%M").time() <= current_time <= datetime.strptime("16:00", "%H:%M").time()
             return morning or afternoon
         elif market == 'US':
-            # 美股: 21:30-次日4:00 (夏令时) 或 22:30-次日5:00 (冬令时)
-            # 简化处理：21:00-次日6:00
-            return current_time >= datetime.strptime("21:00", "%H:%M").time() or current_time <= datetime.strptime("06:00", "%H:%M").time()
+            # 🔥 美股交易时段（包含盘前、常规、盘后）
+            # - 盘前：04:00-09:30 ET = 17:00-22:30 北京时间（冬令时）或 16:00-21:30（夏令时）
+            # - 常规：09:30-16:00 ET = 22:30-次日05:00 北京时间（冬令时）或 21:30-次日04:00（夏令时）
+            # - 盘后：16:00-20:00 ET = 05:00-09:00 北京时间（冬令时）或 04:00-08:00（夏令时）
+            #
+            # 为了简化，使用保守范围：北京时间 16:00-次日10:00
+            # 这样可以覆盖夏令时和冬令时的所有交易时段（盘前+常规+盘后）
+            return current_time >= datetime.strptime("16:00", "%H:%M").time() or current_time <= datetime.strptime("10:00", "%H:%M").time()
         elif market in ['SH', 'SZ']:
             # A股: 9:30-11:30, 13:00-15:00
             morning = datetime.strptime("09:30", "%H:%M").time() <= current_time <= datetime.strptime("11:30", "%H:%M").time()
