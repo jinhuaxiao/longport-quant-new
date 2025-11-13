@@ -3779,8 +3779,14 @@ class SignalGenerator:
                         if signal_score > holding_score + 20:
                             opportunity_cost_positions.append(p)
 
-                # 合并两类可卖出持仓
-                potential_sell_positions = list(set(sell_positions + opportunity_cost_positions))
+                # 合并两类可卖出持仓（按 symbol 去重）
+                seen_symbols = set()
+                potential_sell_positions = []
+                for pos in (sell_positions + opportunity_cost_positions):
+                    symbol = pos['symbol']
+                    if symbol not in seen_symbols:
+                        seen_symbols.add(symbol)
+                        potential_sell_positions.append(pos)
 
                 # 如果没有挪仓机会，生成简化通知
                 if not potential_sell_positions:
