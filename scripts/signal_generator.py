@@ -5141,9 +5141,10 @@ class SignalGenerator:
             return False
 
         if market == 'HK':
-            # 港股: 9:30-12:00, 13:00-16:00 (16:00收盘竞价，实际交易截止15:00)
+            # 港股: 9:30-12:00, 13:00-16:00
+            # 注意：16:00前（含16:00收盘竞价）都属于交易时段
             morning = datetime.strptime("09:30", "%H:%M").time() <= current_time <= datetime.strptime("12:00", "%H:%M").time()
-            afternoon = datetime.strptime("13:00", "%H:%M").time() <= current_time <= datetime.strptime("15:00", "%H:%M").time()
+            afternoon = datetime.strptime("13:00", "%H:%M").time() <= current_time <= datetime.strptime("16:00", "%H:%M").time()
             return morning or afternoon
         elif market == 'US':
             # 美股: 21:30-次日4:00 (夏令时) 或 22:30-次日5:00 (冬令时)
