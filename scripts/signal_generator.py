@@ -1406,6 +1406,25 @@ class SignalGenerator:
         except Exception as e:
             logger.warning(f"⚠️ 动态订阅失败: {e}")
 
+    def _is_option_symbol(self, symbol: str) -> bool:
+        """
+        判断是否为期权标的
+
+        期权标的特征：
+        - 格式：SYMBOL + YYMMDD + C/P + STRIKE + .MARKET
+        - 例如：GOOGL260320C300000.US, AAPL250117P150000.US
+
+        Args:
+            symbol: 标的代码
+
+        Returns:
+            bool: 是否为期权标的
+        """
+        import re
+        # 匹配期权格式：任意字符 + 6位数字 + C/P + 数字 + .US/.HK等
+        pattern = r'^[A-Z]+\d{6}[CP]\d+\.(US|HK|SH|SZ)$'
+        return bool(re.match(pattern, symbol))
+
     async def _auto_sync_position_klines(self, symbols: List[str]):
         """
         自动同步新持仓标的的历史K线数据
@@ -1421,9 +1440,15 @@ class SignalGenerator:
 
         try:
             symbols_to_sync = []
+            options_skipped = []
 
             # 检查每个标的的数据库数据
             for symbol in symbols:
+                # 🔥 跳过期权标的（无法获取K线数据）
+                if self._is_option_symbol(symbol):
+                    options_skipped.append(symbol)
+                    logger.debug(f"  ⏭️  {symbol}: 期权标的，跳过K线同步")
+                    continue
                 try:
                     # 检查数据库中是否有该标的的数据
                     end_date = date.today()
@@ -1452,6 +1477,14 @@ class SignalGenerator:
                     logger.debug(f"  ⚠️ {symbol}: 检查数据库失败 - {e}")
                     symbols_to_sync.append(symbol)  # 失败也尝试同步
 
+            # 🔥 输出期权标的跳过统计
+            if options_skipped:
+                logger.info(
+                    f"⏭️  跳过 {len(options_skipped)} 个期权标的（无K线数据）: "
+                    f"{', '.join(options_skipped[:3])}"
+                    + (f" 等{len(options_skipped)}个" if len(options_skipped) > 3 else "")
+                )
+
             # 批量同步需要的标的
             if symbols_to_sync:
                 logger.info(f"🔄 开始自动同步 {len(symbols_to_sync)} 个新持仓标的的历史K线...")
@@ -1478,6 +1511,8 @@ class SignalGenerator:
                     )
                 else:
                     logger.warning(f"⚠️ K线自动同步未成功，将继续使用API模式")
+            elif not options_skipped:
+                logger.debug("  ✅ 所有持仓标的数据库均有数据，无需同步")
 
         except Exception as e:
             logger.warning(f"⚠️ 自动同步K线失败: {e}")
