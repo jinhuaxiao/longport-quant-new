@@ -489,16 +489,16 @@ class SignalQueue:
         signal: Dict,
         delay_minutes: int = 30,
         priority_penalty: int = 20,
-        max_delay_minutes: int = 30
+        max_delay_minutes: int = 2880
     ) -> bool:
         """
-        延迟重新入队（用于资金不足场景）
+        延迟重新入队（用于资金不足或市场休市场景）
 
         Args:
             signal: 信号数据
             delay_minutes: 延迟分钟数
             priority_penalty: 优先级惩罚（降低分数避免死循环）
-            max_delay_minutes: 最大延迟分钟数（默认30分钟）
+            max_delay_minutes: 最大延迟分钟数（默认2880分钟=48小时，足够覆盖周末）
 
         Returns:
             bool: 是否成功重新入队

@@ -156,6 +156,89 @@ class MarketHours:
         return False  # 未知市场默认不开盘
 
     @classmethod
+    def get_minutes_until_next_open(cls, symbol: str) -> int:
+        """
+        计算距离该标的市场下次开盘的分钟数
+
+        Args:
+            symbol: 股票代码，如 "AAPL.US", "700.HK"
+
+        Returns:
+            int: 距离下次开盘的分钟数，如果已开盘返回0
+        """
+        from datetime import timedelta
+
+        market = cls.get_market_for_symbol(symbol)
+
+        if market == "HK":
+            now = datetime.now(cls.HK_TZ)
+            # 如果已开盘，返回0
+            if cls._is_hk_trading_hours(now):
+                return 0
+
+            current_time = now.time()
+            current_weekday = now.weekday()
+
+            # 情况1：周末（周六、周日）→ 下周一09:30
+            if current_weekday >= 5:  # 周六或周日
+                days_until_monday = 7 - current_weekday
+                next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                next_open = next_open + timedelta(days=days_until_monday)
+                return int((next_open - now).total_seconds() / 60)
+
+            # 情况2：工作日中午休市（12:00-13:00）
+            if cls.HK_MORNING_CLOSE < current_time < cls.HK_AFTERNOON_OPEN:
+                next_open = now.replace(hour=13, minute=0, second=0, microsecond=0)
+                return int((next_open - now).total_seconds() / 60)
+
+            # 情况3：收盘后（16:00-23:59）→ 次日09:30
+            if current_time >= cls.HK_AFTERNOON_CLOSE:
+                next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                next_open = next_open + timedelta(days=1)
+                # 如果次日是周末，跳到下周一
+                if next_open.weekday() >= 5:
+                    days_until_monday = 7 - next_open.weekday()
+                    next_open = next_open + timedelta(days=days_until_monday)
+                return int((next_open - now).total_seconds() / 60)
+
+            # 情况4：开盘前（00:00-09:30）→ 今日09:30
+            next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            return int((next_open - now).total_seconds() / 60)
+
+        elif market == "US":
+            now = datetime.now(cls.US_TZ)
+            # 如果已开盘，返回0
+            if cls._is_us_trading_hours(now):
+                return 0
+
+            current_time = now.time()
+            current_weekday = now.weekday()
+
+            # 情况1：周末（周六、周日）→ 下周一09:30
+            if current_weekday >= 5:  # 周六或周日
+                days_until_monday = 7 - current_weekday
+                next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                next_open = next_open + timedelta(days=days_until_monday)
+                return int((next_open - now).total_seconds() / 60)
+
+            # 情况2：收盘后（16:00-23:59）→ 次日09:30
+            if current_time >= cls.US_CLOSE:
+                next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                next_open = next_open + timedelta(days=1)
+                # 如果次日是周末，跳到下周一
+                if next_open.weekday() >= 5:
+                    days_until_monday = 7 - next_open.weekday()
+                    next_open = next_open + timedelta(days=days_until_monday)
+                return int((next_open - now).total_seconds() / 60)
+
+            # 情况3：开盘前（00:00-09:30）→ 今日09:30
+            next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            return int((next_open - now).total_seconds() / 60)
+
+        # 未知市场，返回30分钟（保守估计）
+        return 30
+
+    @classmethod
     def get_market_name(cls, market: MarketType) -> str:
         """获取市场中文名称"""
         names = {

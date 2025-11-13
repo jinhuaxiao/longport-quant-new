@@ -1905,14 +1905,47 @@ class OrderExecutor:
             is_rebalancer_sell = "Regime去杠杆" in reason or "去杠杆" in reason
 
             if is_market_closed:
-                # 市场关闭：强制使用低紧急度和PASSIVE策略（限价单）
-                urgency_level = 3
-                execution_strategy = ExecutionStrategy.PASSIVE
+                # 🔥 市场关闭：延迟到开盘时间而不是立即提交
+                minutes_until_open = MarketHours.get_minutes_until_next_open(symbol)
+
+                # 如果距离开盘时间过长（>480分钟=8小时），延迟到开盘前30分钟
+                if minutes_until_open > 480:
+                    delay_minutes = minutes_until_open - 30
+                else:
+                    # 否则延迟到开盘时间
+                    delay_minutes = max(1, minutes_until_open)
+
                 logger.warning(
-                    f"  ⏸️ {symbol}: 市场休市，强制使用PASSIVE策略（限价单）\n"
-                    f"     原因: 避免开盘时市价单跳空风险\n"
-                    f"     策略: urgency={urgency_level}, strategy=PASSIVE"
+                    f"  ⏸️ {symbol}: 市场休市，信号延迟到开盘时间执行\n"
+                    f"     距离开盘: {minutes_until_open}分钟\n"
+                    f"     延迟时间: {delay_minutes}分钟\n"
+                    f"     原因: 避免休市时段挂单无法成交"
                 )
+
+                # 🔥 重新入队，延迟到开盘时间
+                await self.signal_queue.requeue_with_delay(
+                    signal=signal,
+                    delay_minutes=delay_minutes,
+                    priority_penalty=0,  # 不降低优先级
+                    max_delay_minutes=delay_minutes  # 允许更长延迟
+                )
+
+                # 发送通知
+                if self.slack:
+                    try:
+                        await self.slack.send(
+                            f"⏸️ *订单延迟通知*\n\n"
+                            f"标的: `{symbol}`\n"
+                            f"类型: {signal_type}\n"
+                            f"原因: {reason}\n"
+                            f"市场状态: 休市\n"
+                            f"延迟时间: {delay_minutes}分钟（约{delay_minutes//60}小时{delay_minutes%60}分钟）\n\n"
+                            f"✅ 订单将在开盘时自动执行"
+                        )
+                    except Exception as e:
+                        logger.debug(f"发送通知失败: {e}")
+
+                return  # 不立即提交订单
             elif is_rebalancer_sell:
                 # 去杠杆：低紧急度，强制限价单
                 urgency_level = 3
