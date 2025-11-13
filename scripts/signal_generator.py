@@ -2458,21 +2458,98 @@ class SignalGenerator:
                         f"数据库{len(db_klines)}根 + API{len(api_candles or [])}根"
                     )
                 else:
-                    # 数据库数据不足，回退到纯API模式
+                    # 🔥 数据库数据不足，尝试自动同步
                     logger.debug(
                         f"  ⚠️ {symbol}: 数据库数据不足({len(db_klines)}根)，"
-                        f"回退到API模式"
+                        f"尝试自动同步..."
                     )
-                    # 回退：从API获取完整的100天数据
-                    end_date = datetime.now()
-                    start_date = end_date - timedelta(days=100)
-                    candles = await self.quote_client.get_history_candles(
-                        symbol=symbol,
-                        period=openapi.Period.Day,
-                        adjust_type=openapi.AdjustType.NoAdjust,
-                        start=start_date,
-                        end=end_date
-                    )
+
+                    # 跳过期权标的（无法获取K线）
+                    if not self._is_option_symbol(symbol) and self.kline_service:
+                        try:
+                            # 同步100天历史数据
+                            sync_end_date = date.today()
+                            sync_start_date = sync_end_date - timedelta(days=100)
+
+                            results = await self.kline_service.sync_daily_klines(
+                                symbols=[symbol],
+                                start_date=sync_start_date,
+                                end_date=sync_end_date
+                            )
+
+                            synced_count = results.get(symbol, 0)
+                            if synced_count > 0:
+                                logger.info(
+                                    f"  ✅ {symbol}: 自动同步完成，新增 {synced_count} 条K线"
+                                )
+
+                                # 同步后重新读取数据库
+                                db_klines = await self._load_klines_from_db(
+                                    symbol=symbol,
+                                    days=self.db_klines_history_days
+                                )
+
+                                if db_klines and len(db_klines) >= 30:
+                                    # 同步成功，使用混合模式
+                                    candles = self._merge_klines(db_klines, api_candles)
+                                    logger.debug(
+                                        f"  ✅ {symbol}: 同步后混合模式 - "
+                                        f"数据库{len(db_klines)}根 + API{len(api_candles or [])}根"
+                                    )
+                                else:
+                                    # 同步后仍不足，回退到API
+                                    logger.debug(
+                                        f"  ⚠️ {symbol}: 同步后数据仍不足，回退到API模式"
+                                    )
+                                    end_date = datetime.now()
+                                    start_date = end_date - timedelta(days=100)
+                                    candles = await self.quote_client.get_history_candles(
+                                        symbol=symbol,
+                                        period=openapi.Period.Day,
+                                        adjust_type=openapi.AdjustType.NoAdjust,
+                                        start=start_date,
+                                        end=end_date
+                                    )
+                            else:
+                                # 同步失败，回退到API
+                                logger.debug(f"  ⚠️ {symbol}: 自动同步失败，回退到API模式")
+                                end_date = datetime.now()
+                                start_date = end_date - timedelta(days=100)
+                                candles = await self.quote_client.get_history_candles(
+                                    symbol=symbol,
+                                    period=openapi.Period.Day,
+                                    adjust_type=openapi.AdjustType.NoAdjust,
+                                    start=start_date,
+                                    end=end_date
+                                )
+                        except Exception as e:
+                            # 同步异常，回退到API
+                            logger.debug(f"  ⚠️ {symbol}: 自动同步异常 ({e})，回退到API模式")
+                            end_date = datetime.now()
+                            start_date = end_date - timedelta(days=100)
+                            candles = await self.quote_client.get_history_candles(
+                                symbol=symbol,
+                                period=openapi.Period.Day,
+                                adjust_type=openapi.AdjustType.NoAdjust,
+                                start=start_date,
+                                end=end_date
+                            )
+                    else:
+                        # 期权标的或kline_service未初始化，直接回退到API
+                        logger.debug(
+                            f"  ⏭️ {symbol}: "
+                            + ("期权标的" if self._is_option_symbol(symbol) else "同步服务未启用")
+                            + "，回退到API模式"
+                        )
+                        end_date = datetime.now()
+                        start_date = end_date - timedelta(days=100)
+                        candles = await self.quote_client.get_history_candles(
+                            symbol=symbol,
+                            period=openapi.Period.Day,
+                            adjust_type=openapi.AdjustType.NoAdjust,
+                            start=start_date,
+                            end=end_date
+                        )
             else:
                 # 纯API模式（混合模式未启用）
                 end_date = datetime.now()
