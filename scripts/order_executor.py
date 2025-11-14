@@ -106,7 +106,13 @@ class OrderExecutor:
         self.stop_manager = StopLossManager()
 
         # 【新增】Kelly 公式计算器 - 基于历史胜率动态调整仓位
-        self.kelly_calculator = KellyCalculator(self.settings)
+        self.kelly_calculator = KellyCalculator(
+            kelly_fraction=self.settings.kelly_fraction,
+            max_position_size=self.settings.kelly_max_position,
+            min_win_rate=self.settings.kelly_min_win_rate,
+            min_trades=self.settings.kelly_min_trades,
+            lookback_days=self.settings.kelly_lookback_days
+        )
 
         # 【新增】风险评估器 - 智能决策备份条件单
         self.risk_assessor = RiskAssessor(config=self.settings.backup_orders)
