@@ -2099,10 +2099,10 @@ class SignalGenerator:
         - 趋势: 0-10分 (均线方向)
         总分: 0-100分
 
-        阈值:
-        - >= 60分: 强买入信号
-        - >= 45分: 买入信号
-        - >= 30分: 弱买入信号
+        阈值（分级买入策略）:
+        - >= 60分: 强买入信号（正常仓位）
+        - 45-59分: 试探性买入（小仓位，最多1万美金）
+        - < 45分: 不生成买入信号
         """
         score = 0
         reasons = []
@@ -2286,79 +2286,85 @@ class SignalGenerator:
             + (f" (原始分: {original_score})" if self.settings.enable_transaction_cost_penalty else "")
         )
 
-        # 判断是否生成信号
-        if score >= 30:  # 弱买入以上
-            signal_type = "STRONG_BUY" if score >= 60 else ("BUY" if score >= 45 else "WEAK_BUY")
+        # 判断是否生成信号（分级买入策略）
+        if score >= 60:
+            # 60分以上：正常仓位强买入
+            signal_type = "STRONG_BUY"
             signal_strength = score / 100.0
-
-            # 检查是否禁用WEAK_BUY信号
-            if signal_type == "WEAK_BUY" and not self.enable_weak_buy:
-                logger.info(f"  ⏭️  不生成WEAK_BUY信号 (已禁用，得分={score})")
-                return None
-
-            # 计算止损止盈（根据信号强度动态调整止损距离）
-            atr = ind.get('atr', 0)
-            if atr and atr > 0:
-                # 根据信号强度调整止损距离倍数
-                if score >= 80:
-                    stop_multiplier = 2.0  # 极强信号：更紧止损
-                elif score >= 60:
-                    stop_multiplier = 2.5  # 强信号：标准止损
-                else:
-                    stop_multiplier = 3.0  # 一般信号：宽松止损
-
-                stop_loss = current_price - (stop_multiplier * atr)
-                take_profit = current_price + (3.5 * atr)
-            else:
-                # 无ATR时使用固定百分比
-                if score >= 80:
-                    stop_loss = current_price * 0.96  # -4%
-                elif score >= 60:
-                    stop_loss = current_price * 0.95  # -5%
-                else:
-                    stop_loss = current_price * 0.93  # -7%
-                take_profit = current_price * 1.10
-
-            logger.success(
-                f"  ✅ 决策: 生成买入信号 (得分{score} >= 30)\n"
-                f"     信号类型: {signal_type}\n"
-                f"     强度: {signal_strength:.2f}\n"
-                f"     原因: {', '.join(reasons)}"
-            )
-
-            # 构造信号数据（发送到队列）
-            signal = {
-                'symbol': symbol,
-                'type': signal_type,
-                'side': 'BUY',
-                'score': score,
-                'strength': signal_strength,
-                'price': current_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'reasons': reasons,
-                'strategy': 'HYBRID',
-                'indicators': {
-                    'rsi': float(ind['rsi']),
-                    'bb_upper': float(ind['bb_upper']),
-                    'bb_middle': float(ind['bb_middle']),
-                    'bb_lower': float(ind['bb_lower']),
-                    'macd': float(ind['macd']),
-                    'macd_signal': float(ind['macd_signal']),
-                    'volume_ratio': float(volume_ratio),
-                    'sma_20': float(ind['sma_20']) if not np.isnan(ind['sma_20']) else None,
-                    'sma_50': float(ind['sma_50']) if not np.isnan(ind['sma_50']) else None,
-                    'atr': float(ind['atr']) if not np.isnan(ind['atr']) else None,
-                },
-                'timestamp': datetime.now(self.beijing_tz).isoformat(),
-                'priority': score,  # 用于队列排序
-            }
-
-            return signal
-
+            max_position_value = None  # 不限制，使用凯利公式计算
+            position_mode = "正常仓位"
+        elif score >= 45:
+            # 45-59分：小仓位试探性买入
+            signal_type = "BUY"
+            signal_strength = score / 100.0
+            max_position_value = 10000.0  # 最多1万美金
+            position_mode = "小仓位试探"
         else:
-            logger.info(f"  ⏭️  不生成信号 (得分{score} < 30)")
+            # 低于45分：不生成信号
+            logger.info(f"  ⏭️  不生成信号 (得分{score} < 45)")
             return None
+
+        # 计算止损止盈（根据信号强度动态调整止损距离）
+        atr = ind.get('atr', 0)
+        if atr and atr > 0:
+            # 根据信号强度调整止损距离倍数
+            if score >= 80:
+                stop_multiplier = 2.0  # 极强信号：更紧止损
+            elif score >= 60:
+                stop_multiplier = 2.5  # 强信号：标准止损
+            else:
+                stop_multiplier = 3.0  # 一般信号：宽松止损
+
+            stop_loss = current_price - (stop_multiplier * atr)
+            take_profit = current_price + (3.5 * atr)
+        else:
+            # 无ATR时使用固定百分比
+            if score >= 80:
+                stop_loss = current_price * 0.96  # -4%
+            elif score >= 60:
+                stop_loss = current_price * 0.95  # -5%
+            else:
+                stop_loss = current_price * 0.93  # -7%
+            take_profit = current_price * 1.10
+
+        logger.success(
+            f"  ✅ 决策: 生成买入信号 (得分{score}, {position_mode})\n"
+            f"     信号类型: {signal_type}\n"
+            f"     强度: {signal_strength:.2f}\n"
+            + (f"     最大金额: ${max_position_value:,.0f}\n" if max_position_value else "")
+            + f"     原因: {', '.join(reasons)}"
+        )
+
+        # 构造信号数据（发送到队列）
+        signal = {
+            'symbol': symbol,
+            'type': signal_type,
+            'side': 'BUY',
+            'score': score,
+            'strength': signal_strength,
+            'price': current_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'reasons': reasons,
+            'strategy': 'HYBRID',
+            'max_position_value': max_position_value,  # 小仓位限制
+            'indicators': {
+                'rsi': float(ind['rsi']),
+                'bb_upper': float(ind['bb_upper']),
+                'bb_middle': float(ind['bb_middle']),
+                'bb_lower': float(ind['bb_lower']),
+                'macd': float(ind['macd']),
+                'macd_signal': float(ind['macd_signal']),
+                'volume_ratio': float(volume_ratio),
+                'sma_20': float(ind['sma_20']) if not np.isnan(ind['sma_20']) else None,
+                'sma_50': float(ind['sma_50']) if not np.isnan(ind['sma_50']) else None,
+                'atr': float(ind['atr']) if not np.isnan(ind['atr']) else None,
+            },
+            'timestamp': datetime.now(self.beijing_tz).isoformat(),
+            'priority': score,  # 用于队列排序
+        }
+
+        return signal
 
     async def _load_klines_from_db(self, symbol: str, days: int = 90) -> List[KlineDaily]:
         """

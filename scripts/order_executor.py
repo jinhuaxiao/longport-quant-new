@@ -2056,10 +2056,21 @@ class OrderExecutor:
         计算动态预算（基于信号强度和风险）
 
         较高评分的信号分配更多资金
+
+        支持max_position_value限制（用于小仓位试探性买入）
         """
+        # 🔥 优先检查小仓位限制（45-59分的试探性买入）
+        max_position_value = signal.get('max_position_value')
+        if max_position_value is not None:
+            logger.info(f"  🎯 小仓位试探: 最大金额限制=${max_position_value:,.2f}")
+
         if not self.use_adaptive_budget:
             # 如果不使用动态预算，返回固定金额
-            return 10000.0
+            fixed_budget = 10000.0
+            # 如果有小仓位限制，取较小值
+            if max_position_value is not None:
+                return min(fixed_budget, max_position_value)
+            return fixed_budget
 
         score = signal.get('score', 0)
         symbol = signal.get('symbol', '')
@@ -2211,6 +2222,13 @@ class OrderExecutor:
                 f"调整为${effective_cap:,.2f}"
             )
             dynamic_budget = effective_cap
+
+        # 🔥 应用小仓位限制（如果有）
+        if max_position_value is not None and dynamic_budget > max_position_value:
+            logger.info(
+                f"  🎯 应用小仓位限制: ${dynamic_budget:,.2f} → ${max_position_value:,.2f}"
+            )
+            dynamic_budget = max_position_value
 
         logger.debug(
             f"  动态预算计算: 评分={score}, 预算比例={budget_pct:.2%}, "
