@@ -18,8 +18,9 @@ class MultiChannelNotifier:
         self,
         slack_webhook_url: str | None = None,
         discord_webhook_url: str | None = None,
+        enable_slack: bool = True,
     ) -> None:
-        self._slack = SlackNotifier(slack_webhook_url) if slack_webhook_url else None
+        self._slack = SlackNotifier(slack_webhook_url) if (slack_webhook_url and enable_slack) else None
         self._discord = DiscordNotifier(discord_webhook_url) if discord_webhook_url else None
 
         # Log which channels are enabled
@@ -33,6 +34,9 @@ class MultiChannelNotifier:
             logger.info(f"✅ 通知已启用: {', '.join(channels)}")
         else:
             logger.warning("⚠️ 未配置任何通知渠道")
+
+        if slack_webhook_url and not enable_slack:
+            logger.info("⚠️ 已配置Slack Webhook，但根据设置禁用了Slack通知")
 
     async def __aenter__(self) -> "MultiChannelNotifier":
         """Enter async context manager."""

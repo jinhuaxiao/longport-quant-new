@@ -29,7 +29,8 @@ class EnhancedTradingStrategy:
         self.settings = get_settings()
         self.beijing_tz = ZoneInfo('Asia/Shanghai')
         self.enable_trading = enable_trading  # 是否真实下单
-        self.enable_slack = enable_slack      # 是否发送Slack通知
+        settings_flag = bool(getattr(self.settings, 'slack_enabled', True))
+        self.enable_slack = enable_slack and settings_flag      # 是否发送Slack通知
         self.slack = None
         self.use_builtin_watchlist = use_builtin_watchlist
 

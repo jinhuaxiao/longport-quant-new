@@ -246,9 +246,12 @@ class AdvancedTechnicalTrader:
         self.websocket_enabled = False  # WebSocket订阅标志
 
         # 初始化客户端
+        slack_enabled = bool(getattr(self.settings, 'slack_enabled', True))
+        slack_webhook = self.settings.slack_webhook_url if (self.settings.slack_webhook_url and slack_enabled) else None
+
         async with QuoteDataClient(self.settings) as quote_client, \
                    LongportTradingClient(self.settings) as trade_client, \
-                   SlackNotifier(self.settings.slack_webhook_url) as slack:
+                   SlackNotifier(slack_webhook) as slack:
 
             self.quote_client = quote_client
             self.trade_client = trade_client

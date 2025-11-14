@@ -121,6 +121,7 @@ class Settings(BaseSettings):
     log_path: Path = Field(Path("logs/app.log"), alias="LOG_PATH")
 
     health_port: int = Field(8080, alias="HEALTHCHECK_PORT")
+    slack_enabled: bool = Field(True, alias="SLACK_ENABLED")
     slack_webhook_url: HttpUrl | None = Field(None, alias="SLACK_WEBHOOK_URL")
     discord_webhook_url: HttpUrl | None = Field(None, alias="DISCORD_WEBHOOK_URL")
 

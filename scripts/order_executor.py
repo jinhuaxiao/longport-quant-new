@@ -46,6 +46,8 @@ from longport_quant.persistence.order_manager import OrderManager
 from longport_quant.persistence.stop_manager import StopLossManager
 from longport_quant.persistence.position_manager import RedisPositionManager
 from longport_quant.persistence.db import DatabaseSessionManager
+from longport_quant.persistence.models import SecurityUniverse, SecurityStatic
+from sqlalchemy import select
 from datetime import datetime
 
 
@@ -157,9 +159,14 @@ class OrderExecutor:
                 self.trade_client = trade_client
 
                 # 初始化通知（支持Slack和Discord）
+                slack_enabled = bool(getattr(self.settings, 'slack_enabled', True))
                 slack_url = str(self.settings.slack_webhook_url) if self.settings.slack_webhook_url else None
                 discord_url = str(self.settings.discord_webhook_url) if self.settings.discord_webhook_url else None
-                self.slack = MultiChannelNotifier(slack_webhook_url=slack_url, discord_webhook_url=discord_url)
+                self.slack = MultiChannelNotifier(
+                    slack_webhook_url=slack_url,
+                    discord_webhook_url=discord_url,
+                    enable_slack=slack_enabled
+                )
 
                 # 🔥 连接Redis持仓管理器
                 await self.position_manager.connect()
@@ -2399,6 +2406,58 @@ class OrderExecutor:
         logger.debug(f"  💰 下单价计算: {side}, ${order_price:.2f}")
         return order_price
 
+    async def _get_security_name_cn(self, symbol: str) -> Optional[str]:
+        """
+        查询股票中文名称（仅港股）
+
+        Args:
+            symbol: 股票代码
+
+        Returns:
+            中文名称，如果不是港股或查询失败则返回None
+        """
+        if ".HK" not in symbol:
+            return None  # 仅处理港股
+
+        try:
+            if hasattr(self, 'db') and self.db:
+                async with self.db.session() as session:
+                    # 优先查询 SecurityUniverse
+                    result = await session.execute(
+                        select(SecurityUniverse).where(SecurityUniverse.symbol == symbol)
+                    )
+                    security = result.scalar_one_or_none()
+                    if security and security.name_cn:
+                        return security.name_cn
+
+                    # 备选：查询 SecurityStatic
+                    result = await session.execute(
+                        select(SecurityStatic).where(SecurityStatic.symbol == symbol)
+                    )
+                    security_static = result.scalar_one_or_none()
+                    if security_static and security_static.name_cn:
+                        return security_static.name_cn
+
+            return None
+        except Exception as e:
+            logger.debug(f"查询中文名称失败 {symbol}: {e}")
+            return None
+
+    def _format_symbol_with_name(self, symbol: str, name_cn: Optional[str]) -> str:
+        """
+        格式化股票代码（带中文名称）
+
+        Args:
+            symbol: 股票代码
+            name_cn: 中文名称（可选）
+
+        Returns:
+            格式化后的字符串，如 "0700.HK (腾讯控股)" 或 "AAPL.US"
+        """
+        if name_cn and ".HK" in symbol:
+            return f"{symbol} ({name_cn})"
+        return symbol
+
     async def _send_buy_notification(
         self,
         symbol: str,
@@ -2458,10 +2517,14 @@ class OrderExecutor:
                 for reason in reasons:
                     reasons_text += f"   • {reason}\n"
 
+            # 查询并格式化标的名称（港股显示中文名）
+            name_cn = await self._get_security_name_cn(symbol)
+            symbol_display = self._format_symbol_with_name(symbol, name_cn)
+
             message = (
                 f"{emoji} *开仓订单已提交*\n\n"
                 f"📋 订单ID: `{order.get('order_id', 'N/A')}`\n"
-                f"📊 标的: *{symbol}*\n"
+                f"📊 标的: *{symbol_display}*\n"
                 f"📘 策略: `{strategy_name}`\n"
                 f"💯 信号类型: {signal_type}\n"
                 f"⭐ 综合评分: *{score}/100*\n\n"
@@ -2529,11 +2592,15 @@ class OrderExecutor:
 
             emoji = "🛑" if "止损" in reason else ("🎯" if "止盈" in reason else "💵")
 
+            # 查询并格式化标的名称（港股显示中文名）
+            name_cn = await self._get_security_name_cn(symbol)
+            symbol_display = self._format_symbol_with_name(symbol, name_cn)
+
             # 基础信息
             message = (
                 f"{emoji} *平仓订单已提交*\n\n"
                 f"📋 订单ID: `{order.get('order_id', 'N/A')}`\n"
-                f"📊 标的: *{symbol}*\n"
+                f"📊 标的: *{symbol_display}*\n"
                 f"📘 策略: `{strategy_name}`\n"
                 f"💡 原因: {reason}\n"
                 f"⭐ 评分: {score}/100\n\n"

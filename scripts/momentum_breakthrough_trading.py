@@ -32,7 +32,8 @@ class EnhancedTradingStrategy:
         self.newyork_tz = ZoneInfo('America/New_York')
 
         self.enable_trading = enable_trading
-        self.enable_slack = enable_slack
+        settings_flag = bool(getattr(self.settings, 'slack_enabled', True))
+        self.enable_slack = enable_slack and settings_flag
         self.slack = None
         self.use_builtin_watchlist = use_builtin_watchlist
         self.limit_positions = limit_positions  # 是否限制持仓数量

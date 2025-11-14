@@ -174,6 +174,8 @@ class SmartOrderRouter:
         """
         获取股票的手数（买卖单位/Board Lot）
 
+        查询优先级: 缓存 > API > 数据库 > 默认值
+
         Args:
             symbol: 股票代码
 
@@ -184,35 +186,65 @@ class SmartOrderRouter:
         if symbol in self._lot_size_cache:
             return self._lot_size_cache[symbol]
 
+        lot_size = None
+
         # 尝试从API获取
         if self.quote_client:
             try:
                 static_info = await self.quote_client.get_static_info([symbol])
                 if static_info and len(static_info) > 0:
-                    lot_size = getattr(static_info[0], 'board_lot', None)
-                    if lot_size and lot_size > 0:
-                        self._lot_size_cache[symbol] = lot_size
-                        logger.debug(f"  📊 {symbol} 手数: {lot_size}股/手 (来自API)")
-                        return lot_size
-                    else:
-                        # 🔥 API返回但board_lot为空或无效
-                        logger.warning(f"⚠️ {symbol} API返回static_info但board_lot无效: {lot_size}")
+                    info = static_info[0]
+
+                    # 🔥 修复：尝试多个可能的属性名
+                    for attr_name in ['board_lot', 'lot_size', 'boardLot']:
+                        lot_size = getattr(info, attr_name, None)
+                        if lot_size and lot_size > 0:
+                            self._lot_size_cache[symbol] = lot_size
+                            logger.info(f"  📊 {symbol} 手数(API): {lot_size}股/手")
+                            return lot_size
+
+                    # 所有属性都无效
+                    logger.warning(
+                        f"⚠️ {symbol} API返回但board_lot/lot_size无效，可用属性: "
+                        f"{[(k,v) for k,v in vars(info).items() if 'lot' in k.lower()]}"
+                    )
                 else:
-                    # 🔥 API返回空列表
                     logger.warning(f"⚠️ {symbol} API返回空static_info列表")
             except Exception as e:
-                # 🔥 API调用失败，记录详细错误
                 logger.warning(f"⚠️ {symbol} 获取手数API调用失败: {type(e).__name__}: {e}")
         else:
-            # 🔥 没有配置quote_client
-            logger.warning(f"⚠️ SmartOrderRouter未配置quote_client，无法获取{symbol}的准确手数")
+            logger.debug(f"  ℹ️ SmartOrderRouter未配置quote_client，将尝试数据库")
+
+        # 🔥 新增：尝试从数据库查询
+        if lot_size is None and self.db:
+            try:
+                from sqlalchemy import select
+                from longport_quant.persistence.models import SecurityStatic
+
+                async with self.db.session() as session:
+                    result = await session.execute(
+                        select(SecurityStatic).where(
+                            SecurityStatic.symbol == symbol
+                        )
+                    )
+                    security = result.scalar_one_or_none()
+
+                    if security and security.lot_size and security.lot_size > 0:
+                        lot_size = security.lot_size
+                        self._lot_size_cache[symbol] = lot_size
+                        logger.info(f"  📊 {symbol} 手数(数据库): {lot_size}股/手")
+                        return lot_size
+                    else:
+                        logger.debug(f"  ℹ️ {symbol} 数据库中无lot_size数据")
+            except Exception as e:
+                logger.debug(f"  ℹ️ {symbol} 数据库查询失败: {e}")
 
         # 使用默认值（但这可能导致订单失败！）
         default_lot_size = 1 if ".US" in symbol else 100
         self._lot_size_cache[symbol] = default_lot_size
         logger.warning(
             f"⚠️ {symbol} 使用默认手数: {default_lot_size}股/手 "
-            f"(这可能与实际手数不符，可能导致订单失败！)"
+            f"(这可能与实际手数不符，可能导致订单失败！建议同步静态数据)"
         )
         return default_lot_size
 

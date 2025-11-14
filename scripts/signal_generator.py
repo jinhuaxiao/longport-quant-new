@@ -45,7 +45,7 @@ from longport_quant.risk.kelly import KellyCalculator
 from longport_quant.risk.timezone_capital import TimeZoneCapitalManager
 from longport_quant.notifications.notifier import MultiChannelNotifier
 from longport_quant.persistence.db import DatabaseSessionManager
-from longport_quant.persistence.models import KlineDaily
+from longport_quant.persistence.models import KlineDaily, SecurityUniverse, SecurityStatic
 from longport_quant.data.kline_sync import KlineDataService
 from sqlalchemy import select, and_
 from datetime import date
@@ -171,7 +171,7 @@ class SignalGenerator:
 
         # A股监控列表
         self.a_watchlist = {
-            "300750.SZ": {"name": "宁德时代", "sector": "新能源"},
+            # A股暂不监控（账户不支持A股交易）
         }
 
         # 策略参数
@@ -302,6 +302,58 @@ class SignalGenerator:
 
         # 🛡️ 恐慌期动态添加的防御标的集合
         self.panic_added_symbols = set()
+
+    async def _get_security_name_cn(self, symbol: str) -> Optional[str]:
+        """
+        查询股票中文名称（仅港股）
+
+        Args:
+            symbol: 股票代码
+
+        Returns:
+            中文名称，如果不是港股或查询失败则返回None
+        """
+        if ".HK" not in symbol:
+            return None  # 仅处理港股
+
+        try:
+            if hasattr(self, 'db') and self.db:
+                async with self.db.session() as session:
+                    # 优先查询 SecurityUniverse
+                    result = await session.execute(
+                        select(SecurityUniverse).where(SecurityUniverse.symbol == symbol)
+                    )
+                    security = result.scalar_one_or_none()
+                    if security and security.name_cn:
+                        return security.name_cn
+
+                    # 备选：查询 SecurityStatic
+                    result = await session.execute(
+                        select(SecurityStatic).where(SecurityStatic.symbol == symbol)
+                    )
+                    security_static = result.scalar_one_or_none()
+                    if security_static and security_static.name_cn:
+                        return security_static.name_cn
+
+            return None
+        except Exception as e:
+            logger.debug(f"查询中文名称失败 {symbol}: {e}")
+            return None
+
+    def _format_symbol_with_name(self, symbol: str, name_cn: Optional[str]) -> str:
+        """
+        格式化股票代码（带中文名称）
+
+        Args:
+            symbol: 股票代码
+            name_cn: 中文名称（可选）
+
+        Returns:
+            格式化后的字符串，如 "0700.HK (腾讯控股)" 或 "AAPL.US"
+        """
+        if name_cn and ".HK" in symbol:
+            return f"{symbol} ({name_cn})"
+        return symbol
 
     def _is_market_open(self, symbol: str) -> bool:
         """
@@ -1541,12 +1593,17 @@ class SignalGenerator:
 
             # 使用async with正确初始化客户端
             # 初始化通知（支持Slack和Discord）
+            slack_enabled = bool(getattr(self.settings, 'slack_enabled', True))
             slack_url = str(self.settings.slack_webhook_url) if self.settings.slack_webhook_url else None
             discord_url = str(self.settings.discord_webhook_url) if self.settings.discord_webhook_url else None
 
             async with QuoteDataClient(self.settings) as quote_client, \
                        LongportTradingClient(self.settings) as trade_client, \
-                       MultiChannelNotifier(slack_webhook_url=slack_url, discord_webhook_url=discord_url) as slack:
+                       MultiChannelNotifier(
+                           slack_webhook_url=slack_url,
+                           discord_webhook_url=discord_url,
+                           enable_slack=slack_enabled
+                       ) as slack:
 
                 # 保存客户端引用
                 self.quote_client = quote_client
@@ -4445,8 +4502,13 @@ class SignalGenerator:
 
                     profit_emoji = "🟢" if profit_pct > 0 else "🔴"
 
+                    # 查询并格式化标的名称（港股显示中文名）
+                    symbol = signal['symbol']
+                    name_cn = await self._get_security_name_cn(symbol)
+                    symbol_display = self._format_symbol_with_name(symbol, name_cn)
+
                     notification_lines.append(
-                        f"{i}. {signal['symbol']} - ${signal['price']:.2f} "
+                        f"{i}. {symbol_display} - ${signal['price']:.2f} "
                         f"{profit_emoji} {profit_pct:+.1%} "
                         f"(市值${market_value:,.0f}, 评分{score:.0f})"
                     )
@@ -4860,6 +4922,9 @@ class SignalGenerator:
                 logger.debug("  ℹ️  当前无持仓，跳过紧急卖出检查")
                 return []
 
+            # 🔥 修复：在检查前更新 sold_today，确保包含最新的pending订单
+            await self._update_sold_today()
+
             # 构建行情字典
             quote_dict = {q.symbol: q for q in quotes}
 
@@ -4965,8 +5030,13 @@ class SignalGenerator:
                     urgency = metadata.get('urgency_score', 0)
                     signals_list = metadata.get('technical_signals', [])
 
+                    # 查询并格式化标的名称（港股显示中文名）
+                    symbol = signal['symbol']
+                    name_cn = await self._get_security_name_cn(symbol)
+                    symbol_display = self._format_symbol_with_name(symbol, name_cn)
+
                     notification_lines.append(
-                        f"{i}. **{signal['symbol']}** - ${signal['price']:.2f}"
+                        f"{i}. **{symbol_display}** - ${signal['price']:.2f}"
                     )
                     notification_lines.append(
                         f"   紧急度: {urgency}分 | 数量: {signal['quantity']}"
@@ -5099,6 +5169,10 @@ class SignalGenerator:
 
                             await self.signal_queue.publish_signal(signal)
                             published_count += 1
+
+                            # 🔥 修复：立即标记为已卖出，防止下次检查时重复
+                            self.sold_today.add(symbol)
+                            logger.debug(f"  ✅ {symbol}: 已添加到 sold_today，防止重复卖出")
 
                         if published_count > 0:
                             logger.info(f"  ✅ 已发布 {published_count}/{len(urgent_signals)} 个新信号")

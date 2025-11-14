@@ -32,7 +32,12 @@ async def application_lifespan() -> AsyncIterator[None]:
         sdk_config = build_sdk_config(settings)
         slack_url = str(settings.slack_webhook_url) if settings.slack_webhook_url else None
         discord_url = str(settings.discord_webhook_url) if settings.discord_webhook_url else None
-        slack = MultiChannelNotifier(slack_webhook_url=slack_url, discord_webhook_url=discord_url)
+        slack_enabled = bool(getattr(settings, "slack_enabled", True))
+        slack = MultiChannelNotifier(
+            slack_webhook_url=slack_url,
+            discord_webhook_url=discord_url,
+            enable_slack=slack_enabled,
+        )
 
         order_router = OrderRouter(settings, sdk_config)
         await stack.enter_async_context(order_router)
