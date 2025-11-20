@@ -79,6 +79,19 @@ class SignalGenerator:
         self.use_builtin_watchlist = use_builtin_watchlist
         self.max_iterations = max_iterations
 
+        # 🚫 买入黑名单和白名单配置
+        buy_blacklist_str = getattr(self.settings, 'buy_blacklist', '')
+        self.buy_blacklist = set(s.strip() for s in buy_blacklist_str.split(',') if s.strip())
+
+        buy_whitelist_str = getattr(self.settings, 'buy_whitelist', '')
+        self.buy_whitelist = set(s.strip() for s in buy_whitelist_str.split(',') if s.strip())
+        self.use_whitelist_only = bool(getattr(self.settings, 'use_whitelist_only', False))
+
+        if self.buy_blacklist:
+            logger.info(f"🚫 买入黑名单已启用: {', '.join(sorted(self.buy_blacklist))}")
+        if self.use_whitelist_only and self.buy_whitelist:
+            logger.info(f"✅ 白名单模式已启用: {', '.join(sorted(self.buy_whitelist))}")
+
         # 初始化消息队列
         self.signal_queue = SignalQueue(
             redis_url=self.settings.redis_url,
@@ -100,8 +113,6 @@ class SignalGenerator:
             "1398.HK": {"name": "工商银行", "sector": "银行"},
             "3988.HK": {"name": "中国银行", "sector": "银行"},
             "2318.HK": {"name": "中国平安", "sector": "保险"},
-            "1299.HK": {"name": "友邦保险", "sector": "保险"},
-            "02378.HK": {"name": "保诚", "sector": "保险"},
             # === 通信（1个）===
             "0941.HK": {"name": "中国移动", "sector": "通信"},
 
@@ -116,8 +127,6 @@ class SignalGenerator:
             "1929.HK": {"name": "周大福", "sector": "消费"},
             "6181.HK": {"name": "老铺黄金", "sector": "消费"},
 
-            # === 地产（1个，可选）===
-            "0688.HK": {"name": "中国海外发展", "sector": "地产"},
 
             # ========================================
             # 高科技成长股 - 18支
@@ -153,7 +162,6 @@ class SignalGenerator:
             "AMD.US": {"name": "AMD", "sector": "科技"},
             # 半导体产业链
             "TSM.US": {"name": "台积电", "sector": "半导体"},
-            "ASML.US": {"name": "阿斯麦", "sector": "半导体"},
             # AI & 云计算
             #"PLTR.US": {"name": "Palantir", "sector": "AI"},
             # 电商 & 金融科技
@@ -440,8 +448,8 @@ class SignalGenerator:
             # 使用OrderManager获取今日所有买单标的
             new_traded_today = await self.order_manager.get_today_buy_symbols()
 
-            # 更新成功才赋值
-            self.traded_today = new_traded_today
+            # 🔥 修复：使用update合并而非覆盖，保留内存中手动添加的标的
+            self.traded_today.update(new_traded_today)
 
             if self.traded_today:
                 logger.info(f"📋 今日已下买单标的: {len(self.traded_today)}个（包括pending订单）")
@@ -472,8 +480,8 @@ class SignalGenerator:
             # 使用OrderManager获取今日所有卖单标的
             new_sold_today = await self.order_manager.get_today_sell_symbols()
 
-            # 更新成功才赋值
-            self.sold_today = new_sold_today
+            # 🔥 修复：使用update合并而非覆盖，保留内存中手动添加的标的（如pending中的紧急卖出）
+            self.sold_today.update(new_sold_today)
 
             if self.sold_today:
                 logger.info(f"📋 今日已下卖单标的: {len(self.sold_today)}个（包括pending订单）")
@@ -598,6 +606,18 @@ class SignalGenerator:
         if await self.signal_queue.has_pending_signal(symbol, signal_type):
             return False, "队列中已有该标的的待处理信号"
 
+        # === 🔥 买卖信号互斥检查（防止同时存在买卖信号）===
+        if signal_type in ["BUY", "STRONG_BUY", "WEAK_BUY"]:
+            # 如果队列中有卖出信号，禁止生成买入信号
+            for sell_type in ["URGENT_SELL", "SELL", "STOP_LOSS", "TAKE_PROFIT", "SMART_TAKE_PROFIT", "EARLY_TAKE_PROFIT"]:
+                if await self.signal_queue.has_pending_signal(symbol, sell_type):
+                    return False, f"队列中已有该标的的{sell_type}信号，禁止买入"
+        elif signal_type in ["SELL", "STOP_LOSS", "TAKE_PROFIT", "SMART_TAKE_PROFIT", "EARLY_TAKE_PROFIT", "URGENT_SELL"]:
+            # 如果队列中有买入信号，禁止生成卖出信号
+            for buy_type in ["BUY", "STRONG_BUY", "WEAK_BUY"]:
+                if await self.signal_queue.has_pending_signal(symbol, buy_type):
+                    return False, f"队列中已有该标的的{buy_type}信号，禁止卖出"
+
         # === BUY信号的去重与频控检查 ===
         if signal_type in ["BUY", "STRONG_BUY", "WEAK_BUY"]:
             # 全局日度买单上限（可选）
@@ -608,18 +628,17 @@ class SignalGenerator:
                 except Exception:
                     pass
 
-            # 单标的日度买单上限（可选，默认1次）
-            if getattr(self.settings, 'enable_per_symbol_daily_cap', False):
-                try:
-                    max_buys = int(getattr(self.settings, 'per_symbol_daily_max_buys', 1))
-                    # 使用OrderManager统计该标的今日买单次数（包括待成交）
-                    # 为降低DB压力，先用集合快速判断是否已买过一次
-                    if max_buys <= 0:
-                        return False, "单标的买入次数上限为0"
-                    if max_buys == 1 and symbol in self.traded_today:
-                        return False, "该标的今日已下过买单"
-                except Exception:
-                    pass
+            # 🔥 单标的日度买单上限（强制启用，防止重复下单）
+            try:
+                max_buys = int(getattr(self.settings, 'per_symbol_daily_max_buys', 1))
+                # 使用OrderManager统计该标的今日买单次数（包括待成交）
+                # 为降低DB压力，先用集合快速判断是否已买过一次
+                if max_buys <= 0:
+                    return False, "单标的买入次数上限为0"
+                if symbol in self.traded_today:
+                    return False, f"该标的今日已下过买单（上限{max_buys}次/天）"
+            except Exception as e:
+                logger.warning(f"  {symbol}: 检查日度买单上限失败: {e}，默认允许")
             # 🔥 修改：移除持仓去重检查，允许对已持仓标的加仓
             # 原因：如果某标的再次出现强买入信号，应该允许加仓（分批建仓策略）
 
@@ -658,7 +677,7 @@ class SignalGenerator:
                 logger.debug(f"  ℹ️  {symbol}: 今日未买过，允许买入")
 
         # === SELL信号的去重与频控检查 ===
-        elif signal_type in ["SELL", "STOP_LOSS", "TAKE_PROFIT", "SMART_TAKE_PROFIT", "EARLY_TAKE_PROFIT"]:
+        elif signal_type in ["SELL", "STOP_LOSS", "TAKE_PROFIT", "SMART_TAKE_PROFIT", "EARLY_TAKE_PROFIT", "URGENT_SELL"]:
             # 全局日度卖单上限（止损止盈不受限）
             if signal_type not in ["STOP_LOSS", "TAKE_PROFIT"] and getattr(self.settings, 'enable_daily_trade_cap', False):
                 try:
@@ -1059,30 +1078,37 @@ class SignalGenerator:
             import redis.asyncio as aioredis
             from datetime import datetime
 
-            redis_client = aioredis.from_url(self.settings.redis_url)
+            # 🔥 修复：添加超时配置，防止 "Timeout should be used inside a task" 错误
+            redis_client = aioredis.from_url(
+                self.settings.redis_url,
+                socket_timeout=5.0,
+                socket_connect_timeout=5.0,
+                decode_responses=True
+            )
 
             # 使用 pipeline 批量写入
-            pipe = redis_client.pipeline()
-            pipe.set("market:vixy:price", str(current_price))
-            pipe.set("market:vixy:panic", "1" if self.market_panic else "0")
-            pipe.set("market:vixy:threshold", str(self.vixy_panic_threshold))
-            pipe.set("market:vixy:ma200", str(self.vixy_ma200) if self.vixy_ma200 else "")
-            pipe.set("market:vixy:updated_at", datetime.now(self.beijing_tz).isoformat())
+            async with redis_client.pipeline(transaction=True) as pipe:
+                pipe.set("market:vixy:price", str(current_price))
+                pipe.set("market:vixy:panic", "1" if self.market_panic else "0")
+                pipe.set("market:vixy:threshold", str(self.vixy_panic_threshold))
+                pipe.set("market:vixy:ma200", str(self.vixy_ma200) if self.vixy_ma200 else "")
+                pipe.set("market:vixy:updated_at", datetime.now(self.beijing_tz).isoformat())
 
-            # 设置过期时间为10分钟（如果信号生成器停止，状态会自动失效）
-            pipe.expire("market:vixy:price", 600)
-            pipe.expire("market:vixy:panic", 600)
-            pipe.expire("market:vixy:threshold", 600)
-            pipe.expire("market:vixy:ma200", 600)
-            pipe.expire("market:vixy:updated_at", 600)
+                # 设置过期时间为10分钟（如果信号生成器停止，状态会自动失效）
+                pipe.expire("market:vixy:price", 600)
+                pipe.expire("market:vixy:panic", 600)
+                pipe.expire("market:vixy:threshold", 600)
+                pipe.expire("market:vixy:ma200", 600)
+                pipe.expire("market:vixy:updated_at", 600)
 
-            await pipe.execute()
+                await pipe.execute()
+
             await redis_client.aclose()
 
-            logger.info(f"✅ VIXY 状态已保存: ${current_price:.2f}, 恐慌={self.market_panic}")
+            logger.debug(f"✅ VIXY 状态已保存: ${current_price:.2f}, 恐慌={self.market_panic}")
 
         except Exception as e:
-            logger.error(f"❌ 保存 VIXY 状态到 Redis 失败: {e}", exc_info=True)
+            logger.error(f"❌ 保存 VIXY 状态到 Redis 失败: {e}")
 
     async def _activate_defensive_watchlist(self):
         """
@@ -1925,6 +1951,16 @@ class SignalGenerator:
             Dict: 信号数据，如果不生成信号则返回None
         """
         try:
+            # 🚫 【第0层过滤】黑名单和白名单检查（买入信号）
+            # 仅对买入信号生效，不影响卖出信号（已持有的标的可以卖出）
+            if symbol in self.buy_blacklist:
+                logger.debug(f"  🚫 {symbol}: 在买入黑名单中，跳过")
+                return None
+
+            if self.use_whitelist_only and symbol not in self.buy_whitelist:
+                logger.debug(f"  🚫 {symbol}: 不在买入白名单中，跳过")
+                return None
+
             # 🚨 恐慌断路器：市场恐慌时的分级响应
             if self.market_panic:
                 # 检查是否为防御性标的
@@ -4942,6 +4978,11 @@ class SignalGenerator:
             for pos in positions:
                 symbol = pos.get("symbol")
                 try:
+                    # 🔥 检查队列中是否已有URGENT_SELL信号（最高优先级去重）
+                    if await self.signal_queue.has_pending_signal(symbol, "URGENT_SELL"):
+                        logger.debug(f"    {symbol}: 队列中已有URGENT_SELL信号，跳过")
+                        continue
+
                     # 检查冷却期
                     last_check = self.urgent_sell_last_check.get(symbol, 0)
                     if (now_ts - last_check) < self.urgent_sell_cooldown:
@@ -4980,11 +5021,41 @@ class SignalGenerator:
                             f"建议={action}"
                         )
 
-                        # 获取持仓信息
-                        quantity = pos.get('quantity', 0)
-                        if quantity <= 0:
-                            logger.warning(f"    {symbol}: 持仓数量无效 ({quantity})，跳过")
+                        # 🔥 【第三层防护】获取持仓信息并扣除pending卖单（防止卖空）
+                        position_quantity = pos.get('quantity', 0)
+                        if position_quantity <= 0:
+                            logger.warning(f"    {symbol}: 持仓数量无效 ({position_quantity})，跳过")
                             continue
+
+                        # 🔥 获取pending卖单数量
+                        try:
+                            pending_orders = await self.order_manager.get_today_orders()
+                            pending_sell_qty = sum(
+                                o.quantity - o.executed_quantity
+                                for o in pending_orders
+                                if o.symbol == symbol and o.side == "SELL" and o.status in ["New", "PartialFilled"]
+                            )
+                        except Exception as e:
+                            logger.warning(f"    {symbol}: 获取pending订单失败: {e}，假设为0")
+                            pending_sell_qty = 0
+
+                        # 🔥 计算可用数量 = 持仓 - pending卖单
+                        available_quantity = position_quantity - pending_sell_qty
+
+                        if available_quantity <= 0:
+                            logger.warning(
+                                f"    {symbol}: 可用数量为0，跳过紧急卖出 "
+                                f"(持仓={position_quantity}, pending卖单={pending_sell_qty})"
+                            )
+                            continue
+
+                        # 使用可用数量而非总持仓数量
+                        quantity = available_quantity
+                        if pending_sell_qty > 0:
+                            logger.info(
+                                f"    {symbol}: 持仓数量已调整 {position_quantity} → {quantity} "
+                                f"(扣除pending卖单={pending_sell_qty})"
+                            )
 
                         # 构建紧急卖出信号
                         sell_signals = tech_analysis.get('signals', [])
@@ -4995,7 +5066,7 @@ class SignalGenerator:
                             'type': 'URGENT_SELL',  # 标记为紧急卖出
                             'side': 'SELL',
                             'price': current_price,
-                            'quantity': quantity,
+                            'quantity': quantity,  # 🔥 使用调整后的可用数量
                             'reason': reason,
                             'score': 95,  # 紧急卖出优先级很高
                             'priority': 95,
