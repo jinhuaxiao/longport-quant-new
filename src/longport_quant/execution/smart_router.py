@@ -523,6 +523,43 @@ class SmartOrderRouter:
                 error_message=str(e)
             )
 
+    async def _get_pending_sell_quantity(self, symbol: str) -> int:
+        """
+        获取指定标的的pending卖单数量
+
+        Args:
+            symbol: 股票代码
+
+        Returns:
+            pending卖单的总数量
+        """
+        try:
+            # 获取今日订单
+            today_orders = await asyncio.to_thread(self.trade_context.today_orders)
+
+            # 过滤出该标的的pending卖单
+            pending_sell_qty = 0
+            for order in today_orders:
+                if order.symbol == symbol and order.side == OrderSide.Sell:
+                    # 检查订单状态是否为pending（New或PartialFilled）
+                    status_str = str(order.status)
+                    if any(s in status_str for s in ["New", "PartialFilled", "Partially"]):
+                        # 计算未成交数量
+                        remaining_qty = int(order.quantity) - int(order.executed_quantity or 0)
+                        pending_sell_qty += remaining_qty
+                        logger.debug(
+                            f"  📋 发现pending卖单: {order.order_id}, "
+                            f"总量={int(order.quantity)}, "
+                            f"已成交={int(order.executed_quantity or 0)}, "
+                            f"未成交={remaining_qty}"
+                        )
+
+            return pending_sell_qty
+
+        except Exception as e:
+            logger.warning(f"获取pending卖单数量失败: {e}")
+            return 0  # 保守起见，返回0（但会在上层检查持仓）
+
     async def _validate_order(self, request: OrderRequest) -> bool:
         """Validate order before execution."""
         # Check basic parameters
@@ -538,6 +575,47 @@ class SmartOrderRouter:
         if request.order_type == "LIMIT" and not request.limit_price:
             logger.error("Limit price required for limit orders")
             return False
+
+        # 🔥 新增：SELL订单持仓检查（防止卖空）
+        if request.side == "SELL":
+            try:
+                # 获取实际持仓
+                positions = await asyncio.to_thread(self.trade_context.stock_positions)
+                position = next((p for p in positions if p.symbol == request.symbol), None)
+
+                if not position:
+                    logger.error(f"❌ {request.symbol}: 无持仓，无法卖出")
+                    return False
+
+                # 获取pending卖单数量
+                pending_sell_qty = await self._get_pending_sell_quantity(request.symbol)
+
+                # 计算可用数量 = 持仓 - pending卖单
+                available_qty = int(position.quantity) - pending_sell_qty
+
+                if available_qty <= 0:
+                    logger.error(
+                        f"❌ {request.symbol}: 可用数量为0或负数 "
+                        f"(持仓={int(position.quantity)}, pending卖单={pending_sell_qty})"
+                    )
+                    return False
+
+                if request.quantity > available_qty:
+                    logger.error(
+                        f"❌ {request.symbol}: 卖出数量{request.quantity}超过可用数量{available_qty} "
+                        f"(持仓={int(position.quantity)}, pending卖单={pending_sell_qty})"
+                    )
+                    return False
+
+                logger.info(
+                    f"✅ {request.symbol}: 持仓检查通过 "
+                    f"(卖出={request.quantity}, 可用={available_qty}, "
+                    f"持仓={int(position.quantity)}, pending={pending_sell_qty})"
+                )
+
+            except Exception as e:
+                logger.error(f"❌ {request.symbol}: 持仓检查失败: {e}")
+                return False
 
         # Validate against current market price
         market_data = self._market_data_cache.get(request.symbol)

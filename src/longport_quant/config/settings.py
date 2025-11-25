@@ -104,7 +104,9 @@ class Settings(BaseSettings):
     signal_batch_window: float = Field(15.0, alias="SIGNAL_BATCH_WINDOW")  # 等待15秒收集信号
     signal_batch_size: int = Field(5, alias="SIGNAL_BATCH_SIZE")  # 每批最多5个信号
     stop_loss_priority: int = Field(999, alias="STOP_LOSS_PRIORITY")  # 止损止盈优先级（立即执行）
-    min_signal_score: int = Field(40, alias="MIN_SIGNAL_SCORE")  # 最低分数阈值
+    min_signal_score: int = Field(60, alias="MIN_SIGNAL_SCORE")  # 全局默认最低分数阈值
+    min_signal_score_us: int = Field(60, alias="MIN_SIGNAL_SCORE_US")  # 美股信号阈值
+    min_signal_score_hk: int = Field(70, alias="MIN_SIGNAL_SCORE_HK")  # 港股信号阈值
     funds_retry_max: int = Field(5, alias="FUNDS_RETRY_MAX")  # 资金不足最大重试次数
     funds_retry_delay: int = Field(5, alias="FUNDS_RETRY_DELAY")  # 资金不足重试延迟（分钟）
 
@@ -285,6 +287,24 @@ class Settings(BaseSettings):
     urgent_sell_cooldown: int = Field(300, alias="URGENT_SELL_COOLDOWN")
 
     # ============================================================
+    # 买入黑名单和白名单配置（Buy Blacklist & Whitelist）
+    # ============================================================
+    # 说明：
+    # - 黑名单：系统永远不会买入黑名单中的标的（但可以卖出已持有的）
+    # - 白名单：启用白名单模式后，只买入白名单中的标的
+    # - 用逗号分隔多个股票代码
+    # ============================================================
+
+    # 买入黑名单（逗号分隔）
+    buy_blacklist: str = Field("", alias="BUY_BLACKLIST")
+
+    # 买入白名单（逗号分隔）
+    buy_whitelist: str = Field("", alias="BUY_WHITELIST")
+
+    # 启用白名单模式（仅买入白名单中的标的）
+    use_whitelist_only: bool = Field(False, alias="USE_WHITELIST_ONLY")
+
+    # ============================================================
     # VIXY 恐慌指数监控（Panic Index Monitoring）
     # ============================================================
     # 说明：
@@ -419,6 +439,24 @@ class Settings(BaseSettings):
             self.signal_queue_key = f"{self.signal_queue_key}:{self.account_id}"
             self.signal_processing_key = f"{self.signal_processing_key}:{self.account_id}"
             self.signal_failed_key = f"{self.signal_failed_key}:{self.account_id}"
+
+    def get_min_signal_score_for_symbol(self, symbol: str) -> int:
+        """
+        根据股票代码获取对应市场的信号阈值
+
+        Args:
+            symbol: 股票代码（如 "AAPL.US", "0700.HK"）
+
+        Returns:
+            int: 该市场的最低信号评分要求
+        """
+        if ".US" in symbol:
+            return self.min_signal_score_us
+        elif ".HK" in symbol:
+            return self.min_signal_score_hk
+        else:
+            # 其他市场使用全局默认值
+            return self.min_signal_score
 
     @field_validator("database_dsn", mode="before")
     @classmethod

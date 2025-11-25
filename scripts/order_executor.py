@@ -423,6 +423,60 @@ class OrderExecutor:
                 return self._account_cache
             raise
 
+    async def _get_hk_positions_market_value(self, account: Dict) -> float:
+        """
+        计算当前港股持仓总市值（HKD）
+
+        Args:
+            account: 账户信息字典
+
+        Returns:
+            float: 港股持仓总市值
+        """
+        hk_total_value = 0.0
+        positions = account.get('positions', [])
+
+        for pos in positions:
+            symbol = pos.get('symbol', '')
+            if '.HK' not in symbol:
+                continue
+
+            quantity = float(pos.get('quantity', 0))
+            if quantity <= 0:
+                continue
+
+            # 尝试获取实时价格，失败则使用成本价
+            try:
+                quote = await self.quote_client.get_quote(symbol)
+                current_price = float(quote.last_done) if quote and quote.last_done else pos.get('cost_price', 0)
+            except:
+                current_price = pos.get('cost_price', 0)
+
+            hk_total_value += quantity * current_price
+
+        return hk_total_value
+
+    async def _get_total_net_assets_in_hkd(self, account: Dict) -> float:
+        """
+        计算账户总净资产（HKD等值）
+
+        Args:
+            account: 账户信息字典
+
+        Returns:
+            float: 总净资产（HKD）
+        """
+        net_assets = account.get('net_assets', {})
+
+        hkd_assets = float(net_assets.get('HKD', 0))
+        usd_assets = float(net_assets.get('USD', 0))
+
+        # USD 转 HKD（使用固定汇率 7.8）
+        usd_to_hkd_rate = 7.8
+        total_assets_hkd = hkd_assets + (usd_assets * usd_to_hkd_rate)
+
+        return total_assets_hkd
+
     async def execute_order(self, signal: Dict):
         """
         执行订单（核心逻辑）
@@ -637,12 +691,13 @@ class OrderExecutor:
                 f"     可能原因: 购买力受限、融资额度不足或待结算资金占用"
             )
 
-        # 6. 资金缺口 & 是否允许尝试轮换
+        # 6. 资金缺口 & 是否允许尝试轮换（使用市场专用阈值）
         shortfall_cash = max(0.0, min_required_cash - available_cash)
         effective_power = max(available_cash, buy_power, remaining_finance)
         shortfall_power = max(0.0, min_required_cash - effective_power)
         needed_amount = max(min_required_cash, shortfall_cash, shortfall_power)
-        rotation_allowed = score >= 60
+        min_score_threshold = self.settings.get_min_signal_score_for_symbol(symbol)
+        rotation_allowed = score >= min_score_threshold
 
         broker_reason_lines = []
         if not broker_allows_purchase:
@@ -653,7 +708,50 @@ class OrderExecutor:
                 f"   • 买入力: ${buy_power:.2f}, 剩余融资: ${remaining_finance:.2f}"
             )
 
-        # 7. 获取持仓并进行分析
+        # 7. 🚫 港股资金分配限制检查（仅针对港股标的）
+        if ".HK" in symbol:
+            try:
+                # 计算当前港股持仓总市值
+                hk_current_value = await self._get_hk_positions_market_value(account)
+
+                # 计算账户总净资产（HKD等值）
+                total_net_assets = await self._get_total_net_assets_in_hkd(account)
+
+                # 港股配额上限：净资产的 1/3
+                HK_MAX_ALLOCATION_RATIO = 0.33
+                max_hk_allocation = total_net_assets * HK_MAX_ALLOCATION_RATIO
+
+                # 检查：当前港股市值 + 本次最小买入金额 是否超过配额
+                if hk_current_value + min_required_cash > max_hk_allocation:
+                    remaining_quota = max(0, max_hk_allocation - hk_current_value)
+
+                    logger.warning(
+                        f"  🚫 港股资金分配限制触发:\n"
+                        f"     • 当前港股市值: ${hk_current_value:,.2f}\n"
+                        f"     • 本次买入需要: ${min_required_cash:,.2f}\n"
+                        f"     • 港股配额上限: ${max_hk_allocation:,.2f} (净资产的33%)\n"
+                        f"     • 剩余可用额度: ${remaining_quota:,.2f}\n"
+                        f"     • 账户总净资产: ${total_net_assets:,.2f}\n"
+                        f"     💡 建议: 卖出部分港股持仓或等待美股交易机会"
+                    )
+
+                    return False, (
+                        f"🚫 港股资金分配限制\n\n"
+                        f"港股持仓已达配额上限，无法买入新港股标的：\n"
+                        f"  • 当前港股市值: ${hk_current_value:,.2f}\n"
+                        f"  • 港股配额上限: ${max_hk_allocation:,.2f}\n"
+                        f"  • 本次需要资金: ${min_required_cash:,.2f}\n"
+                        f"  • 剩余可用额度: ${remaining_quota:,.2f}\n\n"
+                        f"💡 港股占用 {hk_current_value/total_net_assets*100:.1f}% 净资产（上限33%）\n"
+                        f"   建议卖出弱势港股持仓或等待美股机会"
+                    ), None
+
+            except Exception as e:
+                logger.error(f"  ⚠️ 港股配额检查失败: {e}")
+                # 检查失败时不阻止订单，但记录警告
+                pass
+
+        # 8. 获取持仓并进行分析
         try:
             positions = account.get("positions") or []
             if not positions:
@@ -705,7 +803,8 @@ class OrderExecutor:
             if rotation_allowed:
                 reason_lines.append("   • 当前无持仓可以换仓")
             else:
-                reason_lines.append(f"   • 信号评分过低({score}分 < 60分)，系统不会自动换仓")
+                market_name = "美股" if ".US" in symbol else ("港股" if ".HK" in symbol else "其他")
+                reason_lines.append(f"   • 信号评分过低({score}分 < {min_score_threshold}分{market_name}阈值)，系统不会自动换仓")
             reason_lines.append("   💡 建议: 等待资金到账或市场机会")
             return False, "\n".join(reason_lines), None
 
@@ -799,7 +898,8 @@ class OrderExecutor:
         reason_lines.extend(broker_reason_lines)
 
         if not rotation_allowed:
-            reason_lines.append(f"   • 信号评分过低({score}分 < 60分)，系统不会自动换仓")
+            market_name = "美股" if ".US" in symbol else ("港股" if ".HK" in symbol else "其他")
+            reason_lines.append(f"   • 信号评分过低({score}分 < {min_score_threshold}分{market_name}阈值)，系统不会自动换仓")
             if cumulative_freed > 0:
                 reason_lines.append(
                     f"   • 潜在可释放资金: ${cumulative_freed:.2f}（需手动确认）"
@@ -948,10 +1048,13 @@ class OrderExecutor:
             needed_amount = required_cash - available_cash
 
             # 🔥 关键修复：只在确实需要资金且信号质量足够高时才触发轮换
-            if needed_amount > 0 and score >= 60:
+            # 使用市场专用阈值（美股60分，港股70分）
+            min_score_threshold = self.settings.get_min_signal_score_for_symbol(symbol)
+            if needed_amount > 0 and score >= min_score_threshold:
                 logger.info(
                     f"  🔄 尝试智能持仓轮换释放 ${needed_amount:,.2f}...\n"
-                    f"     策略: 卖出评分较低的持仓，为评分{score}分的新信号腾出空间"
+                    f"     策略: 卖出评分较低的持仓，为评分{score}分的新信号腾出空间\n"
+                    f"     市场阈值: {symbol} 需要 ≥{min_score_threshold}分"
                 )
 
                 rotation_success, freed_amount = await self._try_smart_rotation(
@@ -968,9 +1071,9 @@ class OrderExecutor:
                     f"动态预算不足（预算${dynamic_budget:.2f} < 1手${required_cash:.2f}）"
                 )
             else:
-                # 低分信号（<60分）不触发轮换，避免为低质量信号卖出好持仓
+                # 低分信号不触发轮换，避免为低质量信号卖出好持仓
                 logger.warning(
-                    f"  ⚠️ {symbol}: 信号评分{score}分 < 60分，不触发持仓轮换\n"
+                    f"  ⚠️ {symbol}: 信号评分{score}分 < {min_score_threshold}分（市场阈值），不触发持仓轮换\n"
                     f"     说明: 低分信号不应卖出现有持仓，建议等待更高质量的交易机会"
                 )
                 rotation_success = False
@@ -1238,11 +1341,12 @@ class OrderExecutor:
 
                 # 根据评估结果决定是否提交备份条件单
                 if risk_assessment['should_backup']:
-                    # 🔥 低分信号保护：分数<60的信号不提交备份条件单（降低探索性仓位风险）
+                    # 🔥 低分信号保护：低于市场阈值的信号不提交备份条件单（降低探索性仓位风险）
                     signal_score = signal.get('score', 0)
-                    if signal_score < 60:
+                    min_score_threshold = self.settings.get_min_signal_score_for_symbol(symbol)
+                    if signal_score < min_score_threshold:
                         logger.info(
-                            f"  ⏭️ 跳过备份条件单: 信号分数较低({signal_score}分 < 60分)，"
+                            f"  ⏭️ 跳过备份条件单: 信号分数较低({signal_score}分 < {min_score_threshold}分市场阈值)，"
                             f"仅依赖客户端监控止损/止盈（降低误触风险）"
                         )
                     else:
@@ -1820,6 +1924,55 @@ class OrderExecutor:
         current_price = signal.get('price', 0)
         reason = signal.get('reason', '平仓')
 
+        # 🔥 【第二层防护】执行前二次验证持仓（防止卖空）
+        try:
+            # 获取实际持仓
+            positions = await self.trade_client.get_positions()
+            position = next((p for p in positions if p['symbol'] == symbol), None)
+
+            if not position:
+                logger.error(f"❌ {symbol}: 二次验证失败 - 无持仓，无法卖出")
+                return
+
+            # 获取pending卖单数量
+            pending_orders = await self.order_manager.get_today_orders()
+            pending_sell_qty = sum(
+                o.quantity - o.executed_quantity
+                for o in pending_orders
+                if o.symbol == symbol and o.side == "SELL" and o.status in ["New", "PartialFilled"]
+            )
+
+            # 计算可用数量 = 持仓 - pending卖单
+            position_quantity = float(position['quantity'])
+            available_qty = position_quantity - pending_sell_qty
+
+            if available_qty <= 0:
+                logger.error(
+                    f"❌ {symbol}: 二次验证失败 - 可用数量为0 "
+                    f"(持仓={position_quantity}, pending卖单={pending_sell_qty})"
+                )
+                return
+
+            # 如果信号数量超过可用数量，自动调整
+            if quantity > available_qty:
+                original_quantity = quantity
+                quantity = available_qty
+                logger.warning(
+                    f"⚠️ {symbol}: 卖出数量已自动调整 {original_quantity} → {quantity} "
+                    f"(持仓={position_quantity}, pending={pending_sell_qty})"
+                )
+                # 更新signal中的数量
+                signal['quantity'] = quantity
+
+            logger.info(
+                f"✅ {symbol}: 二次持仓验证通过 "
+                f"(卖出={quantity}, 可用={available_qty}, 持仓={position_quantity}, pending={pending_sell_qty})"
+            )
+
+        except Exception as e:
+            logger.error(f"❌ {symbol}: 二次持仓验证失败: {e}")
+            return
+
         # 🔥 取消备份条件单（客户端监控优先触发）
         try:
             stops = await self.stop_manager.get_stop_for_symbol(symbol)
@@ -2063,17 +2216,17 @@ class OrderExecutor:
 
         较高评分的信号分配更多资金
 
-        支持max_position_value限制（用于小仓位试探性买入）
+        支持max_position_value限制（用于限制最大仓位金额）
         """
-        # 🔥 优先检查小仓位限制（45-59分的试探性买入）
+        # 🔥 优先检查仓位金额上限（如果有）
         max_position_value = signal.get('max_position_value')
         if max_position_value is not None:
-            logger.info(f"  🎯 小仓位试探: 最大金额限制=${max_position_value:,.2f}")
+            logger.info(f"  🎯 仓位金额限制: 最大金额=${max_position_value:,.2f}")
 
         if not self.use_adaptive_budget:
             # 如果不使用动态预算，返回固定金额
             fixed_budget = 10000.0
-            # 如果有小仓位限制，取较小值
+            # 如果有仓位金额上限，取较小值
             if max_position_value is not None:
                 return min(fixed_budget, max_position_value)
             return fixed_budget
@@ -2090,19 +2243,24 @@ class OrderExecutor:
         # 基础预算（总资产的百分比）
         base_budget = net_assets * self.min_position_size_pct
 
-        # 根据评分调整预算（优化后：降低最大仓位25%）
+        # 根据评分调整预算（使用市场专用阈值：美股60分，港股70分）
+        min_score_threshold = self.settings.get_min_signal_score_for_symbol(symbol)
+
         if score >= 80:
-            # 极强买入信号：重仓（20-25%，从30-40%降低）
+            # 极强买入信号：重仓（20-25%）
             budget_pct = 0.20 + (score - 80) / 400  # 80分=20%, 100分=25%
-        elif score >= 60:
-            # 强买入信号：标准仓（15-22%，从20-30%降低）
-            budget_pct = 0.15 + (score - 60) * 0.07 / 20  # 60分=15%, 80分=22%
-        elif score >= 45:
-            # 买入信号：试探性小仓位（5-10%，微调上限）
-            budget_pct = 0.05 + (score - 45) * 0.05 / 14  # 45分=5%, 59分=10%
+        elif score >= min_score_threshold:
+            # 强买入信号：标准仓（15-22%）
+            # 根据市场阈值动态计算：从阈值分到80分线性增长
+            score_range = 80 - min_score_threshold
+            budget_pct = 0.15 + (score - min_score_threshold) * 0.07 / score_range
         else:
-            # 低于45分：不应该生成信号（WEAK_BUY已禁用）
-            budget_pct = 0.05  # 兜底最小值
+            # 低于市场阈值：不符合强信号要求，拒绝买入
+            market_name = "美股" if ".US" in symbol else ("港股" if ".HK" in symbol else "其他市场")
+            logger.warning(
+                f"  ⚠️ {symbol}: 信号评分{score}分低于{market_name}阈值({min_score_threshold}分)，拒绝买入"
+            )
+            raise ValueError(f"信号评分{score}分不足，{market_name}需要≥{min_score_threshold}分才能买入")
 
         # 限制在合理范围内
         budget_pct = max(self.min_position_size_pct, min(budget_pct, self.max_position_size_pct))
@@ -2229,10 +2387,10 @@ class OrderExecutor:
             )
             dynamic_budget = effective_cap
 
-        # 🔥 应用小仓位限制（如果有）
+        # 🔥 应用仓位金额上限（如果有）
         if max_position_value is not None and dynamic_budget > max_position_value:
             logger.info(
-                f"  🎯 应用小仓位限制: ${dynamic_budget:,.2f} → ${max_position_value:,.2f}"
+                f"  🎯 应用仓位金额上限: ${dynamic_budget:,.2f} → ${max_position_value:,.2f}"
             )
             dynamic_budget = max_position_value
 
@@ -2978,10 +3136,12 @@ class OrderExecutor:
                     f"• 建议: 等待高质量卖出信号或更优买入机会"
                 )
             else:
+                min_score_threshold = self.settings.get_min_signal_score_for_symbol(symbol)
+                market_name = "美股" if ".US" in symbol else ("港股" if ".HK" in symbol else "")
                 decision_section = (
                     f"\n## 💡 决策建议\n"
                     f"❌ **信号评分不足，系统不会自动换仓**\n"
-                    f"• 新信号评分: {score}/100 (<60)\n"
+                    f"• 新信号评分: {score}/100 (<{min_score_threshold}分{market_name}阈值)\n"
                     f"• 建议: 若需腾出购买力，请手动评估上述持仓"
                 )
 
@@ -3518,7 +3678,8 @@ class OrderExecutor:
                 )
 
                 # 🔥 新增：高分信号延迟通知（只在首次延迟时通知）
-                if score >= 60 and signal['retry_count'] == 1 and self.slack and reason == "资金不足":
+                min_score_threshold = self.settings.get_min_signal_score_for_symbol(symbol)
+                if score >= min_score_threshold and signal['retry_count'] == 1 and self.slack and reason == "资金不足":
                     try:
                         # 获取账户信息
                         try:
@@ -3656,19 +3817,22 @@ class OrderExecutor:
         score = signal.get('score', 0)
         symbol = signal['symbol']
 
-        # 根据信号强度决定建仓策略
+        # 根据信号强度决定建仓策略（使用市场专用阈值）
+        min_score_threshold = self.settings.get_min_signal_score_for_symbol(symbol)
+        market_name = "美股" if ".US" in symbol else ("港股" if ".HK" in symbol else "其他市场")
+
         if score >= 80:
             # 极强信号：一次性建仓（信号强，仓位重）
             stages = [(1.0, "全仓")]
             logger.info(f"  📊 建仓策略: 极强信号({score}分)，一次性全仓建仓")
-        elif score >= 60:
+        elif score >= min_score_threshold:
             # 强信号：分两批（60% + 40%）
             stages = [(0.6, "首批"), (0.4, "加仓")]
             logger.info(f"  📊 建仓策略: 强信号({score}分)，分2批建仓（60%+40%）")
         else:
-            # BUY信号（45-59分）：一次性建仓（仓位本就很小5-12%，无需分批）
-            stages = [(1.0, "试探仓")]
-            logger.info(f"  📊 建仓策略: 一般信号({score}分)，一次性试探建仓（仓位小）")
+            # 低于市场阈值：不符合强信号要求，拒绝建仓
+            logger.error(f"  ❌ 建仓失败: 信号评分{score}分低于{market_name}阈值({min_score_threshold}分)")
+            raise ValueError(f"信号评分{score}分不足，{market_name}需要≥{min_score_threshold}分才能买入")
 
         total_filled = 0
         total_value = 0.0

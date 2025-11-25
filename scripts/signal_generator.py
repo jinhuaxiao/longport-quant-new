@@ -154,7 +154,8 @@ class SignalGenerator:
             # 科技大盘股
             "AAPL.US": {"name": "苹果", "sector": "科技"},
             "MSFT.US": {"name": "微软", "sector": "科技"},
-            "GOOGL.US": {"name": "谷歌", "sector": "科技"},
+            "GOOGL.US": {"name": "谷歌A类", "sector": "科技"},
+            "GOOG.US": {"name": "谷歌C类", "sector": "科技"},
             "AMZN.US": {"name": "亚马逊", "sector": "科技"},
             "NVDA.US": {"name": "英伟达", "sector": "科技"},
             "TSLA.US": {"name": "特斯拉", "sector": "汽车"},
@@ -167,8 +168,6 @@ class SignalGenerator:
             # 电商 & 金融科技
             "SHOP.US": {"name": "Shopify", "sector": "电商"},
             # 杠杆ETF
-            "TQQQ.US": {"name": "纳指三倍做多ETF", "sector": "ETF"},
-            "NVDU.US": {"name": "英伟达二倍做多ETF", "sector": "ETF"},
             # 其他
             "RKLB.US": {"name": "火箭实验室", "sector": "航天"},
             "RDDT.US": {"name": "reddit", "sector": "reddit"},
@@ -394,20 +393,28 @@ class SignalGenerator:
             return is_morning or is_afternoon
 
         elif symbol.endswith('.US'):
-            # 美股交易时间（北京时间）
-            # 夏令时（3月第二个周日 - 11月第一个周日）: 21:30 - 次日04:00
-            # 冬令时（11月第一个周日 - 次年3月第二个周日）: 22:30 - 次日05:00
-            # 简化处理：使用 21:30 - 次日05:00（涵盖两种情况）
+            # 美股交易时间（北京时间）- 包含盘前、常规、盘后交易
+            #
+            # 冬令时（11月-3月）：
+            # - 盘前: 04:00-09:30 ET = 17:00-22:30 北京时间
+            # - 常规: 09:30-16:00 ET = 22:30-次日05:00 北京时间
+            # - 盘后: 16:00-20:00 ET = 05:00-09:00 北京时间
+            #
+            # 夏令时（3月-11月）：
+            # - 盘前: 04:00-09:30 ET = 16:00-21:30 北京时间
+            # - 常规: 09:30-16:00 ET = 21:30-次日04:00 北京时间
+            # - 盘后: 16:00-20:00 ET = 04:00-08:00 北京时间
+            #
+            # 为覆盖盘前+常规+盘后，使用保守范围：北京时间 16:00 - 次日 10:30
 
-            # 美股周一到周五交易，对应北京时间周二到周六早上
-            market_start = time(21, 30)
-            market_end = time(5, 0)
+            premarket_start = time(16, 0)   # 盘前开始（最早）
+            afterhours_end = time(10, 30)   # 盘后结束（最晚，含缓冲）
 
-            # 如果当前是晚上21:30之后，需要是周一到周五
-            if current_time >= market_start:
+            # 如果当前是下午16:00之后，需要是周一到周五
+            if current_time >= premarket_start:
                 return weekday < 5  # 周一到周五
-            # 如果当前是早上05:00之前，需要是周二到周六
-            elif current_time <= market_end:
+            # 如果当前是上午10:00之前，需要是周二到周六
+            elif current_time <= afterhours_end:
                 return 0 < weekday < 6  # 周二到周六
             else:
                 return False
@@ -5336,24 +5343,31 @@ class SignalGenerator:
         if weekday >= 5:
             return False, 'closed'
 
-        # 美股盘前时段：16:00-21:30 北京时间 (对应美东 04:00-09:30)
+        # 美股盘前时段：16:00-22:30 北京时间
+        # 冬令时: 04:00-09:30 ET = 17:00-22:30 北京
+        # 夏令时: 04:00-09:30 ET = 16:00-21:30 北京
         premarket_start = datetime.strptime("16:00", "%H:%M").time()
-        premarket_end = datetime.strptime("21:30", "%H:%M").time()
+        premarket_end = datetime.strptime("22:30", "%H:%M").time()
 
-        # 美股常规交易：21:30-次日04:00 北京时间 (对应美东 09:30-16:00)
-        regular_start = datetime.strptime("21:30", "%H:%M").time()
-        regular_end = datetime.strptime("04:00", "%H:%M").time()
+        # 美股常规交易：22:30-次日05:00 北京时间
+        # 冬令时: 09:30-16:00 ET = 22:30-次日05:00 北京
+        # 夏令时: 09:30-16:00 ET = 21:30-次日04:00 北京
+        regular_start = datetime.strptime("22:30", "%H:%M").time()
+        regular_end = datetime.strptime("05:00", "%H:%M").time()
 
-        # 美股盘后时段：04:00-08:00 北京时间 (对应美东 16:00-20:00)
-        afterhours_start = datetime.strptime("04:00", "%H:%M").time()
-        afterhours_end = datetime.strptime("08:00", "%H:%M").time()
+        # 美股盘后时段：05:00-10:30 北京时间（扩展以覆盖冬夏令时 + 缓冲）
+        # 冬令时: 16:00-20:00 ET = 05:00-09:00 北京
+        # 夏令时: 16:00-20:00 ET = 04:00-08:00 北京
+        # 使用 10:30 作为保守上限（留出缓冲时间）
+        afterhours_start = datetime.strptime("05:00", "%H:%M").time()
+        afterhours_end = datetime.strptime("10:30", "%H:%M").time()
 
         # 判断时段
         if premarket_start <= current_time < premarket_end:
             return True, 'pre_market'
         elif current_time >= regular_start or current_time < regular_end:
             return False, 'regular'
-        elif afterhours_start <= current_time < afterhours_end:
+        elif afterhours_start <= current_time <= afterhours_end:  # 包含 10:00
             return False, 'after_hours'
         else:
             return False, 'closed'

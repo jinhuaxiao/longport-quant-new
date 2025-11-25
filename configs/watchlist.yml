@@ -44,7 +44,15 @@ markets:
     - 1211.HK   # 比亚迪股份 (新能源汽车)
 
   us:
+    # 科技巨头 - FAANG+
     - AAPL.US   # 苹果
     - MSFT.US   # 微软
+    - GOOGL.US  # Google (A类股)
+    - GOOG.US   # Google (C类股)
+    - AMZN.US   # 亚马逊
+    - META.US   # Meta (Facebook)
+    - NVDA.US   # 英伟达
+    - TSLA.US   # 特斯拉
+    - AVGO.US   # 博通 (半导体)
 
 symbols: []
